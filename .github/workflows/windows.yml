@@ -4,6 +4,8 @@ on:
     branches: [main]
     tags: ['v*']
   workflow_dispatch:
+  pull_request:
+    branches: [main]
 concurrency:
   group: windows-desktop-${{ github.ref }}
   cancel-in-progress: true
@@ -48,6 +50,7 @@ jobs:
           path: WhaleCursorStudio-Windows.zip
           retention-days: 30
       - name: Publish rolling portable release
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}

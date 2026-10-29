@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 import math
-import copy
 import os
 import random
 import uuid
@@ -10,15 +9,17 @@ import shutil
 import json
 import time
 from collections import OrderedDict
-from PySide6.QtCore import Qt, QTimer, QPoint, QRectF
+from PySide6.QtCore import Qt, QTimer, QPoint, QRectF, QRect
 from PySide6.QtGui import QCursor, QPainter, QColor, QPen
 from PySide6.QtWidgets import QWidget, QApplication
 from PySide6.QtMultimedia import QSoundEffect
 from PySide6.QtCore import QUrl
-from .codec import encode_cur
+from .codec import encode_cur, Frame
+from PIL import Image
 from .project import Project, user_dir
 from . import native
 from .conditions import Inputs, Resolver, ORDER, owners
+from .fx import pose, parse_keyframes, EXAMPLE
 
 
 _pixmap_cache = OrderedDict()
@@ -65,18 +66,119 @@ class Overlay(QWidget):
         self.sprite = None
         self.sprite_pos = QPoint()
         self.sprite_size = 64
+        self.cursor_frame = None
+        self.cursor_pos = QPoint()
+        self.cursor_size = 64
         self.settings = {}
         self.effects = {}
+        self.keyframes = parse_keyframes(EXAMPLE)
 
     def fit_screens(self):
-        rect = QApplication.screens()[0].geometry()
-        for screen in QApplication.screens()[1:]:
-            rect = rect.united(screen.geometry())
+        # Never create a desktop-sized topmost window or give it an editor owner.
+        pos = QCursor.pos()
+        self.setGeometry(QRect(pos.x(), pos.y(), 2, 2))
+
+    def present(self):
+        now = time.monotonic()
+        self.particles = [
+            v
+            for v in self.particles
+            if now - v[1]
+            < (
+                self.settings.get("trail_lifetime", 850)
+                if v[2] == "trail"
+                else self.settings.get("effect_lifetime", 850)
+            )
+            / 1000
+        ]
+        rect = QRect()
+        if self.cursor_frame is not None:
+            frame = self.cursor_frame
+            size = self.cursor_size
+            rect = QRect(
+                round(self.cursor_pos.x() - frame.x * size / 256),
+                round(self.cursor_pos.y() - frame.y * size / 256),
+                size + 2,
+                size + 2,
+            )
+        if self.sprite is not None:
+            rect = rect.united(
+                QRect(
+                    self.sprite_pos.x(),
+                    self.sprite_pos.y(),
+                    self.sprite_size + 2,
+                    self.sprite_size + 2,
+                )
+            )
+        for pos, born, kind, vx, vy in self.particles:
+            size = (
+                self.settings.get("trail_size", 24)
+                if kind == "trail"
+                else self.settings.get("click_size", 64)
+            )
+            lifetime = max(
+                0.1,
+                (
+                    self.settings.get("trail_lifetime", 850)
+                    if kind == "trail"
+                    else self.settings.get("effect_lifetime", 850)
+                )
+                / 1000,
+            )
+            motion = pose(
+                self.settings.get("effect_motion", "fade")
+                if kind != "trail"
+                else "fade",
+                (now - born) / lifetime,
+                self.keyframes,
+                vx,
+                vy,
+            )
+            center = pos + QPoint(round(motion["x"]), round(motion["y"]))
+            margin = round(max(size * motion["scale"], 90)) + 20
+            if kind == "petals":
+                center += QPoint(
+                    round(vx * (now - born)),
+                    round(vy * (now - born) + 100 * (now - born) ** 2),
+                )
+            rect = rect.united(
+                QRect(center.x() - margin, center.y() - margin, margin * 2, margin * 2)
+            )
+        if rect.isNull():
+            self.hide()
+            return
+        screen = QApplication.screenAt(self.cursor_pos) or QApplication.primaryScreen()
+        if screen:
+            # The one-pixel inset also prevents the shell treating the decoration as full-screen.
+            rect = rect.intersected(screen.geometry().adjusted(1, 1, -1, -1))
+        if rect.isEmpty():
+            self.hide()
+            return
         self.setGeometry(rect)
+        if not self.isVisible():
+            self.show()
+        if native.WINDOWS:
+            self.raise_()
+        self.update()
 
     def emit_at(self, pos, kind):
         now = time.monotonic()
-        if kind == "petals":
+        if self.settings.get("effect_motion") == "burst" and kind not in (
+            "trail",
+            "none",
+        ):
+            for i in range(8):
+                angle = i * math.tau / 8
+                self.particles.append(
+                    (
+                        QPoint(pos),
+                        now,
+                        kind,
+                        math.cos(angle) * 120,
+                        math.sin(angle) * 120,
+                    )
+                )
+        elif kind == "petals":
             for _ in range(9):
                 self.particles.append(
                     (
@@ -136,7 +238,21 @@ class Overlay(QWidget):
                 24 if kind == "trail" else 64,
             ) / (24 if kind == "trail" else 64)
             local = pos - origin
-            p.setOpacity(max(0, 1 - age / lifetime) * opacity)
+            motion = pose(
+                self.settings.get("effect_motion", "fade")
+                if kind != "trail"
+                else "fade",
+                age / lifetime,
+                self.keyframes,
+                vx,
+                vy,
+            )
+            p.save()
+            p.translate(local.x() + motion["x"], local.y() + motion["y"])
+            p.rotate(motion["rotation"])
+            p.scale(max(0.001, motion["scale"]), max(0.001, motion["scale"]))
+            local = QPoint(0, 0)
+            p.setOpacity(motion["opacity"] * opacity)
             custom = self.effects.get("trail" if kind == "trail" else "click", [])
             if custom and kind in ("custom", "trail"):
                 total = sum(duration for _, duration in custom)
@@ -156,6 +272,7 @@ class Overlay(QWidget):
                     size,
                     custom[index][0],
                 )
+                p.restore()
                 continue
             if kind == "petals":
                 x = local.x() + vx * age
@@ -171,6 +288,7 @@ class Overlay(QWidget):
                 p.setBrush(Qt.BrushStyle.NoBrush)
                 p.setPen(QPen(QColor("#4FAF9C"), 2))
                 p.drawEllipse(local, (8 + age * 48) * scale, (8 + age * 48) * scale)
+            p.restore()
         p.setOpacity(
             self.settings.get(
                 "companion_opacity", self.settings.get("effect_opacity", 1.0)
@@ -180,6 +298,15 @@ class Overlay(QWidget):
             point = self.sprite_pos - origin
             p.drawPixmap(
                 point.x(), point.y(), self.sprite_size, self.sprite_size, self.sprite
+            )
+        if self.cursor_frame is not None:
+            frame = self.cursor_frame
+            size = self.cursor_size
+            p.setOpacity(1)
+            x = self.cursor_pos.x() - origin.x() - frame.x * size / 256
+            y = self.cursor_pos.y() - origin.y() - frame.y * size / 256
+            p.drawPixmap(
+                QRectF(x, y, size, size), pixmap(frame.image), QRectF(0, 0, 256, 256)
             )
         p.end()
 
@@ -222,17 +349,12 @@ class Engine:
         os.replace(tmp, recovery)
         try:
             self.prepare_frames(self.project)
-            export_project = copy.copy(self.project)
-            export_project.multi_size = True
-            paths = (
-                export_project.export(self.temp / "base")
-                if any(self.project.slots.values())
-                else {}
+            self.base_snapshot = self.initial
+            self.blank_cursor = self.temp / "transparent.cur"
+            self.blank_cursor.write_bytes(
+                encode_cur(Frame(Image.new("RGBA", (256, 256)), 0, 0), (32,), True)
             )
-            for path in paths.values():
-                native.validate_file(path, self.project.size)
-            self.base_snapshot = self.project_snapshot(self.project, paths)
-            native.write_snapshot(self.base_snapshot)
+            native.validate_file(self.blank_cursor, 32)
         except Exception:
             self.stop()
             raise
@@ -269,17 +391,18 @@ class Engine:
         self.last_app_check = 0
         self.prepare_sounds(project)
         self.overlay.settings = dict(self.project.settings, pixel=self.project.pixel)
+        self.overlay.keyframes = parse_keyframes(
+            self.project.settings.get("effect_keyframes", EXAMPLE)
+        )
         self.overlay.effects = {
             key: [(pixmap(frame.image), frame.duration) for frame in frames]
             for key, frames in self.project.effects.items()
         }
         self.overlay.fit_screens()
-        self.overlay.show()
         self.timer.start(16)
 
     def prepare_frames(self, project):
         project.migrate_events()
-        key = id(project)
         groups = {
             **{"slots." + role: frames for role, frames in project.slots.items()},
             **project.events,
@@ -288,15 +411,7 @@ class Engine:
                 for key, frames in project.animations.items()
             },
         }
-        for name, frames in groups.items():
-            for index, frame in enumerate(frames):
-                for size in self.render_sizes(project):
-                    path = self.temp / f"{key}-{name}-{index}-{size}.cur"
-                    path.write_bytes(encode_cur(frame, (size,), project.pixel))
-                    self.frame_cache[(key, name, index, size)] = path
-        project._runtime_pixmaps = {
-            name: [pixmap(f.image) for f in frames] for name, frames in groups.items()
-        }
+        project._runtime_frames = groups
 
     def stop(self):
         if not self.active:
@@ -304,6 +419,8 @@ class Engine:
         self.timer.stop()
         self.overlay.hide()
         self.overlay.particles = []
+        self.overlay.cursor_frame = None
+        self.dirty_roles = set()
         self.sound.stop()
         for pool in self.sounds.values():
             for sound in pool:
@@ -320,18 +437,6 @@ class Engine:
             shutil.rmtree(self.temp, ignore_errors=True)
             self.temp = None
 
-    def project_snapshot(self, project, paths):
-        snap = {
-            "values": dict(self.initial["values"]),
-            "scheme": self.initial["scheme"],
-        }
-        for key, path in paths.items():
-            snap["values"][key] = [path, 1]
-        if paths:
-            snap["values"]["CursorBaseSize"] = [project.size, 4]
-            snap["values"][""] = ["", 1]
-        return snap
-
     def switch_rule(self, now):
         if now - self.last_app_check < 0.6:
             return
@@ -344,26 +449,20 @@ class Engine:
                 break
         if rule_path == self.last_rule:
             return
-        # Export each application scheme once, then switch only when the matched rule changes.
+        # Decode each application scheme once; playback never goes through the Windows ANI loader.
         if rule_path:
             if rule_path not in self.rule_cache:
                 p = Project.load(rule_path)
-                folder = self.temp / ("scheme-" + str(len(self.rule_cache)))
-                export_project = copy.copy(p)
-                export_project.multi_size = True
-                paths = export_project.export(folder) if any(p.slots.values()) else {}
-                for path in paths.values():
-                    native.validate_file(path, p.size)
                 self.prepare_frames(p)
-                self.rule_cache[rule_path] = (p, paths)
-            project, paths = self.rule_cache[rule_path]
-            native.write_snapshot(self.project_snapshot(project, paths))
-            self.project = project
+                self.rule_cache[rule_path] = p
+            self.project = self.rule_cache[rule_path]
         else:
-            native.write_snapshot(self.base_snapshot)
             self.project = self.base_project
         self.prepare_sounds(self.project)
         self.overlay.settings = dict(self.project.settings, pixel=self.project.pixel)
+        self.overlay.keyframes = parse_keyframes(
+            self.project.settings.get("effect_keyframes", EXAMPLE)
+        )
         self.overlay.effects = {
             key: [(pixmap(f.image), f.duration) for f in frames]
             for key, frames in self.project.effects.items()
@@ -372,6 +471,8 @@ class Engine:
         self.active_audio = set()
         self.last_sound_trigger = ""
         self.last_rule = rule_path
+        if self.dirty_roles:
+            native.reload()
         self.dirty_roles.clear()
         self.last_frame = None
         self.state = ""
@@ -395,23 +496,6 @@ class Engine:
             name: native.button_down(vk)
             for name, vk in (("left", 1), ("right", 2), ("middle", 4))
         }
-
-    @staticmethod
-    def pixel_size(project, ratio):
-        return max(16, min(256, round(project.size * ratio)))
-
-    def render_sizes(self, project):
-        return {
-            project.size,
-            *(
-                self.pixel_size(project, screen.devicePixelRatio())
-                for screen in QApplication.screens()
-            ),
-        }
-
-    def cursor_pixels(self, project, pos):
-        screen = QApplication.screenAt(pos) or QApplication.primaryScreen()
-        return self.pixel_size(project, screen.devicePixelRatio() if screen else 1)
 
     def rule_frames(self, rule):
         if rule.get("source"):
@@ -485,10 +569,8 @@ class Engine:
             float(settings.get("idle_seconds", 5)),
         )
         role = detected if detected in self.project.slots else "Arrow"
-        if role != self.role and self.dirty_roles:
-            native.reload()
-            self.dirty_roles.clear()
         self.role = role
+        self.overlay.cursor_pos = QPoint(pos)
         if "click" in context.pulses:
             self.overlay.emit_at(pos, settings.get("click_effect", "ripple"))
         if (
@@ -560,7 +642,11 @@ class Engine:
             if rule
             else "slots." + role
         )
-        frames = self.rule_frames(rule) if rule else self.project.slots.get(role, [])
+        frames = (
+            (self.rule_frames(rule) if rule else self.project.slots.get(role, []))
+            if detected is not None
+            else []
+        )
         identity = (id(self.project), group)
         if getattr(self, "animation_identity", None) != identity or (
             rule
@@ -576,8 +662,9 @@ class Engine:
             if self.dirty_roles:
                 native.reload()
                 self.dirty_roles.clear()
+            self.overlay.cursor_frame = None
             self.update_companion(pos, now)
-            self.overlay.update()
+            self.overlay.present()
             self.last_position = pos
             return
         factor = (
@@ -591,30 +678,17 @@ class Engine:
         while self.elapsed >= frames[self.index].duration:
             self.elapsed -= frames[self.index].duration
             self.index = (self.index + 1) % len(frames)
-        size = self.cursor_pixels(self.project, pos)
-        frame_key = (id(self.project), group, self.index, size)
-        if rule:
-            if (
-                frame_key != self.last_frame
-                or getattr(self, "last_target_role", None) != role
-            ):
-                if frame_key not in self.frame_cache:
-                    path = (
-                        self.temp
-                        / f"{id(self.project)}-{group}-{self.index}-{size}.cur"
-                    )
-                    path.write_bytes(
-                        encode_cur(frames[self.index], (size,), self.project.pixel)
-                    )
-                    self.frame_cache[frame_key] = path
-                if native.set_live_cursor(role, self.frame_cache[frame_key], size):
-                    self.dirty_roles.add(role)
-        elif self.dirty_roles:
-            native.reload()
-            self.dirty_roles.clear()
+        frame_key = (id(self.project), group, self.index)
+        self.overlay.cursor_frame = frames[self.index]
+        self.overlay.cursor_size = self.project.size
+        if role not in self.dirty_roles:
+            if native.set_live_cursor(role, self.blank_cursor, 32):
+                self.dirty_roles.add(role)
+            else:
+                self.overlay.cursor_frame = None
         self.last_frame, self.last_target_role = frame_key, role
         self.update_companion(pos, now, group)
-        self.overlay.update()
+        self.overlay.present()
         self.last_position = pos
 
     def prepare_sounds(self, project):
@@ -650,7 +724,9 @@ class Engine:
                     index += 1
                 self.overlay.sprite = pixmap(companion[index].image)
             elif group:
-                self.overlay.sprite = self.project._runtime_pixmaps[group][self.index]
+                self.overlay.sprite = pixmap(
+                    self.project._runtime_frames[group][self.index].image
+                )
         self.overlay.sprite_size = settings.get(
             "companion_size", settings.get("effect_size", self.project.size)
         )

@@ -166,17 +166,14 @@ def test_sequence_audio_cycles_and_keeps_trigger_positions_separate(app):
     assert played == ["a", "b", "x", "c", "a", "y"]
 
 
-def test_high_dpi_frames_are_encoded_directly_at_display_resolution(app):
+def test_nonstandard_size_native_cursor_export_still_supported():
     import struct
 
     p = Project.defaults()
     p.size = 64
-    size = Engine.pixel_size(p, 1.25)
-    assert size == 80
+    size = 80
     data = encode_cur(p.slots["Arrow"][0], (size,), pixel=True)
     assert struct.unpack_from("<BB", data, 6) == (80, 80)
-    assert Engine.pixel_size(p, 2) == 128
-    assert Engine.pixel_size(p, 5) == 256
 
 
 def test_rule_dialog_import_edit_undo_and_audio_mode(app, monkeypatch, tmp_path):

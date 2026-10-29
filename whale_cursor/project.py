@@ -135,6 +135,7 @@ class Project:
     settings: dict = field(
         default_factory=lambda: {
             "click_effect": "ripple",
+            "effect_motion": "fade",
             "trail": False,
             "companion": False,
             "direction": False,
@@ -268,6 +269,10 @@ class Project:
                 ):
                     if key not in previous:
                         p.settings[key] = p.settings[shared]
+            from .fx import parse_keyframes
+
+            if "effect_keyframes" in p.settings:
+                parse_keyframes(p.settings["effect_keyframes"])
             from .conditions import validate_rule
 
             rules = p.settings.get("animation_rules", [])

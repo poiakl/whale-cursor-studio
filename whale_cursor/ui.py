@@ -54,10 +54,12 @@ from PySide6.QtWidgets import (
     QLayout,
     QLineEdit,
     QKeySequenceEdit,
+    QPlainTextEdit,
 )
 from .codec import import_images, split_sheet, transform, SIZES
 from .project import Project, SLOTS, EVENTS, EFFECTS, user_dir, event_key
-from .runtime import Engine, pixmap
+from .runtime import Engine, Overlay, pixmap
+from .fx import MOTIONS as FX_MOTIONS, EXAMPLE, parse_keyframes
 from . import native
 from .editing import History, snapshot, encode_clipboard, decode_clipboard
 from .widgets import AnimatedThumb, MatchDialog, InspectionDialog
@@ -396,7 +398,6 @@ class Window(QMainWindow):
         self.preview_timer.setSingleShot(True)
         self.preview_timer.timeout.connect(self.next_frame)
         self.engine = Engine(self.runtime_error)
-        self.engine.overlay.setParent(self, self.engine.overlay.windowFlags())
         self.engine.timer.setParent(self)
         self.engine.sound.setParent(self)
         if native.WINDOWS:
@@ -548,6 +549,7 @@ class Window(QMainWindow):
         self.slot_list.customContextMenuRequested.connect(self.slot_menu)
         side.addWidget(self.slot_list, 1)
         side.addWidget(self.button("清空当前列表", self.clear_list))
+        side.addWidget(self.button("清空非系统动画…", self.clear_non_system))
         layout.addWidget(sidebar)
         main = QVBoxLayout()
         layout.addLayout(main, 1)
@@ -1358,6 +1360,21 @@ class Window(QMainWindow):
             )
         )
         form.addRow("点击特效", self.click_effect)
+        self.effect_motion = ChoiceBox()
+        for key, title in FX_MOTIONS.items():
+            self.effect_motion.addItem(title, key)
+        self.effect_motion.setCurrentIndex(
+            max(
+                0,
+                self.effect_motion.findData(
+                    self.project.settings.get("effect_motion", "fade")
+                ),
+            )
+        )
+        self.effect_motion.currentIndexChanged.connect(
+            lambda _: self.setting("effect_motion", self.effect_motion.currentData())
+        )
+        form.addRow("运动方式", self.effect_motion)
         self.idle = NumberBox()
         self.idle.setRange(1, 3600)
         self.idle.setSuffix(" 秒")
@@ -1424,6 +1441,10 @@ class Window(QMainWindow):
             row.addWidget(self.button("导入素材", lambda k=key: self.import_effect(k)))
             row.addWidget(self.button("制作", lambda k=key: self.edit_effect(k)))
             feature_layouts[key].addLayout(row)
+        helpers = QHBoxLayout()
+        helpers.addWidget(self.button("关键帧 / 提示", self.edit_effect_code))
+        helpers.addWidget(self.button("试播", self.preview_effect))
+        feature_layouts["click"].addLayout(helpers)
         for feature in feature_layouts.values():
             feature.addStretch()
         self.sound_trigger = ChoiceBox()
@@ -1902,6 +1923,16 @@ class Window(QMainWindow):
             )
         )
         self.click_effect.blockSignals(False)
+        self.effect_motion.blockSignals(True)
+        self.effect_motion.setCurrentIndex(
+            max(
+                0,
+                self.effect_motion.findData(
+                    project.settings.get("effect_motion", "fade")
+                ),
+            )
+        )
+        self.effect_motion.blockSignals(False)
         self.idle.blockSignals(True)
         self.idle.setValue(int(project.settings.get("idle_seconds", 5)))
         self.idle.blockSignals(False)
@@ -2038,7 +2069,7 @@ class Window(QMainWindow):
         a.addWidget(label("关于", "title"))
         a.addWidget(
             label(
-                "鲸鱼娘指针工坊 2.3\n原生 CUR / ANI 安装无需常驻；桌面互动在托盘运行，可随时停止。\n方案与导入素材保存在当前用户目录，程序不上传图片或鼠标操作。\n支持 Windows 10 / 11。游戏、远程桌面和部分自绘指针应用可能使用自己的指针。"
+                "鲸鱼娘指针工坊 2.4\n原生 CUR / ANI 安装无需常驻；桌面互动在托盘运行，可随时停止。\n方案与导入素材保存在当前用户目录，程序不上传图片或鼠标操作。\n支持 Windows 10 / 11。游戏、远程桌面和部分自绘指针应用可能使用自己的指针。"
             )
         )
         a.addWidget(
@@ -2706,3 +2737,105 @@ class Window(QMainWindow):
     def refresh_interaction_views(self):
         self.refresh_events()
         self.refresh_conditions()
+
+    def clear_non_system(self):
+        groups = ("events", "effects", "animations")
+        if not any(any(getattr(self.project, g).values()) for g in groups):
+            return
+        answer = QMessageBox.warning(
+            self,
+            "清空非系统动画",
+            "将清空当前方案中的全部互动动画、条件动画、点击特效素材、拖尾和跟随角色素材。\n系统指针、音效和条件设置保留。本次操作可以撤销。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self.stop_play()
+        if self.engine.active:
+            self.toggle_engine()
+        self.remember("清空非系统动画")
+        for group in groups:
+            getattr(self.project, group).clear()
+        self.frame_index = 0
+        self.rebuild_slots()
+        self.refresh_interaction_views()
+        self.touch()
+
+    def edit_effect_code(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("点击特效 · JSON 关键帧")
+        dialog.resize(680, 640)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(
+            label(
+                "先导入图片或动画，选择点击特效“自定义”；运动方式可选上浮、飘落、旋转、弹出、环绕、散射。自定义关键帧时选择“自定义关键帧”。"
+            )
+        )
+        layout.addWidget(
+            label(
+                "t：播放进度 0～1；x / y：相对点击位置的偏移像素（右 / 下为正）；scale：缩放倍数；rotation：角度；opacity：不透明度 0～1。首尾必须为 t=0 和 t=1，中间自动插值。持续时间在点击参数里设置。",
+                "muted",
+            )
+        )
+        editor = QPlainTextEdit()
+        editor.setPlainText(self.project.settings.get("effect_keyframes", EXAMPLE))
+        layout.addWidget(editor, 1)
+        example = self.button("填入示例", lambda: editor.setPlainText(EXAMPLE))
+        layout.addWidget(example)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+
+        def save():
+            try:
+                parse_keyframes(editor.toPlainText())
+            except (ValueError, TypeError) as error:
+                QMessageBox.warning(dialog, "关键帧有误", str(error))
+                return
+            self.setting("effect_keyframes", editor.toPlainText())
+            self.effect_motion.setCurrentIndex(self.effect_motion.findData("keyframes"))
+            dialog.accept()
+
+        buttons.accepted.connect(save)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        dialog.exec()
+
+    def preview_effect(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("点击特效试播")
+        layout = QVBoxLayout(dialog)
+        scene = Overlay()
+        scene.setParent(dialog, Qt.WindowType.Widget)
+        scene.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
+        scene.setFixedSize(420, 280)
+        scene.settings = dict(self.project.settings, pixel=self.project.pixel)
+        scene.keyframes = parse_keyframes(
+            self.project.settings.get("effect_keyframes", EXAMPLE)
+        )
+        scene.effects = {
+            key: [(pixmap(f.image), f.duration) for f in frames]
+            for key, frames in self.project.effects.items()
+        }
+        layout.addWidget(scene)
+        timer = QTimer(dialog)
+        timer.timeout.connect(scene.update)
+        timer.start(16)
+
+        def play():
+            scene.emit_at(
+                scene.geometry().center(),
+                self.project.settings.get("click_effect", "ripple"),
+            )
+
+        layout.addWidget(self.button("播放", play))
+        layout.addWidget(
+            label(
+                "自定义特效需先导入素材；每帧停留控制素材动画，持续 ms 控制整次特效。",
+                "muted",
+            )
+        )
+        QTimer.singleShot(0, play)
+        dialog.exec()

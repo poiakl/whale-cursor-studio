@@ -58,5 +58,5 @@ jobs:
           }
           gh api --method PATCH "repos/$env:GITHUB_REPOSITORY/git/refs/tags/desktop-latest" -f "sha=$env:GITHUB_SHA" -F force=true
           if ($LASTEXITCODE -ne 0) { throw "Could not update rolling release source tag" }
-          gh release edit desktop-latest --title "Windows 便携版 · 2.3" --notes "条件动画、独立按键长按与松键回退、按屏幕缩放生成互动帧、分组效果参数、音效随机或顺序循环与拖动排序。完整解压后运行 WhaleCursorStudio.exe。"
+          gh release edit desktop-latest --title "Windows 便携版 · 2.4" --notes "原图直接绘制互动、取消运行时 ANI 加载、修复任务栏及最小化行为、点击特效运动预设与 JSON 关键帧、带警告的非系统动画清空。完整解压后运行 WhaleCursorStudio.exe。"
           gh release upload desktop-latest WhaleCursorStudio-Windows.zip --clobber

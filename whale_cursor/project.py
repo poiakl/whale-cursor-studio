@@ -70,7 +70,20 @@ EVENTS = {
     "right": "向右移动",
     "up": "向上移动",
     "down": "向下移动",
+    "left_click": "左键按下",
+    "right_click": "右键按下",
+    "middle_click": "中键按下",
+    "double_click": "左键双击",
+    "drag": "按住拖动",
+    "release": "松开按键",
+    "hold": "长按",
+    "move_start": "开始移动",
+    "move_stop": "停止移动",
+    "role_change": "指针状态改变",
 }
+
+
+EFFECTS = {"click": "点击特效", "trail": "拖尾", "companion": "跟随角色"}
 
 
 def event_key(role, trigger):
@@ -117,6 +130,7 @@ class Project:
     multi_size: bool = False
     slots: dict[str, list[Frame]] = field(default_factory=dict)
     events: dict[str, list[Frame]] = field(default_factory=dict)
+    effects: dict[str, list[Frame]] = field(default_factory=dict)
     settings: dict = field(
         default_factory=lambda: {
             "click_effect": "ripple",
@@ -128,6 +142,18 @@ class Project:
             "sound": "",
             "volume": 0.5,
             "app_rules": [],
+            "interaction_scope": "common",
+            "sounds": {},
+            "history_limit": 30,
+            "effect_size": 64,
+            "click_size": 64,
+            "trail_size": 24,
+            "companion_size": 64,
+            "effect_opacity": 1.0,
+            "effect_lifetime": 850,
+            "trail_spacing": 12,
+            "companion_x": 20,
+            "companion_y": 20,
         }
     )
 
@@ -149,7 +175,7 @@ class Project:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         manifest = {
-            "version": 3,
+            "version": 4,
             "name": self.name,
             "size": self.size,
             "pixel": self.pixel,
@@ -157,11 +183,12 @@ class Project:
             "settings": self.settings,
             "slots": {},
             "events": {},
+            "effects": {},
         }
         temp = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
         try:
-            with zipfile.ZipFile(temp, "w", zipfile.ZIP_DEFLATED) as z:
-                for group in ("slots", "events"):
+            with zipfile.ZipFile(temp, "w", zipfile.ZIP_STORED) as z:
+                for group in ("slots", "events", "effects"):
                     for key, frames in getattr(self, group).items():
                         records = []
                         if not 0 <= len(frames) <= MAX_FRAMES:
@@ -170,7 +197,7 @@ class Project:
                             validate(f)
                             filename = f"{group}/{key}/{i:04}.png"
                             b = io.BytesIO()
-                            f.image.save(b, format="PNG")
+                            f.image.save(b, format="PNG", compress_level=1)
                             z.writestr(filename, b.getvalue())
                             records.append(
                                 {
@@ -181,12 +208,27 @@ class Project:
                                 }
                             )
                         manifest[group][key] = records
-                sound = self.settings.get("sound", "")
-                if sound and Path(sound).is_file():
-                    if Path(sound).stat().st_size > 16 * 1024 * 1024:
-                        raise ValueError("音频文件不能超过 16 MB")
-                    z.write(sound, "audio/click.wav")
-                    manifest["settings"] = dict(self.settings, sound="@embedded")
+                settings = copy.deepcopy(self.settings)
+                sounds = dict(settings.get("sounds", {}))
+                if settings.get("sound") and not sounds.get("click"):
+                    sounds["click"] = [settings["sound"]]
+                embedded = {}
+                for trigger, files in sounds.items():
+                    if trigger not in EVENTS:
+                        continue
+                    embedded[trigger] = []
+                    for i, filename in enumerate(files):
+                        source = Path(filename)
+                        if not source.is_file():
+                            raise ValueError("找不到音频：" + str(source))
+                        if source.stat().st_size > 16 * 1024 * 1024:
+                            raise ValueError("音频文件不能超过 16 MB")
+                        target = f"audio/{trigger}/{i}.wav"
+                        z.write(source, target)
+                        embedded[trigger].append("@" + target)
+                settings["sounds"] = embedded
+                settings["sound"] = ""
+                manifest["settings"] = settings
                 z.writestr("project.json", json.dumps(manifest, ensure_ascii=False))
             os.replace(temp, path)
         finally:
@@ -200,7 +242,7 @@ class Project:
             if z.getinfo("project.json").file_size > 2 * 1024 * 1024:
                 raise ValueError("方案索引过大")
             m = json.loads(z.read("project.json"))
-            if m.get("version") not in (2, 3) or m.get("size") not in SIZES:
+            if m.get("version") not in (2, 3, 4) or m.get("size") not in SIZES:
                 raise ValueError("不支持的方案版本 / 尺寸")
             p = cls.defaults()
             p.name = str(m.get("name", "未命名"))[:120]
@@ -208,7 +250,13 @@ class Project:
             p.pixel = bool(m.get("pixel", True))
             p.multi_size = bool(m.get("multi_size", False))
             p.settings.update(m.get("settings", {}))
-            for group, allowed in (("slots", SLOTS), ("events", EVENTS)):
+            if m.get("version", 2) < 4:
+                p.settings["interaction_scope"] = "role"
+            for group, allowed in (
+                ("slots", SLOTS),
+                ("events", EVENTS),
+                ("effects", EFFECTS),
+            ):
                 for key, records in m.get(group, {}).items():
                     if group == "events":
                         try:
@@ -245,6 +293,22 @@ class Project:
                 sound = dest / (hashlib.sha256(audio).hexdigest() + ".wav")
                 sound.write_bytes(audio)
                 p.settings["sound"] = str(sound)
+            import hashlib
+
+            sounds = p.settings.get("sounds", {})
+            for trigger, files in sounds.items():
+                if trigger not in EVENTS or not isinstance(files, list):
+                    raise ValueError("音频触发配置无效")
+                for i, name in enumerate(files):
+                    if name.startswith("@audio/"):
+                        audio = z.read(name[1:])
+                        if len(audio) > 16 * 1024 * 1024:
+                            raise ValueError("音频文件过大")
+                        dest = user_dir() / "audio"
+                        dest.mkdir(exist_ok=True)
+                        target = dest / (hashlib.sha256(audio).hexdigest() + ".wav")
+                        target.write_bytes(audio)
+                        files[i] = str(target)
             return p
 
     def export(self, folder, only=None):
@@ -284,12 +348,16 @@ class Project:
 
     def inspect(self):
         rows = []
-        for group in ("slots", "events"):
+        for group in ("slots", "events", "effects"):
             for key, frames in getattr(self, group).items():
                 name = (
                     ("系统 · " + SLOTS[key])
                     if group == "slots"
-                    else ("互动 · " + event_name(key))
+                    else (
+                        ("效果 · " + EFFECTS[key])
+                        if group == "effects"
+                        else ("互动 · " + event_name(key))
+                    )
                 )
                 issues = []
                 if not frames:

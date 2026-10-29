@@ -2,7 +2,17 @@ from __future__ import annotations
 import time
 from pathlib import Path
 from PIL import Image
-from PySide6.QtCore import Qt, Signal, QTimer, QSize, QPointF, QRectF, QUrl, QMimeData
+from PySide6.QtCore import (
+    Qt,
+    Signal,
+    QTimer,
+    QSize,
+    QPointF,
+    QRectF,
+    QUrl,
+    QMimeData,
+    QThread,
+)
 from PySide6.QtGui import (
     QColor,
     QPainter,
@@ -11,6 +21,7 @@ from PySide6.QtGui import (
     QDrag,
     QIcon,
     QAction,
+    QKeySequence,
     QDesktopServices,
 )
 from PySide6.QtWidgets import (
@@ -39,14 +50,16 @@ from PySide6.QtWidgets import (
     QSystemTrayIcon,
     QMenu,
     QScrollArea,
+    QGridLayout,
     QLayout,
     QLineEdit,
+    QKeySequenceEdit,
 )
 from .codec import import_images, split_sheet, transform, SIZES
-from .project import Project, SLOTS, EVENTS, user_dir, event_key
+from .project import Project, SLOTS, EVENTS, EFFECTS, user_dir, event_key
 from .runtime import Engine, pixmap
 from . import native
-from .editing import History, encode_clipboard, decode_clipboard
+from .editing import History, snapshot, encode_clipboard, decode_clipboard
 from .widgets import AnimatedThumb, MatchDialog, InspectionDialog
 
 STYLE = """
@@ -90,6 +103,42 @@ def card():
     layout.setContentsMargins(16, 16, 16, 16)
     layout.setSpacing(12)
     return w, layout
+
+
+class NoWheel:
+    def wheelEvent(self, event):
+        event.ignore()
+
+
+class NumberBox(NoWheel, QSpinBox):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setKeyboardTracking(False)
+
+
+class DecimalBox(NoWheel, QDoubleSpinBox):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setKeyboardTracking(False)
+
+
+class ChoiceBox(NoWheel, QComboBox):
+    pass
+
+
+class SaveWorker(QThread):
+    failed = Signal(str)
+
+    def __init__(self, project, path, parent):
+        super().__init__(parent)
+        self.project = snapshot(project)
+        self.path = path
+
+    def run(self):
+        try:
+            self.project.save(self.path)
+        except Exception as error:
+            self.failed.emit(str(error))
 
 
 class FrameList(QListWidget):
@@ -172,6 +221,8 @@ class Canvas(QWidget):
         self.pixel = True
         self.background = "checker"
         self.zoom = 1.0
+        self.pan = QPointF()
+        self.pan_anchor = None
         self.setMinimumSize(220, 220)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setAcceptDrops(True)
@@ -179,7 +230,12 @@ class Canvas(QWidget):
 
     def area(self):
         n = min(self.width() - 36, self.height() - 36) * self.zoom
-        return QRectF((self.width() - n) / 2, (self.height() - n) / 2, n, n)
+        return QRectF(
+            (self.width() - n) / 2 + self.pan.x(),
+            (self.height() - n) / 2 + self.pan.y(),
+            n,
+            n,
+        )
 
     def paintEvent(self, e):
         p = QPainter(self)
@@ -224,18 +280,30 @@ class Canvas(QWidget):
             )
 
     def mousePressEvent(self, e):
-        if e.button() == Qt.MouseButton.LeftButton:
+        if e.button() == Qt.MouseButton.MiddleButton:
+            self.pan_anchor = e.position() - self.pan
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            e.accept()
+        elif e.button() == Qt.MouseButton.LeftButton:
             self.setFocus()
             self.edit_started.emit()
             self.pick(e.position())
 
     def mouseReleaseEvent(self, e):
+        if e.button() == Qt.MouseButton.MiddleButton:
+            self.pan_anchor = None
+            self.setCursor(Qt.CursorShape.CrossCursor)
+            e.accept()
         if e.button() == Qt.MouseButton.LeftButton:
             self.edit_finished.emit()
         super().mouseReleaseEvent(e)
 
     def mouseMoveEvent(self, e):
-        if e.buttons() & Qt.MouseButton.LeftButton:
+        if e.buttons() & Qt.MouseButton.MiddleButton and self.pan_anchor is not None:
+            self.pan = e.position() - self.pan_anchor
+            self.update()
+            e.accept()
+        elif e.buttons() & Qt.MouseButton.LeftButton:
             self.pick(e.position())
 
     def keyPressEvent(self, e):
@@ -298,7 +366,11 @@ class Window(QMainWindow):
         self.frame_index = 0
         self.trigger = "click"
         self.interaction_trigger = "click"
+        self.shortcut_actions = {}
+        self.shortcut_defaults = {}
+        self.shortcut_fields = {}
         self.history = History(30)
+        self.save_worker = None
         self._hot_gesture = False
         self._history_loading = False
         self.syncing = False
@@ -312,12 +384,13 @@ class Window(QMainWindow):
                     0, lambda msg=str(e): self.error("上次编辑未能恢复：" + msg)
                 )
         self.project.migrate_events()
+        self.history.limit = max(
+            1, min(200, int(self.project.settings.get("history_limit", 30)))
+        )
         self.save_timer = QTimer(self)
         self.save_timer.setSingleShot(True)
-        self.save_timer.setInterval(700)
-        self.save_timer.timeout.connect(
-            lambda: self.guard(lambda: self.project.save(self.autosave_path))
-        )
+        self.save_timer.setInterval(1800)
+        self.save_timer.timeout.connect(self.autosave_background)
         self.preview_timer = QTimer(self)
         self.preview_timer.setSingleShot(True)
         self.preview_timer.timeout.connect(self.next_frame)
@@ -336,9 +409,7 @@ class Window(QMainWindow):
         self.build_tray()
         self.rebuild_slots()
         self.refresh()
-        self.statusBar().showMessage(
-            "修改自动保存 · 保存完整方案用于命名与分享 · 互动总开关控制全部互动功能"
-        )
+        self.statusBar().showMessage("已就绪")
 
     @property
     def frames(self):
@@ -370,7 +441,26 @@ class Window(QMainWindow):
 
     def touch(self):
         self.save_timer.start()
-        self.refresh_events()
+        if self.tabs.currentIndex() == 1:
+            self.refresh_events()
+
+    def autosave_background(self):
+        if self.save_worker is not None and self.save_worker.isRunning():
+            self.save_timer.start()
+            return
+        if self.save_worker is not None:
+            self.save_worker.deleteLater()
+        self.save_worker = SaveWorker(self.project, self.autosave_path, self)
+        self.save_worker.failed.connect(
+            lambda message: self.statusBar().showMessage("自动保存失败：" + message)
+        )
+        self.save_worker.start()
+
+    def flush_save(self):
+        self.save_timer.stop()
+        if self.save_worker is not None:
+            self.save_worker.wait()
+        self.project.save(self.autosave_path)
 
     def remember(self, description="编辑", token=None):
         if self._history_loading:
@@ -388,12 +478,12 @@ class Window(QMainWindow):
         root = QWidget()
         self.setCentralWidget(root)
         outer = QVBoxLayout(root)
-        outer.setContentsMargins(24, 20, 24, 12)
-        outer.setSpacing(14)
+        outer.setContentsMargins(18, 14, 18, 10)
+        outer.setSpacing(8)
         top = QHBoxLayout()
         brand = QVBoxLayout()
         brand.addWidget(label("鲸鱼娘 / 指针工坊", "brand"))
-        brand.addWidget(label("把喜欢的角色，放在每一次点击里。", "muted"))
+
         top.addLayout(brand)
         top.addStretch()
         self.name_label = label(self.project.name)
@@ -407,24 +497,30 @@ class Window(QMainWindow):
         self.build_interactions()
         self.build_schemes()
         self.build_settings()
+        self.tabs.currentChanged.connect(
+            lambda index: self.refresh_events() if index == 1 else None
+        )
         bottom = QHBoxLayout()
-        bottom.addWidget(label("CUR 静态  /  ANI 动态  /  17 种系统用途", "muted"))
+
         bottom.addStretch()
         bottom.addWidget(self.button("恢复安装前方案", self.restore))
         outer.addLayout(bottom)
         action = QAction("撤销", self)
-        action.setShortcut("Ctrl+Z")
+        self.bind_shortcut(action, "undo", "Ctrl+Z")
         action.triggered.connect(self.undo)
         self.addAction(action)
         for sequence in ("Ctrl+Y", "Ctrl+Shift+Z"):
             redo = QAction("重做", self)
-            redo.setShortcut(sequence)
+            self.bind_shortcut(
+                redo, "redo" if sequence == "Ctrl+Y" else "redo_alt", sequence
+            )
             redo.triggered.connect(self.redo)
             self.addAction(redo)
         save = QAction("保存方案", self)
-        save.setShortcut("Ctrl+S")
+        self.bind_shortcut(save, "save", "Ctrl+S")
         save.triggered.connect(self.save_scheme)
         self.addAction(save)
+        self.build_shortcut_fields()
 
     def build_editor(self):
         page = QWidget()
@@ -434,11 +530,11 @@ class Window(QMainWindow):
         self.tabs.addTab(page, "制作指针")
         sidebar, side = card()
         sidebar.setFixedWidth(195)
-        self.group_box = QComboBox()
-        self.group_box.addItems(["系统指针 · 17 项", "互动指针 · 17 项"])
+        self.group_box = ChoiceBox()
+        self.group_box.addItems(["系统指针", "互动动画", "装饰效果"])
         self.group_box.currentIndexChanged.connect(self.change_group)
         side.addWidget(self.group_box)
-        self.trigger_box = QComboBox()
+        self.trigger_box = ChoiceBox()
         self.trigger_box.addItems(list(EVENTS.values()))
         self.trigger_box.currentIndexChanged.connect(self.change_trigger)
         self.trigger_box.hide()
@@ -449,6 +545,7 @@ class Window(QMainWindow):
         self.slot_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.slot_list.customContextMenuRequested.connect(self.slot_menu)
         side.addWidget(self.slot_list, 1)
+        side.addWidget(self.button("清空当前列表", self.clear_list))
         layout.addWidget(sidebar)
         main = QVBoxLayout()
         layout.addLayout(main, 1)
@@ -468,13 +565,17 @@ class Window(QMainWindow):
         frame_ops = self.button("帧操作", lambda: None)
         frame_ops.setMenu(self.frame_menu())
         history_bar.addWidget(frame_ops)
-        self.undo_button = self.button("撤销 Ctrl+Z", self.undo)
-        self.redo_button = self.button("重做 Ctrl+Y", self.redo)
+        self.undo_button = self.button("撤销", self.undo)
+        self.redo_button = self.button("重做", self.redo)
         history_bar.addWidget(self.undo_button)
         history_bar.addWidget(self.redo_button)
         self.history_label = label("编辑历史 0 / 30", "muted")
-        history_bar.addWidget(self.history_label)
+        self.history_label.hide()
         history_bar.addStretch()
+        history_bar.addWidget(self.button("居中", lambda: self.set_hot(128, 128)))
+        history_bar.addWidget(self.button("应用全帧", self.hot_all))
+        history_bar.addWidget(self.button("还原", self.reset_slot))
+        history_bar.addWidget(self.button("仅安装", lambda: self.install(True)))
         main.addLayout(history_bar)
         self.update_history()
         work = QHBoxLayout()
@@ -489,86 +590,70 @@ class Window(QMainWindow):
             lambda p: self.guard(lambda: self.load_files(p, False))
         )
         cc.addWidget(self.canvas, 1)
-        cc.addWidget(label("  点击 / 拖动设热点 · 方向键微调 · 滚轮放大", "muted"))
+        self.canvas.setToolTip("左键设置热点 · 中键拖动画布 · 滚轮缩放 · 方向键微调")
         work.addWidget(canvas_card, 1)
         props, prop_outer = card()
-        props.setFixedWidth(224)
+        props.setFixedWidth(272)
         work.addWidget(props)
         prop_tabs = QTabWidget()
-        prop_tabs.setStyleSheet("QTabBar::tab {padding:8px 15px;}")
+        prop_tabs.setStyleSheet("QTabBar::tab {padding:6px 12px;}")
         prop_outer.addWidget(prop_tabs)
         settings_page = QWidget()
         preview_page = QWidget()
         prop = QVBoxLayout(settings_page)
         pv = QVBoxLayout(preview_page)
-        prop.setContentsMargins(0, 8, 0, 0)
-        pv.setContentsMargins(0, 8, 0, 0)
-        prop.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
-        pv.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
-        prop.setSpacing(12)
-        pv.setSpacing(12)
-        for inner, title in ((settings_page, "参数"), (preview_page, "试用")):
-            area = QScrollArea()
-            area.setWidgetResizable(True)
-            area.setWidget(inner)
-            area.setMinimumWidth(0)
-            prop_tabs.addTab(area, title)
+        for inner_layout in (prop, pv):
+            inner_layout.setContentsMargins(0, 6, 0, 0)
+            inner_layout.setSpacing(8)
+        prop_tabs.addTab(settings_page, "参数")
+        prop_tabs.addTab(preview_page, "试用")
         self.inspector_tabs = prop_tabs
-        prop.addWidget(label("点击热点", "title"))
-        form = QFormLayout()
-        self.hot_x = QSpinBox()
-        self.hot_y = QSpinBox()
+        prop.addWidget(label("点击热点"))
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(5)
+        grid.setVerticalSpacing(8)
+        self.hot_x = NumberBox()
+        self.hot_y = NumberBox()
         for b in (self.hot_x, self.hot_y):
             b.setRange(0, 255)
+            b.setKeyboardTracking(False)
+            b.setFixedSize(78, 34)
             b.valueChanged.connect(self.hot_fields)
-        form.setVerticalSpacing(12)
-        self.hot_x.setMinimumHeight(34)
-        self.hot_y.setMinimumHeight(34)
-        form.addRow("X", self.hot_x)
-        form.addRow("Y", self.hot_y)
-        prop.addLayout(form)
-        r = QHBoxLayout()
-        r.addWidget(self.button("居中", lambda: self.set_hot(128, 128)))
-        r.addWidget(self.button("应用到全帧", self.hot_all))
-        prop.addLayout(r)
-        form = QFormLayout()
-        self.size_combo = QComboBox()
+        grid.addWidget(label("x"), 0, 0)
+        grid.addWidget(self.hot_x, 0, 1)
+        grid.addWidget(label("y"), 0, 2)
+        grid.addWidget(self.hot_y, 0, 3)
+        self.size_combo = ChoiceBox()
         self.size_combo.addItems([str(v) for v in SIZES])
         self.size_combo.setCurrentText(str(self.project.size))
+        self.size_combo.setFixedSize(78, 34)
         self.size_combo.currentTextChanged.connect(self.size_changed)
-        form.setVerticalSpacing(12)
-        self.size_combo.setMinimumHeight(34)
-        form.addRow("输出尺寸", self.size_combo)
-        self.duration = QSpinBox()
+        self.duration = NumberBox()
         self.duration.setRange(17, 60000)
-        self.duration.setSuffix(" ms")
-        self.duration.setMinimumHeight(34)
+        self.duration.setKeyboardTracking(False)
+        self.duration.setFixedSize(78, 34)
+        self.duration.setToolTip("毫秒")
         self.duration.valueChanged.connect(self.duration_changed)
-        form.addRow("本帧停留", self.duration)
-        prop.addLayout(form)
-        self.pixel = QCheckBox("像素画清晰缩放")
+        grid.addWidget(label("尺寸"), 1, 0)
+        grid.addWidget(self.size_combo, 1, 1)
+        grid.addWidget(label("停留"), 1, 2)
+        grid.addWidget(self.duration, 1, 3)
+        prop.addLayout(grid)
+        self.pixel = QCheckBox("像素缩放")
         self.pixel.setChecked(self.project.pixel)
         self.pixel.toggled.connect(self.pixel_changed)
         prop.addWidget(self.pixel)
+        prop.addStretch()
         self.actual = QLabel()
         self.actual.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.actual.setMinimumHeight(100)
-        pv.addWidget(label("输出尺寸预览", "title"))
+        self.actual.setMinimumHeight(96)
         pv.addWidget(self.actual)
         self.preview = Preview()
         pv.addWidget(self.preview)
-        pv.addWidget(
-            label(
-                "红色十字只用于标记，不会写入指针。大于 96px 的缩略图会缩小显示。",
-                "muted",
-            )
-        )
         pv.addStretch()
-        prop.addWidget(self.button("仅安装当前用途", lambda: self.install(True)))
-        prop.addStretch()
-        prop.addWidget(self.button("还原内置图片", self.reset_slot))
         frame_card, fc = card()
-        fc.setContentsMargins(12, 10, 12, 10)
+        fc.setContentsMargins(12, 8, 12, 8)
+        fc.setSpacing(6)
         main.addWidget(frame_card)
         frame_top = QHBoxLayout()
         self.play = self.button("▶ 播放", self.toggle_play)
@@ -578,7 +663,7 @@ class Window(QMainWindow):
         self.frame_info = label("1 帧", "muted")
         frame_top.addWidget(self.frame_info)
         frame_top.addStretch()
-        frame_top.addWidget(label("Ctrl+C / V 复制粘贴 · Delete 删除", "muted"))
+        frame_top.addWidget(self.button("清空", self.clear_slot))
         fc.addLayout(frame_top)
         self.frame_list = FrameList()
         self.frame_list.setSelectionMode(
@@ -589,8 +674,8 @@ class Window(QMainWindow):
         self.frame_list.setWrapping(False)
         self.frame_list.setMovement(QListWidget.Movement.Snap)
         self.frame_list.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
-        self.frame_list.setIconSize(QSize(52, 52))
-        self.frame_list.setFixedHeight(99)
+        self.frame_list.setIconSize(QSize(44, 44))
+        self.frame_list.setFixedHeight(92)
         self.frame_list.currentRowChanged.connect(self.select_frame)
         self.frame_list.move_requested.connect(self.reorder_frames)
         fc.addWidget(self.frame_list)
@@ -599,13 +684,13 @@ class Window(QMainWindow):
     def import_menu(self):
         menu = QMenu(self)
         for text, fn in [
-            ("批量匹配 17 种用途", self.batch_import),
+            ("批量匹配", self.batch_import),
             ("精灵图切帧", self.import_sheet),
             ("图像调整", self.image_tools),
             ("导出当前 CUR / ANI", lambda: self.export(True)),
             ("导出整套 CUR / ANI", lambda: self.export(False)),
             ("检查方案", self.check_project),
-            ("撤销最近修改 · Ctrl+Z", self.undo),
+            ("撤销最近修改", self.undo),
         ]:
             menu.addAction(text, lambda checked=False, f=fn: self.guard(f))
         return menu
@@ -613,10 +698,10 @@ class Window(QMainWindow):
     def frame_menu(self):
         menu = QMenu(self)
         for text, fn in [
-            ("复制帧 · Ctrl+C", self.copy_frames),
-            ("粘贴帧 · Ctrl+V", self.paste_frames),
-            ("删除帧 · Delete", self.delete_frame),
-            ("复制并插入 · Ctrl+D", self.duplicate_frame),
+            ("复制帧", self.copy_frames),
+            ("粘贴帧", self.paste_frames),
+            ("删除帧", self.delete_frame),
+            ("复制并插入", self.duplicate_frame),
             ("向前移动", lambda: self.move_frame(-1)),
             ("向后移动", lambda: self.move_frame(1)),
             ("反转顺序", self.reverse_frames),
@@ -631,19 +716,26 @@ class Window(QMainWindow):
         if self.syncing:
             return
         self.stop_play()
-        self.group = "slots" if index == 0 else "events"
+        self.group = ("slots", "events", "effects")[index]
+        self.key = "click" if self.group == "effects" else "Arrow"
         self.trigger_box.setVisible(index == 1)
         self.frame_index = 0
         self.rebuild_slots()
 
     def rebuild_slots(self):
+        if self.key not in self.role_names:
+            self.key = next(iter(self.role_names))
         self.syncing = True
         self.slot_list.clear()
-        for role, name in SLOTS.items():
+        for role, name in self.role_names.items():
             frames = (
                 self.project.slots.get(role, [])
                 if self.group == "slots"
-                else self.project.event_frames(role, self.trigger)
+                else (
+                    self.project.effects.get(role, [])
+                    if self.group == "effects"
+                    else self.project.event_frames(role, self.trigger)
+                )
             )
             item = QListWidgetItem(
                 name + "\n" + (str(len(frames)) + " 帧" if frames else "未设置")
@@ -652,7 +744,7 @@ class Window(QMainWindow):
             if frames:
                 item.setIcon(QIcon(pixmap(frames[0].image)))
             self.slot_list.addItem(item)
-        self.slot_list.setCurrentRow(list(SLOTS).index(self.key))
+        self.slot_list.setCurrentRow(list(self.role_names).index(self.key))
         self.syncing = False
         self.rebuild_frames()
 
@@ -670,7 +762,7 @@ class Window(QMainWindow):
         for i, f in enumerate(self.frames):
             item = QListWidgetItem(QIcon(pixmap(f.image)), f"{i + 1} · {f.duration}ms")
             item.setData(Qt.ItemDataRole.UserRole, i)
-            item.setSizeHint(QSize(90, 77))
+            item.setSizeHint(QSize(98, 68))
             self.frame_list.addItem(item)
         self.frame_index = max(0, min(self.frame_index, len(self.frames) - 1))
         self.frame_list.setCurrentRow(self.frame_index if self.frames else -1)
@@ -708,7 +800,7 @@ class Window(QMainWindow):
         self.canvas.pixel = self.project.pixel
         self.canvas.update()
         self.edit_title.setText(
-            SLOTS[self.key]
+            self.role_names[self.key]
             + (" / " + EVENTS[self.trigger] if self.group == "events" else "")
         )
         self.name_label.setText(self.project.name)
@@ -727,15 +819,21 @@ class Window(QMainWindow):
                     else Qt.TransformationMode.SmoothTransformation,
                 )
             )
-            scaled = f.image.resize(
-                (s, s),
-                Image.Resampling.NEAREST
-                if self.project.pixel
-                else Image.Resampling.LANCZOS,
-            )
+            cache_key = (id(f.image), s, self.project.pixel)
+            if getattr(self, "_trial_key", None) != cache_key:
+                self._trial_key = cache_key
+                self._trial_image = f.image
+                self._trial_pixmap = pixmap(f.image).scaled(
+                    s,
+                    s,
+                    Qt.AspectRatioMode.IgnoreAspectRatio,
+                    Qt.TransformationMode.FastTransformation
+                    if self.project.pixel
+                    else Qt.TransformationMode.SmoothTransformation,
+                )
             self.preview.setCursor(
                 QCursor(
-                    pixmap(scaled),
+                    self._trial_pixmap,
                     min(s - 1, round(f.x * s / 256)),
                     min(s - 1, round(f.y * s / 256)),
                 )
@@ -832,8 +930,16 @@ class Window(QMainWindow):
         self.touch()
 
     def batch_import(self):
+        if self.group == "effects":
+            self.import_files(False)
+            return
+        if (
+            self.group == "events"
+            and self.project.settings.get("interaction_scope") == "common"
+        ):
+            self.scope_box.setCurrentIndex(1)
         files, _ = QFileDialog.getOpenFileNames(
-            self, "选择多张图片或动画，下一步调整 17 项匹配", "", FILTER
+            self, "选择多张图片或动画，下一步调整匹配", "", FILTER
         )
         if not files:
             return
@@ -863,9 +969,9 @@ class Window(QMainWindow):
         dlg = QDialog(self)
         dlg.setWindowTitle("精灵图切帧")
         form = QFormLayout(dlg)
-        cols = QSpinBox()
-        rows = QSpinBox()
-        count = QSpinBox()
+        cols = NumberBox()
+        rows = NumberBox()
+        count = NumberBox()
         for b in (cols, rows):
             b.setRange(1, 512)
         count.setRange(1, 512)
@@ -896,7 +1002,7 @@ class Window(QMainWindow):
         if self.group == "slots":
             self.project.slots[self.key] = Project.defaults().slots[self.key]
         else:
-            self.project.events.pop(self.storage_key, None)
+            getattr(self.project, self.group).pop(self.storage_key, None)
         self.rebuild_slots()
         self.touch()
 
@@ -1009,7 +1115,7 @@ class Window(QMainWindow):
         dlg = QDialog(self)
         dlg.setWindowTitle("图像调整")
         form = QFormLayout(dlg)
-        op = QComboBox()
+        op = ChoiceBox()
         op.addItems(
             [
                 "水平镜像",
@@ -1024,13 +1130,13 @@ class Window(QMainWindow):
         all_frames = QCheckBox("应用到当前用途的所有帧")
         all_frames.setChecked(True)
         form.addRow(all_frames)
-        dx = QSpinBox()
-        dy = QSpinBox()
+        dx = NumberBox()
+        dy = NumberBox()
         dx.setRange(-255, 255)
         dy.setRange(-255, 255)
         form.addRow("水平偏移", dx)
         form.addRow("垂直偏移", dy)
-        scale = QDoubleSpinBox()
+        scale = DecimalBox()
         scale.setRange(0.1, 4)
         scale.setSingleStep(0.1)
         scale.setValue(1)
@@ -1042,7 +1148,7 @@ class Window(QMainWindow):
             ("裁剪右", 256),
             ("裁剪下", 256),
         ]:
-            b = QSpinBox()
+            b = NumberBox()
             b.setRange(0, 256)
             b.setValue(value)
             crop.append(b)
@@ -1117,19 +1223,29 @@ class Window(QMainWindow):
         layout.addLayout(columns)
         actions, ac = card()
         columns.addWidget(actions, 1)
-        ac.addWidget(label("互动素材 · 17 种用途", "title"))
+        ac.addWidget(label("触发与动画", "title"))
         ac.addWidget(
             label(
-                "选择触发动作，为每一种系统用途分别配置动画。旧版 7 类素材已保留在正常选择下。",
+                "例如闲置后播放一个动画；也可按当前指针状态分别指定。",
                 "muted",
             )
         )
-        self.interaction_trigger_box = QComboBox()
+        self.interaction_trigger_box = ChoiceBox()
         self.interaction_trigger_box.addItems(list(EVENTS.values()))
         self.interaction_trigger_box.currentIndexChanged.connect(
             self.change_interaction_trigger
         )
         ac.addWidget(self.interaction_trigger_box)
+        self.scope_box = ChoiceBox()
+        self.scope_box.addItems(["所有状态共用动画", "按指针状态分别配置"])
+        self.scope_box.setCurrentIndex(
+            0 if self.project.settings.get("interaction_scope") == "common" else 1
+        )
+        self.scope_box.currentIndexChanged.connect(self.scope_changed)
+        ac.addWidget(self.scope_box)
+        self.trigger_hint = label("", "muted")
+        ac.addWidget(self.trigger_hint)
+
         action_area = QScrollArea()
         action_area.setWidgetResizable(True)
         action_body = QWidget()
@@ -1137,41 +1253,58 @@ class Window(QMainWindow):
         action_layout = QVBoxLayout(action_body)
         action_layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
         action_layout.setContentsMargins(0, 0, 0, 0)
+        action_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         action_area.setWidget(action_body)
-        action_area.setMinimumHeight(380)
+        action_area.setMinimumHeight(120)
         ac.addWidget(action_area, 1)
         self.event_status = {}
         self.event_thumbs = {}
+        self.event_rows = {}
+        self.event_names = {}
         for role, name in SLOTS.items():
-            row = QHBoxLayout()
+            row_widget = QWidget()
+            self.event_rows[role] = row_widget
+            row = QHBoxLayout(row_widget)
+            row.setContentsMargins(0, 4, 0, 4)
             thumb = AnimatedThumb(size=40)
             self.event_thumbs[role] = thumb
             row.addWidget(thumb)
             text = QVBoxLayout()
-            text.addWidget(label(name))
+            self.event_names[role] = label(name)
+            text.addWidget(self.event_names[role])
             count = label("未设置", "muted")
             self.event_status[role] = count
             text.addWidget(count)
             row.addLayout(text, 1)
             row.addWidget(self.button("导入", lambda r=role: self.import_event(r)))
             row.addWidget(self.button("编辑", lambda r=role: self.edit_event(r)))
-            action_layout.addLayout(row)
-        effects, ef = card()
+            action_layout.addWidget(row_widget)
+        effects, effect_outer = card()
         columns.addWidget(effects, 1)
+        effect_tabs = QTabWidget()
+        effect_outer.addWidget(effect_tabs)
+        effect_page = QWidget()
+        audio_page = QWidget()
+        effect_tabs.addTab(effect_page, "效果")
+        effect_tabs.addTab(audio_page, "音效")
+        ef = QVBoxLayout(effect_page)
+        audio_layout = QVBoxLayout(audio_page)
         ef.addWidget(label("效果与响应", "title"))
         form = QFormLayout()
-        self.click_effect = QComboBox()
-        self.click_effect.addItems(["水波", "花瓣", "关闭"])
+        self.click_effect = ChoiceBox()
+        self.click_effect.addItems(["水波", "花瓣", "关闭", "自定义"])
         self.click_effect.setCurrentIndex(
-            {"ripple": 0, "petals": 1, "none": 2}.get(
+            {"ripple": 0, "petals": 1, "none": 2, "custom": 3}.get(
                 self.project.settings.get("click_effect"), 0
             )
         )
         self.click_effect.currentIndexChanged.connect(
-            lambda i: self.setting("click_effect", ["ripple", "petals", "none"][i])
+            lambda i: self.setting(
+                "click_effect", ["ripple", "petals", "none", "custom"][i]
+            )
         )
         form.addRow("点击特效", self.click_effect)
-        self.idle = QSpinBox()
+        self.idle = NumberBox()
         self.idle.setRange(1, 3600)
         self.idle.setSuffix(" 秒")
         self.idle.setValue(int(self.project.settings.get("idle_seconds", 5)))
@@ -1190,29 +1323,72 @@ class Window(QMainWindow):
             check.toggled.connect(lambda value, k=key: self.setting(k, value))
             self.setting_checks[key] = check
             ef.addWidget(check)
-        ef.addWidget(
-            label(
-                "根据当前系统用途播放对应互动素材；未设置时使用该用途的原动画。手写等特殊用途由应用自身控制，仍支持原生 ANI 安装。",
-                "muted",
+        self.effect_fields = {}
+        self.effect_defaults = {}
+        effect_form = QGridLayout()
+        for row, (key, title, low, high, default) in enumerate(
+            [
+                ("click_size", "点击大小", 8, 256, 64),
+                ("trail_size", "拖尾大小", 8, 256, 24),
+                ("companion_size", "角色大小", 8, 256, 64),
+                ("effect_lifetime", "持续 ms", 100, 10000, 850),
+                ("effect_opacity", "不透明度 %", 0, 100, 100),
+                ("trail_spacing", "拖尾间距", 1, 200, 12),
+                ("companion_x", "跟随 x", -256, 256, 20),
+                ("companion_y", "跟随 y", -256, 256, 20),
+            ]
+        ):
+            field = NumberBox()
+            field.setRange(low, high)
+            field.setKeyboardTracking(False)
+            value = self.project.settings.get(key, default)
+            field.setValue(
+                round(value * 100) if key == "effect_opacity" else int(value)
             )
+            field.valueChanged.connect(
+                lambda v, k=key: self.setting(
+                    k, v / 100 if k == "effect_opacity" else v
+                )
+            )
+            self.effect_fields[key] = field
+            self.effect_defaults[key] = 1.0 if key == "effect_opacity" else default
+            effect_form.addWidget(label(title), row // 2, (row % 2) * 2)
+            effect_form.addWidget(field, row // 2, (row % 2) * 2 + 1)
+        ef.addLayout(effect_form)
+        for key, title in EFFECTS.items():
+            row = QHBoxLayout()
+            row.addWidget(label(title), 1)
+            row.addWidget(self.button("导入", lambda k=key: self.import_effect(k)))
+            row.addWidget(self.button("制作", lambda k=key: self.edit_effect(k)))
+            ef.addLayout(row)
+        ef.addStretch()
+        self.sound_trigger = ChoiceBox()
+        self.sound_trigger.addItems(list(EVENTS.values()))
+        self.sound_trigger.currentIndexChanged.connect(
+            lambda _: self.refresh_sound_list()
         )
+        audio_layout.addWidget(self.sound_trigger)
+        self.sound_list = QListWidget()
+        self.sound_list.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection
+        )
+        audio_layout.addWidget(self.sound_list, 1)
         audio = QHBoxLayout()
-        audio.addWidget(self.button("选择点击音效 / 语音", self.choose_sound))
-        audio.addWidget(self.button("清除", lambda: self.setting("sound", "")))
-        ef.addLayout(audio)
-        self.sound_label = label(
-            Path(self.project.settings.get("sound", "")).name or "未设置音频", "muted"
-        )
-        ef.addWidget(self.sound_label)
-        self.volume = QDoubleSpinBox()
+        audio.addWidget(self.button("添加音频", self.choose_sound))
+        audio.addWidget(self.button("移除", self.remove_sounds))
+        audio.addWidget(self.button("清空", self.clear_sounds))
+        audio_layout.addLayout(audio)
+        self.sound_label = label("多段音频随机播放", "muted")
+        audio_layout.addWidget(self.sound_label)
+        self.volume = DecimalBox()
         self.volume.setRange(0, 1)
         self.volume.setSingleStep(0.1)
         self.volume.setValue(float(self.project.settings.get("volume", 0.5)))
         self.volume.valueChanged.connect(lambda v: self.setting("volume", v))
         vf = QFormLayout()
         vf.addRow("音量", self.volume)
-        ef.addLayout(vf)
-        ef.addStretch()
+        audio_layout.addLayout(vf)
+        self.refresh_sound_list()
         rules, rl = card()
         layout.addWidget(rules)
         r = QHBoxLayout()
@@ -1236,7 +1412,25 @@ class Window(QMainWindow):
     def refresh_events(self):
         if not hasattr(self, "event_status"):
             return
+        common = self.project.settings.get("interaction_scope") == "common"
+        hints = {
+            "idle": "停止操作达到设定时长后播放。",
+            "click": "任意鼠标按键按下时播放。",
+            "drag": "按住鼠标按键移动时播放。",
+            "hold": "按住按键超过半秒后播放。",
+            "move_stop": "停止移动 0.15 秒后播放一次。",
+            "role_change": "例如箭头变为链接手形时播放。",
+        }
+        self.trigger_hint.setText(
+            hints.get(
+                self.interaction_trigger, "触发时播放对应动画；未配置则保留原指针。"
+            )
+        )
         for role, widget in self.event_status.items():
+            self.event_rows[role].setVisible(not common or role == "Arrow")
+            self.event_names[role].setText(
+                "播放动画" if common and role == "Arrow" else SLOTS[role]
+            )
             frames = self.project.event_frames(role, self.interaction_trigger)
             widget.setText(
                 (
@@ -1271,6 +1465,12 @@ class Window(QMainWindow):
         )
 
     def edit_event(self, role, trigger=None):
+        if (
+            role in SLOTS
+            and role != "Arrow"
+            and self.project.settings.get("interaction_scope") == "common"
+        ):
+            self.scope_box.setCurrentIndex(1)
         if role in EVENTS:
             trigger = role
             role = "Arrow"
@@ -1293,24 +1493,101 @@ class Window(QMainWindow):
         self.remember("互动设置", token=("setting", key))
         self.project.settings[key] = value
         self.touch()
-        if hasattr(self, "sound_label"):
-            self.sound_label.setText(
-                Path(self.project.settings.get("sound", "")).name or "未设置音频"
-            )
+        if key == "sounds":
+            self.refresh_sound_list()
         if self.engine.active:
             self.statusBar().showMessage("运行中；设置已修改，停止并重新开启后生效")
 
     def choose_sound(self):
-        file, _ = QFileDialog.getOpenFileName(
-            self, "选择点击音效或角色语音（PCM WAV）", "", "WAV 音频 (*.wav)"
-        )
-        if file:
-            import wave
+        files, _ = QFileDialog.getOpenFileNames(self, "添加音频", "", "PCM WAV (*.wav)")
+        if not files:
+            return
+        import wave
 
-            with wave.open(file, "rb") as w:
-                if w.getcomptype() != "NONE":
+        for file in files:
+            with wave.open(file, "rb") as audio:
+                if audio.getcomptype() != "NONE":
                     raise ValueError("请选择未压缩 PCM WAV")
-            self.setting("sound", file)
+            if Path(file).stat().st_size > 16 * 1024 * 1024:
+                raise ValueError("音频文件不能超过 16 MB")
+        trigger = list(EVENTS)[self.sound_trigger.currentIndex()]
+        sounds = {
+            k: list(v) for k, v in self.project.settings.get("sounds", {}).items()
+        }
+        sounds[trigger] = list(dict.fromkeys(self.audio_files(trigger) + files))
+        self.setting("sounds", sounds)
+        self.refresh_sound_list()
+
+    def audio_files(self, trigger):
+        files = self.project.settings.get("sounds", {}).get(trigger, [])
+        if not files and trigger == "click" and self.project.settings.get("sound"):
+            return [self.project.settings["sound"]]
+        return files
+
+    def refresh_sound_list(self):
+        if not hasattr(self, "sound_list"):
+            return
+        self.sound_list.clear()
+        for file in self.audio_files(list(EVENTS)[self.sound_trigger.currentIndex()]):
+            item = QListWidgetItem(Path(file).name)
+            item.setToolTip(file)
+            self.sound_list.addItem(item)
+
+    def clear_sounds(self):
+        self.remove_sounds(clear=True)
+
+    def remove_sounds(self, clear=False):
+        trigger = list(EVENTS)[self.sound_trigger.currentIndex()]
+        indices = {self.sound_list.row(i) for i in self.sound_list.selectedItems()}
+        sounds = {
+            k: list(v) for k, v in self.project.settings.get("sounds", {}).items()
+        }
+        sounds[trigger] = (
+            []
+            if clear
+            else [
+                file
+                for i, file in enumerate(self.audio_files(trigger))
+                if i not in indices
+            ]
+        )
+        self.setting("sounds", sounds)
+        if trigger == "click":
+            self.project.settings["sound"] = ""
+        self.refresh_sound_list()
+
+    def scope_changed(self, index):
+        self.setting("interaction_scope", "common" if index == 0 else "role")
+        if self.group == "events":
+            self.stop_play()
+            self.key = "Arrow"
+            self.frame_index = 0
+            self.rebuild_slots()
+        self.refresh_events()
+
+    def edit_effect(self, key):
+        self.stop_play()
+        self.group_box.setCurrentIndex(2)
+        self.key = key
+        self.frame_index = 0
+        self.rebuild_slots()
+        self.tabs.setCurrentIndex(0)
+
+    def import_effect(self, key):
+        files, _ = QFileDialog.getOpenFileNames(self, "导入" + EFFECTS[key], "", FILTER)
+        if not files:
+            return
+        old = self.selection()
+        self.group, self.key, self.frame_index = "effects", key, 0
+        try:
+            self.load_files(files, False)
+        finally:
+            self.group, self.key, self.frame_index, self.trigger = old
+            self.rebuild_slots()
+        if key == "click":
+            self.click_effect.setCurrentIndex(3)
+        else:
+            self.setting_checks[key if key == "companion" else "trail"].setChecked(True)
 
     def refresh_rules(self):
         if not hasattr(self, "rules"):
@@ -1526,6 +1803,10 @@ class Window(QMainWindow):
             self.toggle_engine()
         self.stop_play()
         self.project = project
+        self.history.limit = int(project.settings.get("history_limit", 30))
+        self.history_limit.blockSignals(True)
+        self.history_limit.setValue(self.history.limit)
+        self.history_limit.blockSignals(False)
         self.group = "slots"
         self.key = "Arrow"
         self.frame_index = 0
@@ -1537,7 +1818,7 @@ class Window(QMainWindow):
         self.syncing = False
         self.click_effect.blockSignals(True)
         self.click_effect.setCurrentIndex(
-            {"ripple": 0, "petals": 1, "none": 2}.get(
+            {"ripple": 0, "petals": 1, "none": 2, "custom": 3}.get(
                 project.settings.get("click_effect"), 0
             )
         )
@@ -1555,9 +1836,20 @@ class Window(QMainWindow):
         self.multi.blockSignals(True)
         self.multi.setChecked(project.multi_size)
         self.multi.blockSignals(False)
-        self.sound_label.setText(
-            Path(project.settings.get("sound", "")).name or "未设置音频"
+        self.scope_box.blockSignals(True)
+        self.scope_box.setCurrentIndex(
+            0 if project.settings.get("interaction_scope") == "common" else 1
         )
+        self.scope_box.blockSignals(False)
+        for key, field in self.effect_fields.items():
+            field.blockSignals(True)
+            value = project.settings.get(key, self.effect_defaults[key])
+            field.setValue(
+                round(value * 100) if key == "effect_opacity" else int(value)
+            )
+            field.blockSignals(False)
+        self.refresh_sound_list()
+        self.sync_shortcuts()
         self.rebuild_slots()
         self.refresh_rules()
         self.refresh_events()
@@ -1578,9 +1870,31 @@ class Window(QMainWindow):
         pane, p = card()
         b.addWidget(pane)
         p.addWidget(label("编辑与输出", "title"))
+        history_row = QHBoxLayout()
+        history_row.addWidget(label("撤销次数"))
+        self.history_limit = NumberBox()
+        self.history_limit.setRange(1, 200)
+        self.history_limit.setValue(int(self.project.settings.get("history_limit", 30)))
+        self.history_limit.setKeyboardTracking(False)
+        self.history_limit.valueChanged.connect(self.set_history_limit)
+        history_row.addWidget(self.history_limit)
+        history_row.addStretch()
+        p.addLayout(history_row)
+        shortcuts, shortcut_layout = card()
+        b.addWidget(shortcuts)
+        shortcut_layout.addWidget(label("快捷键", "title"))
+        self.shortcut_grid = QGridLayout()
+        shortcut_layout.addLayout(self.shortcut_grid)
+        shortcut_layout.addWidget(self.button("恢复默认快捷键", self.reset_shortcuts))
+        shortcut_layout.addWidget(
+            label(
+                "预览：左键设置热点 · 中键拖拽 · 滚轮缩放 · 方向键微调，Shift 加速",
+                "muted",
+            )
+        )
         row = QHBoxLayout()
         row.addWidget(label("预览背景"))
-        bg = QComboBox()
+        bg = ChoiceBox()
         bg.addItems(["透明棋盘格", "白色", "深色", "浅绿色"])
         bg.currentIndexChanged.connect(
             lambda i: self.set_background(
@@ -1611,7 +1925,7 @@ class Window(QMainWindow):
             )
         )
         f = QFormLayout()
-        self.trails = QSpinBox()
+        self.trails = NumberBox()
         self.trails.setRange(0, 16)
         self.trails.setSpecialValueText("关闭")
         f.addRow("系统鼠标轨迹长度", self.trails)
@@ -1639,7 +1953,7 @@ class Window(QMainWindow):
         a.addWidget(label("关于", "title"))
         a.addWidget(
             label(
-                "鲸鱼娘指针工坊 2.1\n原生 CUR / ANI 安装无需常驻；桌面互动在托盘运行，可随时停止。\n方案与导入素材保存在当前用户目录，程序不上传图片或鼠标操作。\n支持 Windows 10 / 11。游戏、远程桌面和部分自绘指针应用可能使用自己的指针。"
+                "鲸鱼娘指针工坊 2.2\n原生 CUR / ANI 安装无需常驻；桌面互动在托盘运行，可随时停止。\n方案与导入素材保存在当前用户目录，程序不上传图片或鼠标操作。\n支持 Windows 10 / 11。游戏、远程桌面和部分自绘指针应用可能使用自己的指针。"
             )
         )
         a.addWidget(
@@ -1683,8 +1997,7 @@ class Window(QMainWindow):
             raise ValueError("互动动作请在桌面互动中开启，不能作为单独系统用途安装")
         if self.engine.active:
             self.toggle_engine()
-        self.save_timer.stop()
-        self.project.save(self.autosave_path)
+        self.flush_save()
         paths = native.install(self.project, self.key if only else None)
         self.statusBar().showMessage(
             f"已安装 {len(paths)} 种指针 · 支持 CUR / ANI · 原方案已备份"
@@ -1703,7 +2016,7 @@ class Window(QMainWindow):
         if not folder:
             return
         dest = Path(folder) / ("WhaleCursors_" + time.strftime("%Y%m%d_%H%M%S"))
-        if self.group == "events" and only:
+        if self.group != "slots" and only:
             from .codec import encode_ani, encode_cur
 
             if not self.frames:
@@ -1753,7 +2066,7 @@ class Window(QMainWindow):
         def quit_now():
             if self.engine.active:
                 self.engine.stop()
-            self.project.save(self.autosave_path)
+            self.flush_save()
             self.tray.hide()
             QApplication.instance().quit()
 
@@ -1770,7 +2083,7 @@ class Window(QMainWindow):
         try:
             if self.engine.active:
                 self.engine.stop()
-            self.project.save(self.autosave_path)
+            self.flush_save()
             self.tray.hide()
             event.accept()
         except Exception as e:
@@ -1779,7 +2092,7 @@ class Window(QMainWindow):
 
     @property
     def storage_key(self):
-        return self.key if self.group == "slots" else event_key(self.key, self.trigger)
+        return event_key(self.key, self.trigger) if self.group == "events" else self.key
 
     def selection(self):
         return (self.group, self.key, self.frame_index, self.trigger)
@@ -1788,7 +2101,7 @@ class Window(QMainWindow):
         if hasattr(self, "undo_button"):
             self.undo_button.setEnabled(bool(self.history.past))
             self.redo_button.setEnabled(bool(self.history.future))
-            self.history_label.setText(f"编辑历史 {len(self.history.past)} / 30")
+            self.history_label.setText("")
 
     def redo(self):
         self.stop_play()
@@ -1803,7 +2116,9 @@ class Window(QMainWindow):
             self.set_project(project)
             self.group, self.key, self.frame_index, self.trigger = selection
             self.group_box.blockSignals(True)
-            self.group_box.setCurrentIndex(0 if self.group == "slots" else 1)
+            self.group_box.setCurrentIndex(
+                ("slots", "events", "effects").index(self.group)
+            )
             self.group_box.blockSignals(False)
             self.trigger_box.blockSignals(True)
             self.trigger_box.setCurrentIndex(list(EVENTS).index(self.trigger))
@@ -1842,7 +2157,7 @@ class Window(QMainWindow):
         self.frame_index = 0
         self.rebuild_slots()
         self.touch()
-        self.statusBar().showMessage(f"已读取匹配结果：{len(mapping)} 种用途")
+        self.statusBar().showMessage("已读取匹配结果")
 
     def slot_menu(self, pos):
         item = self.slot_list.itemAt(pos)
@@ -1861,6 +2176,7 @@ class Window(QMainWindow):
     def clear_slot(self):
         if not self.frames:
             return
+        self.stop_play()
         self.remember("删除素材")
         getattr(self.project, self.group)[self.storage_key] = []
         self.frame_index = 0
@@ -1883,7 +2199,7 @@ class Window(QMainWindow):
                 ("Ctrl+D", "复制并插入", self.duplicate_frame),
             ]:
                 action = QAction(name, widget)
-                action.setShortcut(sequence)
+                self.bind_shortcut(action, name, sequence)
                 action.setShortcutContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
                 action.triggered.connect(lambda checked=False, f=fn: self.guard(f))
                 widget.addAction(action)
@@ -1898,7 +2214,7 @@ class Window(QMainWindow):
             encode_clipboard([self.frames[i] for i in indices]),
         )
         QApplication.clipboard().setMimeData(mime)
-        self.statusBar().showMessage(f"已复制 {len(indices)} 帧；Ctrl+V 在当前帧后插入")
+        self.statusBar().showMessage("已复制")
 
     def paste_frames(self):
         mime = QApplication.clipboard().mimeData()
@@ -1945,9 +2261,106 @@ class Window(QMainWindow):
         )
 
     def save_summary(self):
-        system = sum(bool(frames) for frames in self.project.slots.values())
-        events = sum(bool(frames) for frames in self.project.events.values())
-        frames = sum(len(v) for v in self.project.slots.values()) + sum(
-            len(v) for v in self.project.events.values()
+        return "保存图片、动画顺序、时长、热点、尺寸、装饰效果、音频与互动规则。"
+
+    @property
+    def role_names(self):
+        if self.group == "effects":
+            return EFFECTS
+        if (
+            self.group == "events"
+            and self.project.settings.get("interaction_scope") == "common"
+        ):
+            return {"Arrow": "共用动画"}
+        return SLOTS
+
+    def clear_list(self):
+        group = getattr(self.project, self.group)
+        keys = (
+            list(EFFECTS)
+            if self.group == "effects"
+            else [
+                k if self.group == "slots" else event_key(k, self.trigger)
+                for k in self.role_names
+            ]
         )
-        return f"保存 {system}/17 种系统素材、{events} 组互动素材，共 {frames} 帧；包含图片、动画顺序、每帧时长、热点、尺寸、音效与应用规则。\n保存不会安装指针，也不会开启桌面互动；Windows 系统鼠标选项不包含在方案内。"
+        if not any(group.get(k) for k in keys):
+            return
+        self.stop_play()
+        self.remember("清空列表")
+        for k in keys:
+            group[k] = []
+        self.frame_index = 0
+        self.rebuild_slots()
+        self.touch()
+
+    def set_history_limit(self, value):
+        self.project.settings["history_limit"] = value
+        self.history.limit = value
+        self.history.past = self.history.past[-value:]
+        self.history.future = self.history.future[-value:]
+        self.update_history()
+        self.touch()
+
+    def bind_shortcut(self, action, key, default):
+        self.shortcut_actions.setdefault(key, []).append(action)
+        self.shortcut_defaults[key] = default
+        action.setShortcut(self.project.settings.get("shortcuts", {}).get(key, default))
+
+    def build_shortcut_fields(self):
+        names = {
+            "undo": "撤销",
+            "redo": "重做",
+            "redo_alt": "重做（备用）",
+            "save": "保存方案",
+        }
+        for index, (key, default) in enumerate(self.shortcut_defaults.items()):
+            field = QKeySequenceEdit(
+                QKeySequence(
+                    self.project.settings.get("shortcuts", {}).get(key, default)
+                )
+            )
+            field.editingFinished.connect(
+                lambda k=key, f=field: self.change_shortcut(
+                    k,
+                    f.keySequence().toString(QKeySequence.SequenceFormat.PortableText),
+                )
+            )
+            self.shortcut_fields[key] = field
+            self.shortcut_grid.addWidget(
+                label(names.get(key, key)), index // 2, (index % 2) * 2
+            )
+            self.shortcut_grid.addWidget(field, index // 2, (index % 2) * 2 + 1)
+
+    def change_shortcut(self, key, value):
+        shortcuts = dict(self.project.settings.get("shortcuts", {}))
+        if value and any(
+            value == shortcuts.get(other, default)
+            for other, default in self.shortcut_defaults.items()
+            if other != key
+        ):
+            self.statusBar().showMessage("快捷键已被使用")
+            self.sync_shortcuts()
+            return
+        shortcuts[key] = value
+        self.project.settings["shortcuts"] = shortcuts
+        self.sync_shortcuts()
+        self.touch()
+
+    def sync_shortcuts(self):
+        for key, actions in self.shortcut_actions.items():
+            value = self.project.settings.get("shortcuts", {}).get(
+                key, self.shortcut_defaults[key]
+            )
+            for action in actions:
+                action.setShortcut(value)
+            field = self.shortcut_fields.get(key)
+            if field:
+                field.blockSignals(True)
+                field.setKeySequence(QKeySequence(value))
+                field.blockSignals(False)
+
+    def reset_shortcuts(self):
+        self.project.settings["shortcuts"] = {}
+        self.sync_shortcuts()
+        self.touch()

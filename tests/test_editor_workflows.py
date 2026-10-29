@@ -25,6 +25,7 @@ def window(app, monkeypatch):
 
 
 def test_seventeen_roles_for_every_trigger(window):
+    window.scope_box.setCurrentIndex(1)
     window.group_box.setCurrentIndex(1)
     assert window.slot_list.count() == 17 and len(window.event_status) == 17
     for role in SLOTS:
@@ -125,8 +126,9 @@ def test_small_inspector_controls_do_not_overlap(window, app):
     ):
         a = first.mapTo(window, QPoint(0, 0))
         b = second.mapTo(window, QPoint(0, 0))
-        assert a.y() + first.height() <= b.y()
-        assert first.height() >= 34
+        assert a.x() + first.width() <= b.x()
+        assert a.y() == b.y()
+        assert first.isVisible() and second.isVisible()
 
 
 def test_delete_slot_keeps_role_and_is_undoable(window):

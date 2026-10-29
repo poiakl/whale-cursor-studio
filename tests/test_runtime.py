@@ -9,7 +9,7 @@ def test_runtime_click_idle_direction_and_restoration(app, monkeypatch, tmp_path
 
     now = [100.0]
     position = [QPoint(100, 100)]
-    buttons = {1: False, 2: False}
+    buttons = {1: False, 2: False, 4: False}
     calls = []
     monkeypatch.setattr(native, "require", lambda: None)
     monkeypatch.setattr(native, "recover_runtime", lambda: False)

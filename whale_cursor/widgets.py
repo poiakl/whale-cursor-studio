@@ -34,7 +34,6 @@ class AnimatedThumb(QLabel):
         self.timer = QTimer(self)
         self.timer.setInterval(33)
         self.timer.timeout.connect(self.advance)
-        self.timer.start()
         self.set_frames(frames or [])
 
     def set_frames(self, frames):
@@ -42,10 +41,24 @@ class AnimatedThumb(QLabel):
             a is b for a, b in zip(self.frames, frames)
         ):
             return
-        self.frames = frames
+        self.frames = list(frames)
+        if self.isVisible() and len(frames) > 1:
+            self.timer.start()
+        else:
+            self.timer.stop()
         self.epoch = time.monotonic()
         self.frame_index = -1
         self.advance(force=True)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if len(self.frames) > 1:
+            self.timer.start()
+        self.advance(force=True)
+
+    def hideEvent(self, event):
+        self.timer.stop()
+        super().hideEvent(event)
 
     def advance(self, force=False):
         if not self.frames:

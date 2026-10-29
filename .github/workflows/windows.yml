@@ -22,6 +22,18 @@ jobs:
           QT_QPA_PLATFORM: offscreen
       - name: Package portable Windows app
         run: python -m PyInstaller --noconfirm --clean --windowed --onedir --name WhaleCursorStudio --add-data "assets;assets" --collect-all PySide6.QtMultimedia main.py
+      - name: Launch packaged app and check all pages
+        shell: pwsh
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          $env:LOCALAPPDATA = Join-Path $env:RUNNER_TEMP "whale-cursor-smoke"
+          $process = Start-Process -FilePath "dist/WhaleCursorStudio/WhaleCursorStudio.exe" -ArgumentList "--smoke-test" -PassThru
+          if (-not $process.WaitForExit(60000)) { $process.Kill(); throw "Packaged app did not complete its launch check" }
+          if ($process.ExitCode -ne 0) {
+            Get-Content "$env:LOCALAPPDATA/WhaleCursorStudio2/error.log" -ErrorAction SilentlyContinue
+            throw "Packaged app launch failed: $($process.ExitCode)"
+          }
       - name: Archive portable app
         shell: pwsh
         run: |

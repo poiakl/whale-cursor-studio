@@ -9,6 +9,20 @@ def main():
     app.setApplicationName("WhaleCursorStudio")
     app.setStyle("Fusion")
     app.setStyleSheet(STYLE)
+    if "--smoke-test" in sys.argv:
+        from whale_cursor.project import Project
+
+        window = Window(Project.defaults())
+        window.show()
+        app.processEvents()
+        for index in range(4):
+            window.tabs.setCurrentIndex(index)
+            app.processEvents()
+        if not window.project.slots or window.canvas.width() < 100:
+            raise RuntimeError("打包程序资源 / 窗口检查失败")
+        window.close()
+        app.processEvents()
+        return 0
     # One instance per user: prevents two live-interaction engines overwriting each other's restore state.
     import getpass, hashlib
 
@@ -52,7 +66,7 @@ if __name__ == "__main__":
 
         log = user_dir() / "error.log"
         log.write_text(traceback.format_exc(), encoding="utf-8")
-        if sys.platform == "win32":
+        if sys.platform == "win32" and "--smoke-test" not in sys.argv:
             import ctypes
 
             ctypes.windll.user32.MessageBoxW(

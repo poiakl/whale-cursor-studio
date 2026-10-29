@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 import math
+import copy
 import os
 import random
 import uuid
@@ -15,8 +16,9 @@ from PySide6.QtWidgets import QWidget, QApplication
 from PySide6.QtMultimedia import QSoundEffect
 from PySide6.QtCore import QUrl
 from .codec import encode_cur
-from .project import Project, EVENTS, user_dir, event_key
+from .project import Project, user_dir
 from . import native
+from .conditions import Inputs, Resolver, ORDER, owners
 
 
 _pixmap_cache = OrderedDict()
@@ -92,13 +94,47 @@ class Overlay(QWidget):
     def paintEvent(self, event):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(
+            QPainter.RenderHint.SmoothPixmapTransform,
+            not self.settings.get("pixel", True),
+        )
         now = time.monotonic()
         origin = self.geometry().topLeft()
         lifetime = max(0.1, self.settings.get("effect_lifetime", 850) / 1000)
-        opacity = self.settings.get("effect_opacity", 1.0)
-        self.particles = [v for v in self.particles if now - v[1] < lifetime]
+        self.particles = [
+            v
+            for v in self.particles
+            if now - v[1]
+            < (
+                self.settings.get(
+                    "trail_lifetime", self.settings.get("effect_lifetime", 850)
+                )
+                / 1000
+                if v[2] == "trail"
+                else lifetime
+            )
+        ]
         for pos, born, kind, vx, vy in self.particles:
             age = now - born
+            lifetime = (
+                max(
+                    0.1,
+                    self.settings.get(
+                        "trail_lifetime", self.settings.get("effect_lifetime", 850)
+                    )
+                    / 1000,
+                )
+                if kind == "trail"
+                else max(0.1, self.settings.get("effect_lifetime", 850) / 1000)
+            )
+            opacity = self.settings.get(
+                "trail_opacity" if kind == "trail" else "click_opacity",
+                self.settings.get("effect_opacity", 1.0),
+            )
+            scale = self.settings.get(
+                "trail_size" if kind == "trail" else "click_size",
+                24 if kind == "trail" else 64,
+            ) / (24 if kind == "trail" else 64)
             local = pos - origin
             p.setOpacity(max(0, 1 - age / lifetime) * opacity)
             custom = self.effects.get("trail" if kind == "trail" else "click", [])
@@ -126,16 +162,20 @@ class Overlay(QWidget):
                 y = local.y() + vy * age + 100 * age * age
                 p.setPen(Qt.PenStyle.NoPen)
                 p.setBrush(QColor("#F3A8C0"))
-                p.drawEllipse(QRectF(x, y, 7, 12))
+                p.drawEllipse(QRectF(x, y, 7 * scale, 12 * scale))
             elif kind == "trail":
                 p.setPen(Qt.PenStyle.NoPen)
                 p.setBrush(QColor("#6BBEAA"))
-                p.drawEllipse(local, 3, 3)
+                p.drawEllipse(local, 3 * scale, 3 * scale)
             else:
                 p.setBrush(Qt.BrushStyle.NoBrush)
                 p.setPen(QPen(QColor("#4FAF9C"), 2))
-                p.drawEllipse(local, 8 + age * 48, 8 + age * 48)
-        p.setOpacity(opacity)
+                p.drawEllipse(local, (8 + age * 48) * scale, (8 + age * 48) * scale)
+        p.setOpacity(
+            self.settings.get(
+                "companion_opacity", self.settings.get("effect_opacity", 1.0)
+            )
+        )
         if self.sprite is not None:
             point = self.sprite_pos - origin
             p.drawPixmap(
@@ -153,6 +193,7 @@ class Engine:
         self.overlay = Overlay()
         self.sound = QSoundEffect()
         self.sounds = {}
+        self.sound_indices = {}
         self.temp = None
         self.initial = None
         self.frame_cache = {}
@@ -181,8 +222,10 @@ class Engine:
         os.replace(tmp, recovery)
         try:
             self.prepare_frames(self.project)
+            export_project = copy.copy(self.project)
+            export_project.multi_size = True
             paths = (
-                self.project.export(self.temp / "base")
+                export_project.export(self.temp / "base")
                 if any(self.project.slots.values())
                 else {}
             )
@@ -194,6 +237,13 @@ class Engine:
             self.stop()
             raise
         self.last_position = QCursor.pos()
+        self.inputs = Inputs(
+            time.monotonic(),
+            (self.last_position.x(), self.last_position.y()),
+            self.read_buttons(),
+        )
+        self.resolver = Resolver()
+        self.active_audio = set()
         self.last_move = time.monotonic()
         self.last_tick = self.last_move
         self.last_activity = self.last_move
@@ -218,7 +268,7 @@ class Engine:
         self.last_rule = ""
         self.last_app_check = 0
         self.prepare_sounds(project)
-        self.overlay.settings = self.project.settings
+        self.overlay.settings = dict(self.project.settings, pixel=self.project.pixel)
         self.overlay.effects = {
             key: [(pixmap(frame.image), frame.duration) for frame in frames]
             for key, frames in self.project.effects.items()
@@ -233,12 +283,17 @@ class Engine:
         groups = {
             **{"slots." + role: frames for role, frames in project.slots.items()},
             **project.events,
+            **{
+                "animations." + key: frames
+                for key, frames in project.animations.items()
+            },
         }
         for name, frames in groups.items():
             for index, frame in enumerate(frames):
-                path = self.temp / f"{key}-{name}-{index}.cur"
-                path.write_bytes(encode_cur(frame, (project.size,), project.pixel))
-                self.frame_cache[(key, name, index)] = path
+                for size in self.render_sizes(project):
+                    path = self.temp / f"{key}-{name}-{index}-{size}.cur"
+                    path.write_bytes(encode_cur(frame, (size,), project.pixel))
+                    self.frame_cache[(key, name, index, size)] = path
         project._runtime_pixmaps = {
             name: [pixmap(f.image) for f in frames] for name, frames in groups.items()
         }
@@ -294,7 +349,9 @@ class Engine:
             if rule_path not in self.rule_cache:
                 p = Project.load(rule_path)
                 folder = self.temp / ("scheme-" + str(len(self.rule_cache)))
-                paths = p.export(folder) if any(p.slots.values()) else {}
+                export_project = copy.copy(p)
+                export_project.multi_size = True
+                paths = export_project.export(folder) if any(p.slots.values()) else {}
                 for path in paths.values():
                     native.validate_file(path, p.size)
                 self.prepare_frames(p)
@@ -306,13 +363,13 @@ class Engine:
             native.write_snapshot(self.base_snapshot)
             self.project = self.base_project
         self.prepare_sounds(self.project)
-        self.overlay.settings = self.project.settings
+        self.overlay.settings = dict(self.project.settings, pixel=self.project.pixel)
         self.overlay.effects = {
             key: [(pixmap(f.image), f.duration) for f in frames]
             for key, frames in self.project.effects.items()
         }
-        self.shot_state = ""
-        self.shot_until = 0
+        self.resolver = Resolver()
+        self.active_audio = set()
         self.last_sound_trigger = ""
         self.last_rule = rule_path
         self.dirty_roles.clear()
@@ -332,6 +389,84 @@ class Engine:
             finally:
                 self.on_error(str(e))
 
+    @staticmethod
+    def read_buttons():
+        return {
+            name: native.button_down(vk)
+            for name, vk in (("left", 1), ("right", 2), ("middle", 4))
+        }
+
+    @staticmethod
+    def pixel_size(project, ratio):
+        return max(16, min(256, round(project.size * ratio)))
+
+    def render_sizes(self, project):
+        return {
+            project.size,
+            *(
+                self.pixel_size(project, screen.devicePixelRatio())
+                for screen in QApplication.screens()
+            ),
+        }
+
+    def cursor_pixels(self, project, pos):
+        screen = QApplication.screenAt(pos) or QApplication.primaryScreen()
+        return self.pixel_size(project, screen.devicePixelRatio() if screen else 1)
+
+    def rule_frames(self, rule):
+        if rule.get("source"):
+            return self.project.events.get(rule["source"], [])
+        return self.project.animations.get(rule["id"], [])
+
+    def animation_rules(self):
+        rules = list(self.project.settings.get("animation_rules", []))
+        common = self.project.settings.get("interaction_scope") == "common"
+        for key, frames in self.project.events.items():
+            if not frames:
+                continue
+            role, trigger = key.split(".")
+            if common and role != "Arrow":
+                continue
+            if trigger in (
+                "left",
+                "right",
+                "up",
+                "down",
+            ) and not self.project.settings.get("direction"):
+                continue
+            rules.append(
+                {
+                    "id": "legacy_" + key.replace(".", "_"),
+                    "trigger": trigger,
+                    "button": "any",
+                    "motion": "any",
+                    "role": "any" if common else role,
+                    "source": key,
+                    "lock": trigger == "hold",
+                }
+            )
+        return rules
+
+    def play_sound(self, trigger):
+        pool = self.sounds.get(trigger, [])
+        if not pool:
+            return
+        mode = self.project.settings.get("sound_modes", {}).get(trigger, "random")
+        if mode == "sequence":
+            index = self.sound_indices.get(trigger, 0) % len(pool)
+            sound = pool[index]
+            if sound.status() != QSoundEffect.Status.Ready:
+                return
+            self.sound_indices[trigger] = (index + 1) % len(pool)
+        else:
+            ready = [
+                sound for sound in pool if sound.status() == QSoundEffect.Status.Ready
+            ]
+            if not ready:
+                return
+            sound = random.choice(ready)
+        sound.play()
+
     def _tick(self):
         now = time.monotonic()
         dt = min(0.2, now - self.last_tick)
@@ -340,141 +475,103 @@ class Engine:
         pos = QCursor.pos()
         delta = pos - self.last_position
         distance = math.hypot(delta.x(), delta.y())
-        speed = distance / max(0.001, dt)
         settings = self.project.settings
-        left, right = native.button_down(1), native.button_down(2)
-        middle = native.button_down(4)
-        new_left = left and not self.prev_left
-        new_right = right and not self.prev_right
-        new_middle = middle and not self.prev_middle
-        clicked = new_left or new_right or new_middle
-        released = (
-            (self.prev_left and not left)
-            or (self.prev_right and not right)
-            or (self.prev_middle and not middle)
-        )
-        pressed = left or right or middle
-        if distance > 0 or pressed or released:
-            self.last_activity = now
-        if clicked:
-            self.press_time = now
-            self.held_fired = False
-        double = new_left and now - self.last_left_click <= 0.5
-        if new_left:
-            self.last_left_click = now
-        self.prev_left, self.prev_right, self.prev_middle = left, right, middle
-        if distance > 0:
-            self.last_move = now
-            if settings.get("trail") and math.hypot(
-                pos.x() - self.last_trail_pos.x(), pos.y() - self.last_trail_pos.y()
-            ) >= settings.get("trail_spacing", 12):
-                self.overlay.emit_at(pos, "trail")
-                self.last_trail_pos = QPoint(pos)
-        moving = distance > 0 or (self.was_moving and now - self.last_move < 0.15)
         detected = native.current_role()
-        role = detected if detected in self.project.slots else "Arrow"
-        role_changed = role != self.role
-        if role_changed:
-            if self.dirty_roles:
-                native.reload()
-                self.dirty_roles.clear()
-            self.state = ""
-            self.index = 0
-            self.elapsed = 0
-            self.last_frame = None
-            self.shot_state = ""
-        self.role = role
-        event_role = "Arrow" if settings.get("interaction_scope") == "common" else role
-        events = {
-            trigger: self.project.event_frames(event_role, trigger)
-            for trigger in EVENTS
-        }
-        candidates = []
-        if double:
-            candidates.append("double_click")
-        if new_left:
-            candidates.append("left_click")
-        if new_right:
-            candidates.append("right_click")
-        if new_middle:
-            candidates.append("middle_click")
-        if clicked:
-            candidates.append("click")
-            self.overlay.emit_at(pos, settings.get("click_effect", "ripple"))
-        if released:
-            candidates.append("release")
-        if pressed and now - self.press_time >= 0.5 and not self.held_fired:
-            candidates.append("hold")
-            self.held_fired = True
-        if role_changed:
-            candidates.append("role_change")
-        if moving and not self.was_moving:
-            candidates.append("move_start")
-        if not moving and self.was_moving:
-            candidates.append("move_stop")
-        self.was_moving = moving
-        # Discrete events are one-shot; configured specific actions override generic clicks.
-        shot = next((key for key in candidates if events[key]), None)
-        if shot:
-            self.shot_state = shot
-            self.shot_until = now + sum(frame.duration for frame in events[shot]) / 1000
-            self.state = ""
-            self.elapsed = 0
-            self.index = 0
-        state = "base"
-        if detected is not None:
-            if now < self.shot_until and self.shot_state:
-                state = self.shot_state
-            elif pressed and distance > 0 and events["drag"]:
-                state = "drag"
-            elif (
-                now - self.last_activity >= float(settings.get("idle_seconds", 5))
-                and events["idle"]
-            ):
-                state = "idle"
-            elif distance > 0:
-                direction = (
-                    ("right" if delta.x() > 0 else "left")
-                    if abs(delta.x()) >= abs(delta.y())
-                    else ("down" if delta.y() > 0 else "up")
-                )
-                if settings.get("direction") and events[direction]:
-                    state = direction
-                elif events["move"]:
-                    state = "move"
-        # Sounds can be used without a cursor animation. Continuous states sound on entry.
-        audio_candidates = list(candidates)
-        if pressed and distance > 0:
-            audio_candidates.append("drag")
-        if now - self.last_activity >= float(settings.get("idle_seconds", 5)):
-            audio_candidates.append("idle")
-        elif distance > 0:
-            direction = (
-                ("right" if delta.x() > 0 else "left")
-                if abs(delta.x()) >= abs(delta.y())
-                else ("down" if delta.y() > 0 else "up")
-            )
-            audio_candidates.extend([direction, "move"])
-        sound_trigger = next(
-            (key for key in audio_candidates if self.sounds.get(key)), ""
+        context = self.inputs.update(
+            now,
+            (pos.x(), pos.y()),
+            self.read_buttons(),
+            detected,
+            float(settings.get("idle_seconds", 5)),
         )
-        if sound_trigger and (
-            sound_trigger in candidates or sound_trigger != self.last_sound_trigger
+        role = detected if detected in self.project.slots else "Arrow"
+        if role != self.role and self.dirty_roles:
+            native.reload()
+            self.dirty_roles.clear()
+        self.role = role
+        if "click" in context.pulses:
+            self.overlay.emit_at(pos, settings.get("click_effect", "ripple"))
+        if (
+            distance
+            and settings.get("trail")
+            and math.hypot(
+                pos.x() - self.last_trail_pos.x(), pos.y() - self.last_trail_pos.y()
+            )
+            >= settings.get("trail_spacing", 12)
         ):
-            pool = [
-                sound
-                for sound in self.sounds[sound_trigger]
-                if sound.status() == QSoundEffect.Status.Ready
-            ]
-            if pool:
-                random.choice(pool).play()
-        self.last_sound_trigger = sound_trigger
-        if state != self.state:
-            self.state = state
+            self.overlay.emit_at(pos, "trail")
+            self.last_trail_pos = QPoint(pos)
+        continuous_audio = {
+            trigger
+            for trigger in (
+                "hold",
+                "drag",
+                "idle",
+                "move",
+                "left",
+                "right",
+                "up",
+                "down",
+            )
+            if owners(trigger, context)
+        }
+        # Direction and generic movement audio share one feedback channel; specific clicks override generic clicks.
+        for button in sorted(context.pulses.get("click", set())):
+            if (
+                button == "left"
+                and "double_click" in context.pulses
+                and self.sounds.get("double_click")
+            ):
+                self.play_sound("double_click")
+            else:
+                specific = button + "_click"
+                self.play_sound(specific if self.sounds.get(specific) else "click")
+        for trigger in context.pulses:
+            if trigger not in (
+                "click",
+                "left_click",
+                "right_click",
+                "middle_click",
+                "double_click",
+            ):
+                self.play_sound(trigger)
+        for trigger in continuous_audio - self.active_audio:
+            if trigger == "move" and any(
+                self.sounds.get(k)
+                for k in ("left", "right", "up", "down")
+                if k in continuous_audio
+            ):
+                continue
+            self.play_sound(trigger)
+        self.active_audio = continuous_audio
+        rule = (
+            self.resolver.select(
+                self.animation_rules(),
+                self.rule_frames,
+                context,
+                settings.get("trigger_order", ORDER),
+            )
+            if detected is not None
+            else None
+        )
+        state = rule["trigger"] if rule else "base"
+        group = (
+            (rule.get("source") or "animations." + rule["id"])
+            if rule
+            else "slots." + role
+        )
+        frames = self.rule_frames(rule) if rule else self.project.slots.get(role, [])
+        identity = (id(self.project), group)
+        if getattr(self, "animation_identity", None) != identity or (
+            rule
+            and state in context.pulses
+            and state not in ("hold", "drag", "pressed")
+        ):
+            self.animation_identity = identity
             self.index = 0
             self.elapsed = 0
             self.last_frame = None
-        frames = self.project.slots.get(role, []) if state == "base" else events[state]
+        self.state = state
         if not frames:
             if self.dirty_roles:
                 native.reload()
@@ -483,27 +580,39 @@ class Engine:
             self.overlay.update()
             self.last_position = pos
             return
-        group = "slots." + role if state == "base" else event_key(event_role, state)
         factor = (
-            max(0.5, min(3, speed / 350))
-            if settings.get("speed") and distance > 0 and state not in ("click", "idle")
+            max(0.5, min(3, distance / max(0.001, dt) / 350))
+            if settings.get("speed")
+            and context.moving
+            and state not in ("click", "idle")
             else 1
         )
         self.elapsed += dt * 1000 * factor
         while self.elapsed >= frames[self.index].duration:
             self.elapsed -= frames[self.index].duration
             self.index = (self.index + 1) % len(frames)
-        frame_key = (id(self.project), group, self.index)
-        if state != "base":
-            if frame_key != self.last_frame:
-                if native.set_live_cursor(
-                    role, self.frame_cache[frame_key], self.project.size
-                ):
+        size = self.cursor_pixels(self.project, pos)
+        frame_key = (id(self.project), group, self.index, size)
+        if rule:
+            if (
+                frame_key != self.last_frame
+                or getattr(self, "last_target_role", None) != role
+            ):
+                if frame_key not in self.frame_cache:
+                    path = (
+                        self.temp
+                        / f"{id(self.project)}-{group}-{self.index}-{size}.cur"
+                    )
+                    path.write_bytes(
+                        encode_cur(frames[self.index], (size,), self.project.pixel)
+                    )
+                    self.frame_cache[frame_key] = path
+                if native.set_live_cursor(role, self.frame_cache[frame_key], size):
                     self.dirty_roles.add(role)
         elif self.dirty_roles:
             native.reload()
             self.dirty_roles.clear()
-        self.last_frame = frame_key
+        self.last_frame, self.last_target_role = frame_key, role
         self.update_companion(pos, now, group)
         self.overlay.update()
         self.last_position = pos
@@ -513,6 +622,7 @@ class Engine:
             for sound in pool:
                 sound.stop()
                 sound.deleteLater()
+        self.sound_indices = {}
         files = dict(project.settings.get("sounds", {}))
         if project.settings.get("sound") and not files.get("click"):
             files["click"] = [project.settings["sound"]]

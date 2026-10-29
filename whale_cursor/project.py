@@ -131,6 +131,7 @@ class Project:
     slots: dict[str, list[Frame]] = field(default_factory=dict)
     events: dict[str, list[Frame]] = field(default_factory=dict)
     effects: dict[str, list[Frame]] = field(default_factory=dict)
+    animations: dict[str, list[Frame]] = field(default_factory=dict)
     settings: dict = field(
         default_factory=lambda: {
             "click_effect": "ripple",
@@ -144,6 +145,8 @@ class Project:
             "app_rules": [],
             "interaction_scope": "common",
             "sounds": {},
+            "sound_modes": {},
+            "animation_rules": [],
             "history_limit": 30,
             "effect_size": 64,
             "click_size": 64,
@@ -175,7 +178,7 @@ class Project:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         manifest = {
-            "version": 4,
+            "version": 5,
             "name": self.name,
             "size": self.size,
             "pixel": self.pixel,
@@ -184,11 +187,12 @@ class Project:
             "slots": {},
             "events": {},
             "effects": {},
+            "animations": {},
         }
         temp = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
         try:
             with zipfile.ZipFile(temp, "w", zipfile.ZIP_STORED) as z:
-                for group in ("slots", "events", "effects"):
+                for group in ("slots", "events", "effects", "animations"):
                     for key, frames in getattr(self, group).items():
                         records = []
                         if not 0 <= len(frames) <= MAX_FRAMES:
@@ -242,7 +246,7 @@ class Project:
             if z.getinfo("project.json").file_size > 2 * 1024 * 1024:
                 raise ValueError("方案索引过大")
             m = json.loads(z.read("project.json"))
-            if m.get("version") not in (2, 3, 4) or m.get("size") not in SIZES:
+            if m.get("version") not in (2, 3, 4, 5) or m.get("size") not in SIZES:
                 raise ValueError("不支持的方案版本 / 尺寸")
             p = cls.defaults()
             p.name = str(m.get("name", "未命名"))[:120]
@@ -250,12 +254,24 @@ class Project:
             p.pixel = bool(m.get("pixel", True))
             p.multi_size = bool(m.get("multi_size", False))
             p.settings.update(m.get("settings", {}))
+            from .conditions import validate_rule
+
+            rules = p.settings.get("animation_rules", [])
+            if not isinstance(rules, list) or len(rules) > 1024:
+                raise ValueError("动画规则数量无效")
+            ids = set()
+            for rule in rules:
+                validate_rule(rule)
+                if rule["id"] in ids:
+                    raise ValueError("动画规则标识重复")
+                ids.add(rule["id"])
             if m.get("version", 2) < 4:
                 p.settings["interaction_scope"] = "role"
             for group, allowed in (
                 ("slots", SLOTS),
                 ("events", EVENTS),
                 ("effects", EFFECTS),
+                ("animations", set(m.get("animations", {}))),
             ):
                 for key, records in m.get(group, {}).items():
                     if group == "events":
@@ -268,6 +284,12 @@ class Project:
                         if key not in allowed:
                             continue
                         target = key
+                        if group == "animations" and (
+                            len(key) > 100
+                            or not key
+                            or not all(c.isalnum() or c in "_-" for c in key)
+                        ):
+                            raise ValueError("动画素材标识无效")
                     if not 0 <= len(records) <= MAX_FRAMES:
                         raise ValueError("方案帧数无效")
                     frames = []
@@ -348,7 +370,7 @@ class Project:
 
     def inspect(self):
         rows = []
-        for group in ("slots", "events", "effects"):
+        for group in ("slots", "events", "effects", "animations"):
             for key, frames in getattr(self, group).items():
                 name = (
                     ("系统 · " + SLOTS[key])
@@ -356,7 +378,11 @@ class Project:
                     else (
                         ("效果 · " + EFFECTS[key])
                         if group == "effects"
-                        else ("互动 · " + event_name(key))
+                        else (
+                            ("条件 · " + self.animation_name(key))
+                            if group == "animations"
+                            else ("互动 · " + event_name(key))
+                        )
                     )
                 )
                 issues = []
@@ -409,3 +435,12 @@ class Project:
             for row in self.inspect()
             for issue in row["issues"]
         ]
+
+    def animation_name(self, key):
+        from .conditions import describe
+
+        rule = next(
+            (r for r in self.settings.get("animation_rules", []) if r["id"] == key),
+            None,
+        )
+        return describe(rule) if rule else "未关联动画"

@@ -61,6 +61,7 @@ from .runtime import Engine, pixmap
 from . import native
 from .editing import History, snapshot, encode_clipboard, decode_clipboard
 from .widgets import AnimatedThumb, MatchDialog, InspectionDialog
+from .conditions import BUTTONS, MOTIONS, TRIGGERS, ORDER, describe, validate_rule
 
 STYLE = """
 QWidget {font-family:"Microsoft YaHei UI","Noto Sans CJK SC","Segoe UI";font-size:13px;color:#24413D;}
@@ -443,6 +444,7 @@ class Window(QMainWindow):
         self.save_timer.start()
         if self.tabs.currentIndex() == 1:
             self.refresh_events()
+            self.refresh_conditions()
 
     def autosave_background(self):
         if self.save_worker is not None and self.save_worker.isRunning():
@@ -498,7 +500,7 @@ class Window(QMainWindow):
         self.build_schemes()
         self.build_settings()
         self.tabs.currentChanged.connect(
-            lambda index: self.refresh_events() if index == 1 else None
+            lambda index: self.refresh_interaction_views() if index == 1 else None
         )
         bottom = QHBoxLayout()
 
@@ -531,7 +533,7 @@ class Window(QMainWindow):
         sidebar, side = card()
         sidebar.setFixedWidth(195)
         self.group_box = ChoiceBox()
-        self.group_box.addItems(["系统指针", "互动动画", "装饰效果"])
+        self.group_box.addItems(["系统指针", "已有互动", "装饰效果", "条件动画"])
         self.group_box.currentIndexChanged.connect(self.change_group)
         side.addWidget(self.group_box)
         self.trigger_box = ChoiceBox()
@@ -716,7 +718,7 @@ class Window(QMainWindow):
         if self.syncing:
             return
         self.stop_play()
-        self.group = ("slots", "events", "effects")[index]
+        self.group = ("slots", "events", "effects", "animations")[index]
         self.key = "click" if self.group == "effects" else "Arrow"
         self.trigger_box.setVisible(index == 1)
         self.frame_index = 0
@@ -732,8 +734,8 @@ class Window(QMainWindow):
                 self.project.slots.get(role, [])
                 if self.group == "slots"
                 else (
-                    self.project.effects.get(role, [])
-                    if self.group == "effects"
+                    getattr(self.project, self.group).get(role, [])
+                    if self.group in ("effects", "animations")
                     else self.project.event_frames(role, self.trigger)
                 )
             )
@@ -913,6 +915,8 @@ class Window(QMainWindow):
             self.load_files(files, append)
 
     def load_files(self, files, append=False):
+        if self.group == "animations" and self.key == "__empty":
+            raise ValueError("请先在互动页添加动画规则")
         result = []
         for path in sorted(files):
             result.extend(import_images(Path(path), self.project.pixel))
@@ -930,7 +934,7 @@ class Window(QMainWindow):
         self.touch()
 
     def batch_import(self):
-        if self.group == "effects":
+        if self.group in ("effects", "animations"):
             self.import_files(False)
             return
         if (
@@ -1221,8 +1225,45 @@ class Window(QMainWindow):
         layout.addWidget(banner)
         columns = QHBoxLayout()
         layout.addLayout(columns)
-        actions, ac = card()
+        actions, action_outer = card()
         columns.addWidget(actions, 1)
+        animation_tabs = QTabWidget()
+        action_outer.addWidget(animation_tabs)
+        conditions_page = QWidget()
+        legacy_page = QWidget()
+        animation_tabs.addTab(conditions_page, "条件动画")
+        animation_tabs.addTab(legacy_page, "已有动画")
+        ac = QVBoxLayout(legacy_page)
+        rc = QVBoxLayout(conditions_page)
+        controls = QHBoxLayout()
+        controls.addWidget(self.button("添加", self.add_condition_rule))
+        controls.addWidget(self.button("条件", self.edit_condition_rule))
+        controls.addWidget(self.button("删除", self.delete_condition_rule))
+        controls.addStretch()
+        controls.addWidget(self.button("触发顺序", self.edit_trigger_order))
+        rc.addLayout(controls)
+        self.condition_list = QListWidget()
+        self.condition_list.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self.condition_list.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self.condition_list.setIconSize(QSize(40, 40))
+        self.condition_list.setMinimumHeight(150)
+        self.condition_list.setToolTip(
+            "条件越具体越优先；同样具体按列表顺序。可拖动排序。"
+        )
+        self.condition_list.currentRowChanged.connect(self.preview_condition)
+        self.condition_list.model().rowsMoved.connect(self.condition_order_changed)
+        self.condition_list.itemDoubleClicked.connect(
+            lambda _: self.edit_condition_rule()
+        )
+        rc.addWidget(self.condition_list, 1)
+        asset_row = QHBoxLayout()
+        self.condition_preview = AnimatedThumb(size=64)
+        asset_row.addWidget(self.condition_preview)
+        asset_row.addStretch()
+        asset_row.addWidget(self.button("导入动画", self.import_condition_animation))
+        asset_row.addWidget(self.button("制作", self.edit_condition_animation))
+        rc.addLayout(asset_row)
+        self.refresh_conditions()
         ac.addWidget(label("触发与动画", "title"))
         ac.addWidget(
             label(
@@ -1289,7 +1330,20 @@ class Window(QMainWindow):
         effect_tabs.addTab(audio_page, "音效")
         ef = QVBoxLayout(effect_page)
         audio_layout = QVBoxLayout(audio_page)
-        ef.addWidget(label("效果与响应", "title"))
+        feature_tabs = QTabWidget()
+        ef.addWidget(feature_tabs)
+        feature_layouts = {}
+        for key, title in (
+            ("click", "点击"),
+            ("trail", "拖尾"),
+            ("companion", "角色"),
+            ("response", "响应"),
+        ):
+            feature = QWidget()
+            feature_tabs.addTab(feature, title)
+            feature_layouts[key] = QVBoxLayout(feature)
+        click_layout = feature_layouts["click"]
+        response_layout = feature_layouts["response"]
         form = QFormLayout()
         self.click_effect = ChoiceBox()
         self.click_effect.addItems(["水波", "花瓣", "关闭", "自定义"])
@@ -1309,66 +1363,82 @@ class Window(QMainWindow):
         self.idle.setSuffix(" 秒")
         self.idle.setValue(int(self.project.settings.get("idle_seconds", 5)))
         self.idle.valueChanged.connect(lambda v: self.setting("idle_seconds", v))
-        form.addRow("闲置多久后切换", self.idle)
-        ef.addLayout(form)
+        click_layout.addLayout(form)
+        response_form = QFormLayout()
+        response_form.addRow("闲置等待", self.idle)
+        response_layout.addLayout(response_form)
         self.setting_checks = {}
         for key, text in [
             ("trail", "移动时显示装饰拖尾"),
             ("companion", "显示跟随鼠标的角色"),
-            ("direction", "按移动方向切换动作"),
+            ("direction", "已有动画按方向切换"),
             ("speed", "按移动速度调整动画速度"),
         ]:
             check = QCheckBox(text)
             check.setChecked(bool(self.project.settings.get(key)))
             check.toggled.connect(lambda value, k=key: self.setting(k, value))
             self.setting_checks[key] = check
-            ef.addWidget(check)
+            feature_layouts[
+                key if key in ("trail", "companion") else "response"
+            ].addWidget(check)
         self.effect_fields = {}
         self.effect_defaults = {}
-        effect_form = QGridLayout()
-        for row, (key, title, low, high, default) in enumerate(
-            [
-                ("click_size", "点击大小", 8, 256, 64),
-                ("trail_size", "拖尾大小", 8, 256, 24),
-                ("companion_size", "角色大小", 8, 256, 64),
-                ("effect_lifetime", "持续 ms", 100, 10000, 850),
-                ("effect_opacity", "不透明度 %", 0, 100, 100),
-                ("trail_spacing", "拖尾间距", 1, 200, 12),
-                ("companion_x", "跟随 x", -256, 256, 20),
-                ("companion_y", "跟随 y", -256, 256, 20),
-            ]
-        ):
+        feature_forms = {key: QFormLayout() for key in ("click", "trail", "companion")}
+        for key in feature_forms:
+            feature_layouts[key].addLayout(feature_forms[key])
+        for key, title, low, high, default, feature in [
+            ("click_size", "大小", 8, 256, 64, "click"),
+            ("effect_lifetime", "持续 ms", 100, 10000, 850, "click"),
+            ("click_opacity", "不透明度 %", 0, 100, 100, "click"),
+            ("trail_size", "大小", 8, 256, 24, "trail"),
+            ("trail_lifetime", "持续 ms", 100, 10000, 850, "trail"),
+            ("trail_opacity", "不透明度 %", 0, 100, 100, "trail"),
+            ("trail_spacing", "间距", 1, 200, 12, "trail"),
+            ("companion_size", "大小", 8, 256, 64, "companion"),
+            ("companion_opacity", "不透明度 %", 0, 100, 100, "companion"),
+            ("companion_x", "横向偏移", -256, 256, 20, "companion"),
+            ("companion_y", "纵向偏移", -256, 256, 20, "companion"),
+        ]:
             field = NumberBox()
             field.setRange(low, high)
-            field.setKeyboardTracking(False)
-            value = self.project.settings.get(key, default)
+            field.setFixedWidth(110)
+            value = self.project.settings.get(
+                key,
+                self.project.settings.get("effect_opacity", 1.0)
+                if key.endswith("opacity")
+                else default,
+            )
             field.setValue(
-                round(value * 100) if key == "effect_opacity" else int(value)
+                round(value * 100) if key.endswith("opacity") else int(value)
             )
             field.valueChanged.connect(
                 lambda v, k=key: self.setting(
-                    k, v / 100 if k == "effect_opacity" else v
+                    k, v / 100 if k.endswith("opacity") else v
                 )
             )
             self.effect_fields[key] = field
-            self.effect_defaults[key] = 1.0 if key == "effect_opacity" else default
-            effect_form.addWidget(label(title), row // 2, (row % 2) * 2)
-            effect_form.addWidget(field, row // 2, (row % 2) * 2 + 1)
-        ef.addLayout(effect_form)
+            self.effect_defaults[key] = 1.0 if key.endswith("opacity") else default
+            feature_forms[feature].addRow(title, field)
         for key, title in EFFECTS.items():
             row = QHBoxLayout()
-            row.addWidget(label(title), 1)
-            row.addWidget(self.button("导入", lambda k=key: self.import_effect(k)))
+            row.addWidget(self.button("导入素材", lambda k=key: self.import_effect(k)))
             row.addWidget(self.button("制作", lambda k=key: self.edit_effect(k)))
-            ef.addLayout(row)
-        ef.addStretch()
+            feature_layouts[key].addLayout(row)
+        for feature in feature_layouts.values():
+            feature.addStretch()
         self.sound_trigger = ChoiceBox()
         self.sound_trigger.addItems(list(EVENTS.values()))
         self.sound_trigger.currentIndexChanged.connect(
             lambda _: self.refresh_sound_list()
         )
         audio_layout.addWidget(self.sound_trigger)
+        self.sound_mode = ChoiceBox()
+        self.sound_mode.addItems(["随机播放", "顺序播放"])
+        self.sound_mode.currentIndexChanged.connect(self.sound_mode_changed)
+        audio_layout.addWidget(self.sound_mode)
         self.sound_list = QListWidget()
+        self.sound_list.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self.sound_list.model().rowsMoved.connect(self.sound_order_changed)
         self.sound_list.setSelectionMode(
             QAbstractItemView.SelectionMode.ExtendedSelection
         )
@@ -1378,7 +1448,7 @@ class Window(QMainWindow):
         audio.addWidget(self.button("移除", self.remove_sounds))
         audio.addWidget(self.button("清空", self.clear_sounds))
         audio_layout.addLayout(audio)
-        self.sound_label = label("多段音频随机播放", "muted")
+        self.sound_label = label("", "muted")
         audio_layout.addWidget(self.sound_label)
         self.volume = DecimalBox()
         self.volume.setRange(0, 1)
@@ -1527,10 +1597,19 @@ class Window(QMainWindow):
     def refresh_sound_list(self):
         if not hasattr(self, "sound_list"):
             return
+        trigger = list(EVENTS)[self.sound_trigger.currentIndex()]
+        self.sound_mode.blockSignals(True)
+        self.sound_mode.setCurrentIndex(
+            1
+            if self.project.settings.get("sound_modes", {}).get(trigger) == "sequence"
+            else 0
+        )
+        self.sound_mode.blockSignals(False)
         self.sound_list.clear()
         for file in self.audio_files(list(EVENTS)[self.sound_trigger.currentIndex()]):
             item = QListWidgetItem(Path(file).name)
             item.setToolTip(file)
+            item.setData(Qt.ItemDataRole.UserRole, file)
             self.sound_list.addItem(item)
 
     def clear_sounds(self):
@@ -1843,9 +1922,14 @@ class Window(QMainWindow):
         self.scope_box.blockSignals(False)
         for key, field in self.effect_fields.items():
             field.blockSignals(True)
-            value = project.settings.get(key, self.effect_defaults[key])
+            value = project.settings.get(
+                key,
+                project.settings.get("effect_opacity", 1.0)
+                if key.endswith("opacity")
+                else self.effect_defaults[key],
+            )
             field.setValue(
-                round(value * 100) if key == "effect_opacity" else int(value)
+                round(value * 100) if key.endswith("opacity") else int(value)
             )
             field.blockSignals(False)
         self.refresh_sound_list()
@@ -1853,6 +1937,7 @@ class Window(QMainWindow):
         self.rebuild_slots()
         self.refresh_rules()
         self.refresh_events()
+        self.refresh_conditions()
         self.touch()
 
     def build_settings(self):
@@ -1953,7 +2038,7 @@ class Window(QMainWindow):
         a.addWidget(label("关于", "title"))
         a.addWidget(
             label(
-                "鲸鱼娘指针工坊 2.2\n原生 CUR / ANI 安装无需常驻；桌面互动在托盘运行，可随时停止。\n方案与导入素材保存在当前用户目录，程序不上传图片或鼠标操作。\n支持 Windows 10 / 11。游戏、远程桌面和部分自绘指针应用可能使用自己的指针。"
+                "鲸鱼娘指针工坊 2.3\n原生 CUR / ANI 安装无需常驻；桌面互动在托盘运行，可随时停止。\n方案与导入素材保存在当前用户目录，程序不上传图片或鼠标操作。\n支持 Windows 10 / 11。游戏、远程桌面和部分自绘指针应用可能使用自己的指针。"
             )
         )
         a.addWidget(
@@ -2117,7 +2202,7 @@ class Window(QMainWindow):
             self.group, self.key, self.frame_index, self.trigger = selection
             self.group_box.blockSignals(True)
             self.group_box.setCurrentIndex(
-                ("slots", "events", "effects").index(self.group)
+                ("slots", "events", "effects", "animations").index(self.group)
             )
             self.group_box.blockSignals(False)
             self.trigger_box.blockSignals(True)
@@ -2267,6 +2352,11 @@ class Window(QMainWindow):
     def role_names(self):
         if self.group == "effects":
             return EFFECTS
+        if self.group == "animations":
+            return {
+                r["id"]: describe(r)
+                for r in self.project.settings.get("animation_rules", [])
+            } or {"__empty": "请先添加动画规则"}
         if (
             self.group == "events"
             and self.project.settings.get("interaction_scope") == "common"
@@ -2277,8 +2367,8 @@ class Window(QMainWindow):
     def clear_list(self):
         group = getattr(self.project, self.group)
         keys = (
-            list(EFFECTS)
-            if self.group == "effects"
+            list(self.role_names)
+            if self.group in ("effects", "animations")
             else [
                 k if self.group == "slots" else event_key(k, self.trigger)
                 for k in self.role_names
@@ -2364,3 +2454,255 @@ class Window(QMainWindow):
         self.project.settings["shortcuts"] = {}
         self.sync_shortcuts()
         self.touch()
+
+    def selected_condition(self):
+        item = self.condition_list.currentItem()
+        return next(
+            (
+                r
+                for r in self.project.settings.get("animation_rules", [])
+                if item and r["id"] == item.data(Qt.ItemDataRole.UserRole)
+            ),
+            None,
+        )
+
+    def refresh_conditions(self, selected=None):
+        if not hasattr(self, "condition_list"):
+            return
+        old = self.selected_condition()
+        selected = selected or (old["id"] if old else None)
+        self.condition_list.blockSignals(True)
+        self.condition_list.clear()
+        for rule in self.project.settings.get("animation_rules", []):
+            frames = self.project.animations.get(rule["id"], [])
+            item = QListWidgetItem(
+                describe(rule)
+                + ("" if frames else " · 未导入")
+                + ("" if rule.get("enabled", True) else " · 已停用")
+            )
+            item.setData(Qt.ItemDataRole.UserRole, rule["id"])
+            if frames:
+                item.setIcon(QIcon(pixmap(frames[0].image)))
+            self.condition_list.addItem(item)
+            if rule["id"] == selected:
+                self.condition_list.setCurrentItem(item)
+        if self.condition_list.currentRow() < 0 and self.condition_list.count():
+            self.condition_list.setCurrentRow(0)
+        self.condition_list.blockSignals(False)
+        self.preview_condition()
+
+    def preview_condition(self, row=0):
+        rule = self.selected_condition()
+        self.condition_preview.set_frames(
+            self.project.animations.get(rule["id"], []) if rule else []
+        )
+
+    def add_condition_rule(self):
+        self.edit_condition_rule(new=True)
+
+    def edit_condition_rule(self, new=False):
+        import uuid
+
+        old = None if new else self.selected_condition()
+        if not new and old is None:
+            return
+        rule = (
+            dict(old)
+            if old
+            else {
+                "id": uuid.uuid4().hex,
+                "trigger": "hold",
+                "button": "any",
+                "motion": "any",
+                "role": "any",
+                "lock": True,
+                "enabled": True,
+            }
+        )
+        dialog = QDialog(self)
+        dialog.setWindowTitle("动画条件")
+        form = QFormLayout(dialog)
+        fields = {}
+        for key, title, values in (
+            (
+                "trigger",
+                "触发",
+                {
+                    k: v
+                    for k, v in TRIGGERS.items()
+                    if k
+                    not in (
+                        "left",
+                        "right",
+                        "up",
+                        "down",
+                        "left_click",
+                        "right_click",
+                        "middle_click",
+                    )
+                },
+            ),
+            ("button", "按键", BUTTONS),
+            ("motion", "移动", MOTIONS),
+            ("role", "指针", {"any": "不限", **SLOTS}),
+        ):
+            box = ChoiceBox()
+            for value, text in values.items():
+                box.addItem(text, value)
+            box.setCurrentIndex(box.findData(rule.get(key, "any")))
+            fields[key] = box
+            form.addRow(title, box)
+        lock = QCheckBox("保持到对应按键松开")
+        lock.setChecked(rule.get("lock", False))
+
+        def sync_lock():
+            lock.setEnabled(
+                fields["trigger"].currentData()
+                in (
+                    "hold",
+                    "drag",
+                    "pressed",
+                    "click",
+                    "left_click",
+                    "right_click",
+                    "middle_click",
+                    "double_click",
+                )
+            )
+
+        def trigger_changed():
+            sync_lock()
+            lock.setChecked(fields["trigger"].currentData() == "hold")
+
+        fields["trigger"].currentIndexChanged.connect(trigger_changed)
+        sync_lock()
+        form.addRow(lock)
+        enabled = QCheckBox("启用")
+        enabled.setChecked(rule.get("enabled", True))
+        form.addRow(enabled)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        form.addRow(buttons)
+        if dialog.exec():
+            rule.update({key: box.currentData() for key, box in fields.items()})
+            rule.update(
+                lock=lock.isChecked() and lock.isEnabled(), enabled=enabled.isChecked()
+            )
+            validate_rule(rule)
+            self.remember("动画条件")
+            rules = list(self.project.settings.get("animation_rules", []))
+            if old:
+                rules[rules.index(old)] = rule
+            else:
+                rules.append(rule)
+            self.project.settings["animation_rules"] = rules
+            self.refresh_conditions(rule["id"])
+            if self.group == "animations":
+                self.rebuild_slots()
+            self.touch()
+
+    def delete_condition_rule(self):
+        rule = self.selected_condition()
+        if not rule:
+            return
+        self.remember("删除动画规则")
+        self.project.settings["animation_rules"] = [
+            r
+            for r in self.project.settings.get("animation_rules", [])
+            if r["id"] != rule["id"]
+        ]
+        self.project.animations.pop(rule["id"], None)
+        self.refresh_conditions()
+        if self.group == "animations":
+            self.rebuild_slots()
+        self.touch()
+
+    def condition_order_changed(self, *args):
+        rules = {r["id"]: r for r in self.project.settings.get("animation_rules", [])}
+        order = [
+            self.condition_list.item(i).data(Qt.ItemDataRole.UserRole)
+            for i in range(self.condition_list.count())
+        ]
+        if order == list(rules):
+            return
+        self.remember("动画规则排序")
+        self.project.settings["animation_rules"] = [rules[key] for key in order]
+        self.save_timer.start()
+
+    def edit_trigger_order(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("触发顺序 · 拖动调整")
+        layout = QVBoxLayout(dialog)
+        items = QListWidget()
+        items.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        order = self.project.settings.get("trigger_order", ORDER)
+        for key in dict.fromkeys([*order, *ORDER]):
+            item = QListWidgetItem(TRIGGERS[key])
+            item.setData(Qt.ItemDataRole.UserRole, key)
+            items.addItem(item)
+        layout.addWidget(items)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        layout.addWidget(buttons)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        if dialog.exec():
+            self.setting(
+                "trigger_order",
+                [
+                    items.item(i).data(Qt.ItemDataRole.UserRole)
+                    for i in range(items.count())
+                ],
+            )
+
+    def edit_condition_animation(self):
+        rule = self.selected_condition()
+        if not rule:
+            return
+        self.group_box.setCurrentIndex(3)
+        self.key = rule["id"]
+        self.frame_index = 0
+        self.rebuild_slots()
+        self.tabs.setCurrentIndex(0)
+
+    def import_condition_animation(self):
+        rule = self.selected_condition()
+        if not rule:
+            return
+        files, _ = QFileDialog.getOpenFileNames(self, "导入动画", "", FILTER)
+        if not files:
+            return
+        old = self.selection()
+        self.group, self.key, self.frame_index = "animations", rule["id"], 0
+        try:
+            self.load_files(files, False)
+        finally:
+            self.group, self.key, self.frame_index, self.trigger = old
+            self.rebuild_slots()
+        self.refresh_conditions(rule["id"])
+
+    def sound_mode_changed(self, index):
+        modes = dict(self.project.settings.get("sound_modes", {}))
+        modes[list(EVENTS)[self.sound_trigger.currentIndex()]] = (
+            "sequence" if index else "random"
+        )
+        self.setting("sound_modes", modes)
+
+    def sound_order_changed(self, *args):
+        trigger = list(EVENTS)[self.sound_trigger.currentIndex()]
+        sounds = dict(self.project.settings.get("sounds", {}))
+        sounds[trigger] = [
+            self.sound_list.item(i).data(Qt.ItemDataRole.UserRole)
+            for i in range(self.sound_list.count())
+        ]
+        self.remember("音效排序")
+        self.project.settings["sounds"] = sounds
+        self.save_timer.start()
+
+    def refresh_interaction_views(self):
+        self.refresh_events()
+        self.refresh_conditions()

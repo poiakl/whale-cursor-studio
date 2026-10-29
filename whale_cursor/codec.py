@@ -53,7 +53,7 @@ def encode_cur(frame: Frame, sizes=(64,), pixel=True) -> bytes:
     validate(frame)
     blobs, entries = [], []
     offset = 6 + 16 * len(sizes)
-    if not sizes or any(s not in SIZES for s in sizes):
+    if not sizes or any(not isinstance(s, int) or not 16 <= s <= 256 for s in sizes):
         raise ValueError("不支持的输出尺寸")
     for s in sizes:
         image = frame.image.resize(

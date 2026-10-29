@@ -11,7 +11,7 @@ from whale_cursor.codec import encode_cur, encode_ani, SIZES
 def test_windows_loads_cur_and_ani(tmp_path):
     p = Project.defaults()
     f = p.slots["Arrow"][0]
-    for size in SIZES:
+    for size in (*SIZES, 80, 112, 160, 192):
         path = tmp_path / f"{size}.cur"
         path.write_bytes(encode_cur(f, (size,)))
         native.validate_file(path, size)

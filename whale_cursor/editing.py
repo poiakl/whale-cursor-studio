@@ -12,7 +12,7 @@ from .codec import Frame, validate
 def snapshot(project):
     p = copy.copy(project)
     p.settings = copy.deepcopy(project.settings)
-    for group in ("slots", "events", "effects"):
+    for group in ("slots", "events", "effects", "animations"):
         setattr(
             p,
             group,

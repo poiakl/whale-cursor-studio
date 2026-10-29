@@ -1,0 +1,55 @@
+{
+  "Arrow": [
+    22,
+    47
+  ],
+  "Help": [
+    31,
+    82
+  ],
+  "AppStarting": null,
+  "Wait": null,
+  "No": null,
+  "Crosshair": [
+    84,
+    106
+  ],
+  "IBeam": [
+    108,
+    90
+  ],
+  "NWPen": [
+    21,
+    26
+  ],
+  "Pin": null,
+  "Hand": [
+    164,
+    48
+  ],
+  "UpArrow": [
+    19,
+    85
+  ],
+  "Person": null,
+  "SizeAll": [
+    78,
+    150
+  ],
+  "SizeNS": [
+    68,
+    118
+  ],
+  "SizeWE": [
+    118,
+    166
+  ],
+  "SizeNWSE": [
+    92,
+    140
+  ],
+  "SizeNESW": [
+    137,
+    140
+  ]
+}

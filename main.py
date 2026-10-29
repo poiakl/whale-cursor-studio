@@ -1,0 +1,61 @@
+import sys
+from PySide6.QtWidgets import QApplication
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
+from whale_cursor.ui import Window, STYLE
+
+
+def main():
+    app = QApplication(sys.argv)
+    app.setApplicationName("WhaleCursorStudio")
+    app.setStyle("Fusion")
+    app.setStyleSheet(STYLE)
+    # One instance per user: prevents two live-interaction engines overwriting each other's restore state.
+    import getpass, hashlib
+
+    name = (
+        "WhaleCursorStudio2-"
+        + hashlib.sha256(getpass.getuser().encode()).hexdigest()[:12]
+    )
+    probe = QLocalSocket()
+    probe.connectToServer(name)
+    if probe.waitForConnected(300):
+        probe.write(b"show")
+        probe.waitForBytesWritten(300)
+        return 0
+    server = QLocalServer()
+    QLocalServer.removeServer(name)
+    if not server.listen(name):
+        raise RuntimeError("无法创建单实例通信通道")
+    window = Window()
+
+    def incoming():
+        socket = server.nextPendingConnection()
+        if socket:
+            socket.disconnectFromServer()
+            socket.deleteLater()
+        window.show_window()
+
+    server.newConnection.connect(incoming)
+    app.aboutToQuit.connect(
+        lambda: window.engine.stop() if window.engine.active else None
+    )
+    window.show()
+    return app.exec()
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception:
+        import traceback
+        from whale_cursor.project import user_dir
+
+        log = user_dir() / "error.log"
+        log.write_text(traceback.format_exc(), encoding="utf-8")
+        if sys.platform == "win32":
+            import ctypes
+
+            ctypes.windll.user32.MessageBoxW(
+                None, "启动失败，错误日志：" + str(log), "指针工坊", 16
+            )
+        raise

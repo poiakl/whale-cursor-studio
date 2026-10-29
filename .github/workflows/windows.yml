@@ -1,0 +1,44 @@
+name: Windows desktop build
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: python -m pip install -r requirements-dev.txt
+      - run: python -m ruff check --select F .
+      - run: python -m pytest -q
+        env:
+          QT_QPA_PLATFORM: offscreen
+      - name: Package portable Windows app
+        run: python -m PyInstaller --noconfirm --clean --windowed --onedir --name WhaleCursorStudio --add-data "assets;assets" --collect-all PySide6.QtMultimedia main.py
+      - name: Archive portable app
+        shell: pwsh
+        run: |
+          Copy-Item README.md dist/WhaleCursorStudio/使用说明.md
+          Compress-Archive -Path dist/WhaleCursorStudio -DestinationPath WhaleCursorStudio-Windows.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WhaleCursorStudio-Windows
+          path: WhaleCursorStudio-Windows.zip
+          retention-days: 30
+      - name: Publish rolling portable release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view desktop-latest 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create desktop-latest --title "Windows 便携版" --notes "解压后运行 WhaleCursorStudio.exe。后续主分支构建会更新此附件。"
+          }
+          gh release upload desktop-latest WhaleCursorStudio-Windows.zip --clobber

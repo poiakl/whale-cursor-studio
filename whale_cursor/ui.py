@@ -2,12 +2,13 @@ from __future__ import annotations
 import time
 from pathlib import Path
 from PIL import Image
-from PySide6.QtCore import Qt, Signal, QTimer, QSize, QPointF, QRectF, QUrl
+from PySide6.QtCore import Qt, Signal, QTimer, QSize, QPointF, QRectF, QUrl, QMimeData
 from PySide6.QtGui import (
     QColor,
     QPainter,
     QPen,
     QCursor,
+    QDrag,
     QIcon,
     QAction,
     QDesktopServices,
@@ -85,6 +86,43 @@ def card():
     layout.setContentsMargins(16, 16, 16, 16)
     layout.setSpacing(12)
     return w, layout
+
+
+class FrameList(QListWidget):
+    """Move the logical sequence, rather than only repositioning icons on the viewport."""
+
+    move_requested = Signal(int, int)
+    mime_type = "application/x-whale-frame"
+
+    def startDrag(self, actions):
+        if self.currentRow() < 0:
+            return
+        drag = QDrag(self)
+        mime = QMimeData()
+        mime.setData(self.mime_type, str(self.currentRow()).encode())
+        drag.setMimeData(mime)
+        drag.setPixmap(self.currentItem().icon().pixmap(52, 52))
+        drag.exec(Qt.DropAction.MoveAction)
+
+    def dragEnterEvent(self, event):
+        if event.source() is self and event.mimeData().hasFormat(self.mime_type):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        self.dragEnterEvent(event)
+
+    def dropEvent(self, event):
+        if event.source() is not self or not event.mimeData().hasFormat(self.mime_type):
+            event.ignore()
+            return
+        source = int(bytes(event.mimeData().data(self.mime_type)))
+        target = self.indexAt(event.position().toPoint()).row()
+        if target < 0:
+            target = self.count() - 1
+        event.acceptProposedAction()
+        self.move_requested.emit(source, target)
 
 
 class Canvas(QWidget):
@@ -452,7 +490,7 @@ class Window(QMainWindow):
         frame_top.addWidget(self.button("帧操作", lambda: None))
         frame_top.itemAt(frame_top.count() - 1).widget().setMenu(self.frame_menu())
         fc.addLayout(frame_top)
-        self.frame_list = QListWidget()
+        self.frame_list = FrameList()
         self.frame_list.setViewMode(QListWidget.ViewMode.IconMode)
         self.frame_list.setFlow(QListWidget.Flow.LeftToRight)
         self.frame_list.setWrapping(False)
@@ -461,7 +499,7 @@ class Window(QMainWindow):
         self.frame_list.setIconSize(QSize(52, 52))
         self.frame_list.setFixedHeight(99)
         self.frame_list.currentRowChanged.connect(self.select_frame)
-        self.frame_list.model().rowsMoved.connect(self.reorder_frames)
+        self.frame_list.move_requested.connect(self.reorder_frames)
         fc.addWidget(self.frame_list)
 
     def import_menu(self):
@@ -546,21 +584,14 @@ class Window(QMainWindow):
         self.frame_index = row
         self.refresh()
 
-    def reorder_frames(self, *args):
-        if self.syncing:
+    def reorder_frames(self, source, target):
+        if self.syncing or source == target:
             return
-        order = [
-            self.frame_list.item(i).data(Qt.ItemDataRole.UserRole)
-            for i in range(self.frame_list.count())
-        ]
-        if sorted(order) != list(range(len(self.frames))):
+        if not (0 <= source < len(self.frames) and 0 <= target < len(self.frames)):
             return
         self.remember()
-        old = list(self.frames)
-        self.frames[:] = [old[i] for i in order]
-        for i in range(self.frame_list.count()):
-            self.frame_list.item(i).setData(Qt.ItemDataRole.UserRole, i)
-        self.frame_index = max(0, self.frame_list.currentRow())
+        self.frames.insert(target, self.frames.pop(source))
+        self.frame_index = target
         self.touch()
         QTimer.singleShot(0, self.rebuild_frames)
 

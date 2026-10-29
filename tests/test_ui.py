@@ -77,3 +77,19 @@ def test_runtime_opt_in_on_non_windows(window):
     with pytest.raises(RuntimeError):
         window.engine.start(window.project)
     assert not window.engine.active
+
+
+def test_drag_sequence_changes_exported_animation(window, app, tmp_path):
+    from whale_cursor.codec import decode_ani
+
+    window.project.slots["Arrow"] = [
+        Frame(Image.new("RGBA", (256, 256), color), 128, 128, duration)
+        for color, duration in [("red", 100), ("blue", 200), ("green", 300)]
+    ]
+    window.rebuild_frames()
+    window.frame_list.move_requested.emit(0, 2)
+    app.processEvents()
+    path = window.project.export(tmp_path / "ordered", "Arrow")["Arrow"]
+    frames = decode_ani(open(path, "rb").read())
+    assert [f.duration for f in frames] == [200, 300, 100]
+    assert frames[-1].image.getpixel((128, 128))[:3] == (255, 0, 0)

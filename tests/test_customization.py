@@ -355,3 +355,11 @@ def test_clearing_common_animation_preserves_hidden_role_assignments(window):
     assert window.project.events["Hand.click"]
     window.undo()
     assert window.project.events["Arrow.click"]
+
+
+
+def test_small_trial_panel_does_not_overlap(window, app):
+    window.resize(1000, 680)
+    window.inspector_tabs.setCurrentIndex(1)
+    app.processEvents()
+    assert window.actual.geometry().bottom() < window.preview.geometry().top()

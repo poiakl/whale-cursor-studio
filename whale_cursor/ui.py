@@ -646,7 +646,7 @@ class Window(QMainWindow):
         prop.addStretch()
         self.actual = QLabel()
         self.actual.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.actual.setMinimumHeight(96)
+        self.actual.setMinimumHeight(64)
         pv.addWidget(self.actual)
         self.preview = Preview()
         pv.addWidget(self.preview)
@@ -811,8 +811,8 @@ class Window(QMainWindow):
             s = self.project.size
             self.actual.setPixmap(
                 pixmap(f.image).scaled(
-                    min(s, 96),
-                    min(s, 96),
+                    min(s, 64),
+                    min(s, 64),
                     Qt.AspectRatioMode.KeepAspectRatio,
                     Qt.TransformationMode.FastTransformation
                     if self.project.pixel

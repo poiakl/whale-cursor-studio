@@ -244,3 +244,35 @@ def test_one_shot_uses_selected_duration_and_does_not_fall_back_to_old_click():
     assert resolver.select(rules, frames, c)["id"] == "specific"
     c.now = 0.2
     assert resolver.select(rules, frames, c) is None
+
+
+def test_effect_groups_are_independent_and_old_values_migrate(tmp_path):
+    import json, zipfile
+
+    p = Project.defaults()
+    p.settings["effect_lifetime"] = 2000
+    p.settings["click_opacity"] = 0.3
+    assert p.settings["trail_lifetime"] == 850
+    assert p.settings["trail_opacity"] == 1.0
+    original = tmp_path / "new.whalepack"
+    p.save(original)
+    old = tmp_path / "old.whalepack"
+    with zipfile.ZipFile(original) as source, zipfile.ZipFile(old, "w") as dest:
+        for info in source.infolist():
+            data = source.read(info.filename)
+            if info.filename == "project.json":
+                manifest = json.loads(data)
+                manifest["version"] = 4
+                for key in (
+                    "click_opacity",
+                    "trail_opacity",
+                    "companion_opacity",
+                    "trail_lifetime",
+                ):
+                    manifest["settings"].pop(key)
+                manifest["settings"]["effect_opacity"] = 0.6
+                data = json.dumps(manifest).encode()
+            dest.writestr(info.filename, data)
+    q = Project.load(old)
+    assert q.settings["trail_lifetime"] == 2000
+    assert q.settings["trail_opacity"] == 0.6 and q.settings["companion_opacity"] == 0.6

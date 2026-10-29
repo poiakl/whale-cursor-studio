@@ -153,6 +153,10 @@ class Project:
             "trail_size": 24,
             "companion_size": 64,
             "effect_opacity": 1.0,
+            "click_opacity": 1.0,
+            "trail_opacity": 1.0,
+            "companion_opacity": 1.0,
+            "trail_lifetime": 850,
             "effect_lifetime": 850,
             "trail_spacing": 12,
             "companion_x": 20,
@@ -254,6 +258,16 @@ class Project:
             p.pixel = bool(m.get("pixel", True))
             p.multi_size = bool(m.get("multi_size", False))
             p.settings.update(m.get("settings", {}))
+            if m.get("version", 2) < 5:
+                previous = m.get("settings", {})
+                for key, shared in (
+                    ("click_opacity", "effect_opacity"),
+                    ("trail_opacity", "effect_opacity"),
+                    ("companion_opacity", "effect_opacity"),
+                    ("trail_lifetime", "effect_lifetime"),
+                ):
+                    if key not in previous:
+                        p.settings[key] = p.settings[shared]
             from .conditions import validate_rule
 
             rules = p.settings.get("animation_rules", [])

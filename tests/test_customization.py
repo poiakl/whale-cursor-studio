@@ -229,7 +229,11 @@ def test_each_trigger_can_play_its_animation(runtime_state, trigger):
         now[0] += 0.2
         engine._tick()
     assert engine.state == trigger
-    assert any("Arrow." + trigger in name for _, name in calls)
+    assert (
+        engine.overlay.cursor_frame
+        is engine.project.event_frames("Arrow", trigger)[engine.index]
+    )
+    assert any(name == "transparent.cur" for _, name in calls)
 
 
 def test_random_audio_without_cursor_animation(runtime_state, monkeypatch):
@@ -355,7 +359,6 @@ def test_clearing_common_animation_preserves_hidden_role_assignments(window):
     assert window.project.events["Hand.click"]
     window.undo()
     assert window.project.events["Arrow.click"]
-
 
 
 def test_small_trial_panel_does_not_overlap(window, app):

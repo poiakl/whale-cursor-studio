@@ -58,7 +58,8 @@ def test_runtime_click_idle_direction_and_restoration(app, monkeypatch, tmp_path
     position[0] = QPoint(100, 100)
     e._tick()
     assert e.state == "base"
-    assert ("reload",) in calls
+    assert e.overlay.cursor_frame is e.project.slots["Arrow"][e.index]
+    assert e.dirty_roles == {"Arrow"}
     e.stop()
     assert calls[-1] == ("restore", initial)
     assert not folder.exists()

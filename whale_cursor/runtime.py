@@ -72,14 +72,57 @@ class Overlay(QWidget):
         self.settings = {}
         self.effects = {}
         self.keyframes = parse_keyframes(EXAMPLE)
+        self.render_time = None
+        self._effect_bounds = QRect()
+        self._particle_bounds = {}
 
     def fit_screens(self):
         # Never create a desktop-sized topmost window or give it an editor owner.
         pos = QCursor.pos()
         self.setGeometry(QRect(pos.x(), pos.y(), 2, 2))
 
-    def present(self):
-        now = time.monotonic()
+    def particle_bounds(self, particle):
+        pos, _, kind, vx, vy = particle
+        trail = kind == "trail"
+        size = (
+            self.settings.get("trail_size", 24)
+            if trail
+            else self.settings.get("click_size", 64)
+        )
+        lifetime = max(
+            0.1,
+            self.settings.get("trail_lifetime" if trail else "effect_lifetime", 850)
+            / 1000,
+        )
+        mode = "fade" if trail else self.settings.get("effect_motion", "fade")
+        times = sorted(
+            {*(i / 64 for i in range(65)), *(frame["t"] for frame in self.keyframes)}
+        )
+        rect = QRect()
+        for t in times:
+            motion = pose(mode, t, self.keyframes, vx, vy)
+            x, y = pos.x() + motion["x"], pos.y() + motion["y"]
+            margin = (
+                max(size * motion["scale"], 3 if trail else 8 + t * lifetime * 48) + 4
+            )
+            if kind == "petals":
+                age = t * lifetime
+                x += vx * age
+                y += vy * age + 100 * age * age
+                margin = max(margin, 20)
+            rect = rect.united(
+                QRect(
+                    math.floor(x - margin),
+                    math.floor(y - margin),
+                    math.ceil(margin * 2) + 2,
+                    math.ceil(margin * 2) + 2,
+                )
+            )
+        return rect
+
+    def present(self, now=None):
+        now = time.monotonic() if now is None else now
+        self.render_time = now
         self.particles = [
             v
             for v in self.particles
@@ -93,13 +136,14 @@ class Overlay(QWidget):
         ]
         rect = QRect()
         if self.cursor_frame is not None:
-            frame = self.cursor_frame
+            # Reserve the whole hotspot range once. Individual animation frames
+            # must not move or resize the native window at a stationary pointer.
             size = self.cursor_size
             rect = QRect(
-                round(self.cursor_pos.x() - frame.x * size / 256),
-                round(self.cursor_pos.y() - frame.y * size / 256),
-                size + 2,
-                size + 2,
+                self.cursor_pos.x() - size - 2,
+                self.cursor_pos.y() - size - 2,
+                size * 2 + 4,
+                size * 2 + 4,
             )
         if self.sprite is not None:
             rect = rect.united(
@@ -110,55 +154,44 @@ class Overlay(QWidget):
                     self.sprite_size + 2,
                 )
             )
-        for pos, born, kind, vx, vy in self.particles:
-            size = (
-                self.settings.get("trail_size", 24)
-                if kind == "trail"
-                else self.settings.get("click_size", 64)
-            )
-            lifetime = max(
-                0.1,
-                (
-                    self.settings.get("trail_lifetime", 850)
-                    if kind == "trail"
-                    else self.settings.get("effect_lifetime", 850)
-                )
-                / 1000,
-            )
-            motion = pose(
-                self.settings.get("effect_motion", "fade")
-                if kind != "trail"
-                else "fade",
-                (now - born) / lifetime,
-                self.keyframes,
-                vx,
-                vy,
-            )
-            center = pos + QPoint(round(motion["x"]), round(motion["y"]))
-            margin = round(max(size * motion["scale"], 90)) + 20
-            if kind == "petals":
-                center += QPoint(
-                    round(vx * (now - born)),
-                    round(vy * (now - born) + 100 * (now - born) ** 2),
-                )
-            rect = rect.united(
-                QRect(center.x() - margin, center.y() - margin, margin * 2, margin * 2)
-            )
+        if self.particles:
+            active_ids = {id(particle) for particle in self.particles}
+            self._particle_bounds = {
+                key: value
+                for key, value in self._particle_bounds.items()
+                if key in active_ids
+            }
+            for particle in self.particles:
+                key = id(particle)
+                if key not in self._particle_bounds:
+                    bounds = self.particle_bounds(particle)
+                    self._particle_bounds[key] = (particle, bounds)
+                    self._effect_bounds = self._effect_bounds.united(bounds)
+            rect = rect.united(self._effect_bounds)
+        else:
+            self._effect_bounds = QRect()
+            self._particle_bounds.clear()
         if rect.isNull():
             self.hide()
             return
-        screen = QApplication.screenAt(self.cursor_pos) or QApplication.primaryScreen()
+        anchor = (
+            self.cursor_pos
+            if self.cursor_frame is not None or self.sprite is not None
+            else (self.particles[0][0] if self.particles else self.cursor_pos)
+        )
+        screen = QApplication.screenAt(anchor) or QApplication.primaryScreen()
         if screen:
             # The one-pixel inset also prevents the shell treating the decoration as full-screen.
             rect = rect.intersected(screen.geometry().adjusted(1, 1, -1, -1))
         if rect.isEmpty():
             self.hide()
             return
-        self.setGeometry(rect)
+        if self.geometry() != rect:
+            self.setGeometry(rect)
         if not self.isVisible():
             self.show()
-        if native.WINDOWS:
-            self.raise_()
+            if native.WINDOWS:
+                self.raise_()
         self.update()
 
     def emit_at(self, pos, kind):
@@ -200,7 +233,7 @@ class Overlay(QWidget):
             QPainter.RenderHint.SmoothPixmapTransform,
             not self.settings.get("pixel", True),
         )
-        now = time.monotonic()
+        now = time.monotonic() if self.render_time is None else self.render_time
         origin = self.geometry().topLeft()
         lifetime = max(0.1, self.settings.get("effect_lifetime", 850) / 1000)
         self.particles = [
@@ -318,6 +351,7 @@ class Engine:
         self.timer.timeout.connect(self.tick)
         self.active = False
         self.overlay = Overlay()
+        self.effect_overlay = Overlay()
         self.sound = QSoundEffect()
         self.sounds = {}
         self.sound_indices = {}
@@ -398,7 +432,9 @@ class Engine:
             key: [(pixmap(frame.image), frame.duration) for frame in frames]
             for key, frames in self.project.effects.items()
         }
+        self.configure_effect_layer()
         self.overlay.fit_screens()
+        self.effect_overlay.fit_screens()
         self.timer.start(16)
 
     def prepare_frames(self, project):
@@ -418,6 +454,10 @@ class Engine:
             return
         self.timer.stop()
         self.overlay.hide()
+        self.effect_overlay.hide()
+        self.effect_overlay.particles = []
+        self.effect_overlay._effect_bounds = QRect()
+        self.effect_overlay._particle_bounds.clear()
         self.overlay.particles = []
         self.overlay.cursor_frame = None
         self.dirty_roles = set()
@@ -467,6 +507,7 @@ class Engine:
             key: [(pixmap(f.image), f.duration) for f in frames]
             for key, frames in self.project.effects.items()
         }
+        self.configure_effect_layer()
         self.resolver = Resolver()
         self.active_audio = set()
         self.last_sound_trigger = ""
@@ -572,7 +613,7 @@ class Engine:
         self.role = role
         self.overlay.cursor_pos = QPoint(pos)
         if "click" in context.pulses:
-            self.overlay.emit_at(pos, settings.get("click_effect", "ripple"))
+            self.effect_overlay.emit_at(pos, settings.get("click_effect", "ripple"))
         if (
             distance
             and settings.get("trail")
@@ -581,7 +622,7 @@ class Engine:
             )
             >= settings.get("trail_spacing", 12)
         ):
-            self.overlay.emit_at(pos, "trail")
+            self.effect_overlay.emit_at(pos, "trail")
             self.last_trail_pos = QPoint(pos)
         continuous_audio = {
             trigger
@@ -664,7 +705,7 @@ class Engine:
                 self.dirty_roles.clear()
             self.overlay.cursor_frame = None
             self.update_companion(pos, now)
-            self.overlay.present()
+            self.present_layers(now)
             self.last_position = pos
             return
         factor = (
@@ -688,7 +729,7 @@ class Engine:
                 self.overlay.cursor_frame = None
         self.last_frame, self.last_target_role = frame_key, role
         self.update_companion(pos, now, group)
-        self.overlay.present()
+        self.present_layers(now)
         self.last_position = pos
 
     def prepare_sounds(self, project):
@@ -733,3 +774,19 @@ class Engine:
         self.overlay.sprite_pos = pos + QPoint(
             settings.get("companion_x", 20), settings.get("companion_y", 20)
         )
+
+    def configure_effect_layer(self):
+        self.effect_overlay.settings = self.overlay.settings
+        self.effect_overlay.effects = self.overlay.effects
+        self.effect_overlay.keyframes = self.overlay.keyframes
+        self.effect_overlay.particles = []
+        self.effect_overlay._effect_bounds = QRect()
+        self.effect_overlay._particle_bounds.clear()
+        self.effect_overlay.hide()
+
+    def present_layers(self, now):
+        was_visible = self.effect_overlay.isVisible()
+        self.effect_overlay.present(now)
+        self.overlay.present(now)
+        if native.WINDOWS and not was_visible and self.effect_overlay.isVisible():
+            self.overlay.raise_()

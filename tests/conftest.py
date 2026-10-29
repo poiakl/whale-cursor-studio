@@ -20,4 +20,11 @@ def app():
     application = QApplication.instance() or QApplication([])
     application.setStyle("Fusion")
     application.setStyleSheet(STYLE)
-    return application
+    yield application
+    from PySide6.QtCore import QCoreApplication, QEvent
+
+    application.clipboard().clear()
+    for widget in application.topLevelWidgets():
+        widget.deleteLater()
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    application.processEvents()

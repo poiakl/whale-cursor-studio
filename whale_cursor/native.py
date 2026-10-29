@@ -9,6 +9,8 @@ from pathlib import Path
 import shutil
 import sys
 import uuid
+import logging
+from contextlib import contextmanager
 from .project import SLOTS, user_dir
 
 WINDOWS = sys.platform == "win32"
@@ -27,6 +29,8 @@ CURSOR_IDS = {
     "Hand": 32649,
     "AppStarting": 32650,
     "Help": 32651,
+    "Pin": 32671,
+    "Person": 32672,
 }
 REG_PATH = r"Control Panel\Cursors"
 SCHEME = "鲸鱼娘 · 指针工坊"
@@ -68,17 +72,50 @@ def require():
         raise RuntimeError("安装和系统互动功能需要 Windows 10 / 11")
 
 
+@contextmanager
+def cursor_key(path):
+    # Explicit read+write access: installation also reads back each configured path.
+    try:
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER, path, 0, winreg.KEY_READ | winreg.KEY_WRITE
+        )
+    except FileNotFoundError:
+        key = winreg.CreateKeyEx(
+            winreg.HKEY_CURRENT_USER, path, 0, winreg.KEY_READ | winreg.KEY_WRITE
+        )
+    with key:
+        yield key
+
+
+def install_logger():
+    logger = logging.getLogger("whale.install")
+    logger.setLevel(logging.INFO)
+    destination = user_dir() / "install.log"
+    for handler in list(logger.handlers):
+        if (
+            isinstance(handler, logging.FileHandler)
+            and Path(handler.baseFilename) != destination
+        ):
+            logger.removeHandler(handler)
+            handler.close()
+    if not logger.handlers:
+        handler = logging.FileHandler(destination, encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        logger.addHandler(handler)
+    return logger
+
+
 def snapshot():
     require()
     values = {}
-    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, REG_PATH) as k:
+    with cursor_key(REG_PATH) as k:
         for name in list(SLOTS) + ["", "CursorBaseSize", "Scheme Source"]:
             try:
                 v, kind = winreg.QueryValueEx(k, name)
                 values[name] = [v, kind]
             except FileNotFoundError:
                 values[name] = None
-    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, REG_PATH + r"\Schemes") as k:
+    with cursor_key(REG_PATH + r"\Schemes") as k:
         try:
             scheme = list(winreg.QueryValueEx(k, SCHEME))
         except FileNotFoundError:
@@ -92,7 +129,7 @@ def write_snapshot(snap):
         (REG_PATH, snap["values"]),
         (REG_PATH + r"\Schemes", {SCHEME: snap["scheme"]}),
     ):
-        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, path) as k:
+        with cursor_key(path) as k:
             for name, v in values.items():
                 if v is None:
                     try:
@@ -106,15 +143,30 @@ def write_snapshot(snap):
 
 def reload():
     require()
-    if not user32.SystemParametersInfoW(0x57, 0, None, 3):
-        raise ctypes.WinError(ctypes.get_last_error())
+    ctypes.set_last_error(0)
+    # Paths are already persisted in HKCU. SPI_SETCURSORS only reloads them;
+    # asking it to rewrite the profile can fail on some Windows configurations.
+    if not user32.SystemParametersInfoW(0x57, 0, None, 0):
+        error = ctypes.get_last_error()
+        raise OSError(
+            error,
+            "Windows 无法重新载入指针"
+            + ("：" + ctypes.FormatError(error) if error else "（系统未提供错误码）"),
+        )
 
 
 def load_cursor(path, size=0):
     require()
+    ctypes.set_last_error(0)
     h = user32.LoadImageW(None, str(path), 2, size, size, 0x10)
     if not h:
-        raise ctypes.WinError(ctypes.get_last_error())
+        error = ctypes.get_last_error()
+        raise OSError(
+            error,
+            "无法加载指针文件 "
+            + str(path)
+            + ("：" + ctypes.FormatError(error) if error else "（系统未提供错误码）"),
+        )
     return h
 
 
@@ -125,11 +177,22 @@ def validate_file(path, size=0):
 
 def install(project, only=None):
     require()
-    folder = user_dir() / "installed" / uuid.uuid4().hex
-    paths = project.export(folder, only)
-    for path in paths.values():
-        validate_file(path, project.size)
-    before = snapshot()
+    logger = install_logger()
+    stage = "生成 CUR / ANI"
+    try:
+        folder = user_dir() / "installed" / uuid.uuid4().hex
+        logger.info("开始安装 size=%s only=%s folder=%s", project.size, only, folder)
+        paths = project.export(folder, only)
+        stage = "Windows 加载检查"
+        for path in paths.values():
+            validate_file(path, project.size)
+        stage = "读取安装前方案"
+        before = snapshot()
+    except Exception as error:
+        logger.exception("安装前检查失败 stage=%s", stage)
+        raise RuntimeError(
+            f"{stage}失败：{error}\n详细日志：{user_dir() / 'install.log'}"
+        ) from error
     backup = user_dir() / "before-install.json"
     new = not backup.exists()
     if new:
@@ -137,7 +200,8 @@ def install(project, only=None):
         tmp.write_text(json.dumps(before), encoding="utf-8")
         os.replace(tmp, backup)
     try:
-        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, REG_PATH) as k:
+        stage = "写入当前用户指针路径"
+        with cursor_key(REG_PATH) as k:
             for key, path in paths.items():
                 winreg.SetValueEx(k, key, 0, winreg.REG_SZ, path)
             winreg.SetValueEx(k, "", 0, winreg.REG_SZ, SCHEME)
@@ -149,11 +213,13 @@ def install(project, only=None):
                     all_paths.append(winreg.QueryValueEx(k, key)[0])
                 except FileNotFoundError:
                     all_paths.append("")
-        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, REG_PATH + r"\Schemes") as k:
+        with cursor_key(REG_PATH + r"\Schemes") as k:
             winreg.SetValueEx(k, SCHEME, 0, winreg.REG_SZ, ",".join(all_paths))
-        # Reload through the scheme. SetSystemCursor can flatten animated cursors.
+        stage = "重新载入系统指针"
         reload()
+        logger.info("安装成功 count=%s", len(paths))
     except Exception as error:
+        logger.exception("安装失败 stage=%s", stage)
         try:
             write_snapshot(before)
             if new:
@@ -162,7 +228,9 @@ def install(project, only=None):
             raise RuntimeError(
                 f"安装失败：{error}；恢复失败：{rollback}；备份仍保留"
             ) from error
-        raise RuntimeError(f"安装失败，已恢复原方案：{error}") from error
+        raise RuntimeError(
+            f"{stage}失败，已恢复原方案：{error}\n详细日志：{user_dir() / 'install.log'}"
+        ) from error
     return paths
 
 
@@ -181,11 +249,55 @@ def restore():
     backup.unlink()
 
 
-def set_live_arrow(path, size):
+def set_live_cursor(role, path, size):
+    require()
+    if role not in CURSOR_IDS:
+        return False
     h = load_cursor(path, size)
-    if not user32.SetSystemCursor(h, 32512):
+    ctypes.set_last_error(0)
+    if not user32.SetSystemCursor(h, CURSOR_IDS[role]):
+        error = ctypes.get_last_error()
         user32.DestroyCursor(h)
-        raise ctypes.WinError(ctypes.get_last_error())
+        raise OSError(
+            error,
+            "无法应用 "
+            + role
+            + " 互动帧"
+            + ("：" + ctypes.FormatError(error) if error else ""),
+        )
+    return True
+
+
+def set_live_arrow(path, size):
+    return set_live_cursor("Arrow", path, size)
+
+
+class CursorInfo(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", W.DWORD),
+        ("flags", W.DWORD),
+        ("hCursor", W.HANDLE),
+        ("ptScreenPos", W.POINT),
+    ]
+
+
+def current_role():
+    if not WINDOWS:
+        return "Arrow"
+    user32.GetCursorInfo.argtypes = [ctypes.POINTER(CursorInfo)]
+    user32.GetCursorInfo.restype = W.BOOL
+    user32.LoadCursorW.argtypes = [W.HINSTANCE, ctypes.c_void_p]
+    user32.LoadCursorW.restype = W.HANDLE
+    info = CursorInfo()
+    info.cbSize = ctypes.sizeof(info)
+    if not user32.GetCursorInfo(ctypes.byref(info)) or not info.flags & 1:
+        return None
+    for role, identifier in CURSOR_IDS.items():
+        if info.hCursor == user32.LoadCursorW(None, ctypes.c_void_p(identifier)):
+            return role
+    # NWPen has no current standard SetSystemCursor id; its assets still install
+    # and animate natively through the registry scheme, and can be previewed.
+    return None
 
 
 def foreground_exe():

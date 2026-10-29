@@ -22,7 +22,10 @@ def test_portable_project_roundtrip(tmp_path):
         and q.slots["Arrow"][1].duration == 250
         and q.settings["trail"]
     )
-    assert q.events["click"][0].image.tobytes() == p.events["click"][0].image.tobytes()
+    assert (
+        q.event_frames("Arrow", "click")[0].image.tobytes()
+        == p.events["click"][0].image.tobytes()
+    )
 
 
 def test_export_mixed_and_single_only(tmp_path):

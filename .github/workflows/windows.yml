@@ -4,6 +4,9 @@ on:
     branches: [main]
     tags: ['v*']
   workflow_dispatch:
+concurrency:
+  group: windows-desktop-${{ github.ref }}
+  cancel-in-progress: true
 permissions:
   contents: write
 jobs:
@@ -53,4 +56,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             gh release create desktop-latest --title "Windows 便携版" --notes "解压后运行 WhaleCursorStudio.exe。后续主分支构建会更新此附件。"
           }
+          gh api --method PATCH "repos/$env:GITHUB_REPOSITORY/git/refs/tags/desktop-latest" -f "sha=$env:GITHUB_SHA" -F force=true
+          if ($LASTEXITCODE -ne 0) { throw "Could not update rolling release source tag" }
+          gh release edit desktop-latest --title "Windows 便携版 · 2.1" --notes "17 种互动用途、30 步统一撤销、帧快捷键、拖动插入、可视化批量匹配、动态预览与安装恢复修复。完整解压后运行 WhaleCursorStudio.exe。"
           gh release upload desktop-latest WhaleCursorStudio-Windows.zip --clobber

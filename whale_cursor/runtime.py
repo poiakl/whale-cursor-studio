@@ -14,7 +14,7 @@ from PySide6.QtWidgets import QWidget, QApplication
 from PySide6.QtMultimedia import QSoundEffect
 from PySide6.QtCore import QUrl
 from .codec import encode_cur
-from .project import Project, user_dir
+from .project import Project, user_dir, event_key
 from . import native
 
 
@@ -126,6 +126,7 @@ class Engine:
             self.stop()
         native.recover_runtime()
         self.project = project.clone()
+        self.project.migrate_events()
         self.base_project = self.project
         self.initial = native.snapshot()
         self.active = True
@@ -160,6 +161,8 @@ class Engine:
         self.index = 0
         self.elapsed = 0
         self.last_frame = None
+        self.dirty_roles = set()
+        self.role = "Arrow"
         self.last_rule = ""
         self.last_app_check = 0
         self.sound.setVolume(float(project.settings.get("volume", 0.5)))
@@ -171,17 +174,19 @@ class Engine:
         self.timer.start(16)
 
     def prepare_frames(self, project):
+        project.migrate_events()
         key = id(project)
-        for name, frames in dict(project.events, Arrow=project.slots["Arrow"]).items():
+        groups = {
+            **{"slots." + role: frames for role, frames in project.slots.items()},
+            **project.events,
+        }
+        for name, frames in groups.items():
             for index, frame in enumerate(frames):
                 path = self.temp / f"{key}-{name}-{index}.cur"
                 path.write_bytes(encode_cur(frame, (project.size,), project.pixel))
                 self.frame_cache[(key, name, index)] = path
         project._runtime_pixmaps = {
-            name: [pixmap(f.image) for f in frames]
-            for name, frames in dict(
-                project.events, Arrow=project.slots["Arrow"]
-            ).items()
+            name: [pixmap(f.image) for f in frames] for name, frames in groups.items()
         }
 
     def stop(self):
@@ -241,6 +246,7 @@ class Engine:
             native.write_snapshot(self.base_snapshot)
             self.project = self.base_project
         self.last_rule = rule_path
+        self.dirty_roles.clear()
         self.last_frame = None
         self.state = ""
         self.index = 0
@@ -274,42 +280,64 @@ class Engine:
             self.last_move = now
             if settings.get("trail"):
                 self.overlay.emit_at(pos, "trail")
+        detected = native.current_role()
+        role = detected if detected in self.project.slots else "Arrow"
+        if role != self.role:
+            if self.dirty_roles:
+                native.reload()
+                self.dirty_roles.clear()
+            self.state = ""
+            self.index = 0
+            self.elapsed = 0
+            self.last_frame = None
+        self.role = role
+        events = {
+            trigger: self.project.event_frames(role, trigger)
+            for trigger in ("click", "idle", "move", "left", "right", "up", "down")
+        }
         if clicked:
             self.overlay.emit_at(pos, settings.get("click_effect", "ripple"))
-            self.sound.play() if settings.get("sound") else None
-            self.click_until = (
-                now
-                + sum(f.duration for f in self.project.events.get("click", [])) / 1000
-            )
-        state = "Arrow"
-        if now < self.click_until and "click" in self.project.events:
-            state = "click"
-        elif (
-            now - self.last_move >= float(settings.get("idle_seconds", 5))
-            and "idle" in self.project.events
-        ):
-            state = "idle"
-        elif distance > 0:
-            direction = (
-                ("right" if delta.x() > 0 else "left")
-                if abs(delta.x()) >= abs(delta.y())
-                else ("down" if delta.y() > 0 else "up")
-            )
-            if settings.get("direction") and direction in self.project.events:
-                state = direction
-            elif "move" in self.project.events:
-                state = "move"
-        previous_state = self.state
+            if settings.get("sound"):
+                self.sound.play()
+            self.click_until = now + sum(f.duration for f in events["click"]) / 1000
+            # Repeated clicks restart the one-shot action.
+            self.state = ""
+            self.elapsed = 0
+            self.index = 0
+        state = "base"
+        if detected is not None:
+            if now < self.click_until and events["click"]:
+                state = "click"
+            elif (
+                now - self.last_move >= float(settings.get("idle_seconds", 5))
+                and events["idle"]
+            ):
+                state = "idle"
+            elif distance > 0:
+                direction = (
+                    ("right" if delta.x() > 0 else "left")
+                    if abs(delta.x()) >= abs(delta.y())
+                    else ("down" if delta.y() > 0 else "up")
+                )
+                if settings.get("direction") and events[direction]:
+                    state = direction
+                elif events["move"]:
+                    state = "move"
         if state != self.state:
             self.state = state
             self.index = 0
             self.elapsed = 0
             self.last_frame = None
-        frames = (
-            self.project.slots["Arrow"]
-            if state == "Arrow"
-            else self.project.events[state]
-        )
+        frames = self.project.slots.get(role, []) if state == "base" else events[state]
+        if not frames:
+            if self.dirty_roles:
+                native.reload()
+                self.dirty_roles.clear()
+            self.overlay.sprite = None
+            self.overlay.update()
+            self.last_position = pos
+            return
+        group = "slots." + role if state == "base" else event_key(role, state)
         factor = (
             max(0.5, min(3, speed / 350))
             if settings.get("speed") and distance > 0 and state not in ("click", "idle")
@@ -319,15 +347,19 @@ class Engine:
         while self.elapsed >= frames[self.index].duration:
             self.elapsed -= frames[self.index].duration
             self.index = (self.index + 1) % len(frames)
-        frame_key = (id(self.project), state, self.index)
-        if state != "Arrow":
+        frame_key = (id(self.project), group, self.index)
+        if state != "base":
             if frame_key != self.last_frame:
-                native.set_live_arrow(self.frame_cache[frame_key], self.project.size)
-        elif previous_state and previous_state != "Arrow":
+                if native.set_live_cursor(
+                    role, self.frame_cache[frame_key], self.project.size
+                ):
+                    self.dirty_roles.add(role)
+        elif self.dirty_roles:
             native.reload()
+            self.dirty_roles.clear()
         self.last_frame = frame_key
         self.overlay.sprite = (
-            self.project._runtime_pixmaps[state][self.index]
+            self.project._runtime_pixmaps[group][self.index]
             if settings.get("companion")
             else None
         )

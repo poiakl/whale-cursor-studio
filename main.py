@@ -23,6 +23,13 @@ def main():
         window.close()
         app.processEvents()
         return 0
+
+    def release_clipboard():
+        mime = app.clipboard().mimeData()
+        if mime and mime.hasFormat("application/x-whale-frames"):
+            app.clipboard().clear()
+
+    app.aboutToQuit.connect(release_clipboard)
     # One instance per user: prevents two live-interaction engines overwriting each other's restore state.
     import getpass, hashlib
 

@@ -8,13 +8,17 @@ from whale_cursor.ui import Window
 
 
 @pytest.fixture
-def window(app):
+def window(app, monkeypatch):
     w = Window(Project.defaults())
+    monkeypatch.setattr(
+        w, "error", lambda message: (_ for _ in ()).throw(AssertionError(message))
+    )
     w.show()
     app.processEvents()
     yield w
     w.save_timer.stop()
     w.close()
+    w.deleteLater()
     app.processEvents()
 
 
@@ -56,7 +60,7 @@ def test_import_animation_and_events(window, tmp_path):
     assert len(window.frames) == 2
     window.edit_event("click")
     window.load_files([str(path)])
-    assert len(window.project.events["click"]) == 2
+    assert len(window.project.event_frames("Arrow", "click")) == 2
     window.hot_all()
     assert window.frames[0].x == window.frames[1].x
 
@@ -87,7 +91,7 @@ def test_drag_sequence_changes_exported_animation(window, app, tmp_path):
         for color, duration in [("red", 100), ("blue", 200), ("green", 300)]
     ]
     window.rebuild_frames()
-    window.frame_list.move_requested.emit(0, 2)
+    window.frame_list.move_requested.emit(0, 3)
     app.processEvents()
     path = window.project.export(tmp_path / "ordered", "Arrow")["Arrow"]
     frames = decode_ani(open(path, "rb").read())

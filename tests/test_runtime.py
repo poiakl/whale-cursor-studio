@@ -22,9 +22,10 @@ def test_runtime_click_idle_direction_and_restoration(app, monkeypatch, tmp_path
     monkeypatch.setattr(native, "reload", lambda: calls.append(("reload",)))
     monkeypatch.setattr(
         native,
-        "set_live_arrow",
-        lambda path, size: calls.append(("arrow", Path(path).name, size)),
+        "set_live_cursor",
+        lambda role, path, size: calls.append(("arrow", Path(path).name, size)) or True,
     )
+    monkeypatch.setattr(native, "current_role", lambda: "Arrow")
     monkeypatch.setattr(native, "foreground_exe", lambda: "")
     monkeypatch.setattr(native, "button_down", lambda vk: buttons[vk])
     monkeypatch.setattr(runtime.time, "monotonic", lambda: now[0])
@@ -56,7 +57,7 @@ def test_runtime_click_idle_direction_and_restoration(app, monkeypatch, tmp_path
     now[0] += 0.1
     position[0] = QPoint(100, 100)
     e._tick()
-    assert e.state == "Arrow"
+    assert e.state == "base"
     assert ("reload",) in calls
     e.stop()
     assert calls[-1] == ("restore", initial)

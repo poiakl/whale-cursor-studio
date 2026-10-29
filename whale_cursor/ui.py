@@ -39,11 +39,15 @@ from PySide6.QtWidgets import (
     QSystemTrayIcon,
     QMenu,
     QScrollArea,
+    QLayout,
+    QLineEdit,
 )
 from .codec import import_images, split_sheet, transform, SIZES
-from .project import Project, SLOTS, EVENTS, user_dir
+from .project import Project, SLOTS, EVENTS, user_dir, event_key
 from .runtime import Engine, pixmap
 from . import native
+from .editing import History, encode_clipboard, decode_clipboard
+from .widgets import AnimatedThumb, MatchDialog, InspectionDialog
 
 STYLE = """
 QWidget {font-family:"Microsoft YaHei UI","Noto Sans CJK SC","Segoe UI";font-size:13px;color:#24413D;}
@@ -112,22 +116,55 @@ class FrameList(QListWidget):
 
     def dragMoveEvent(self, event):
         self.dragEnterEvent(event)
+        index = self.indexAt(event.position().toPoint())
+        row = index.row()
+        self._drop_boundary = (
+            self.count()
+            if row < 0
+            else row + (event.position().x() > self.visualRect(index).center().x())
+        )
+        self.viewport().update()
+
+    def dragLeaveEvent(self, event):
+        self._drop_boundary = None
+        self.viewport().update()
+        event.accept()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        boundary = getattr(self, "_drop_boundary", None)
+        if boundary is None or self.count() == 0:
+            return
+        rect = self.visualItemRect(self.item(min(boundary, self.count() - 1)))
+        x = rect.left() if boundary < self.count() else rect.right() + 2
+        painter = QPainter(self.viewport())
+        painter.setPen(QPen(QColor("#347D68"), 3))
+        painter.drawLine(x, rect.top() + 4, x, rect.bottom() - 4)
+        painter.end()
 
     def dropEvent(self, event):
         if event.source() is not self or not event.mimeData().hasFormat(self.mime_type):
             event.ignore()
             return
         source = int(bytes(event.mimeData().data(self.mime_type)))
-        target = self.indexAt(event.position().toPoint()).row()
+        point = event.position().toPoint()
+        index = self.indexAt(point)
+        target = index.row()
         if target < 0:
-            target = self.count() - 1
+            target = self.count()
+        elif point.x() > self.visualRect(index).center().x():
+            target += 1
         event.acceptProposedAction()
+        self._drop_boundary = None
+        self.viewport().update()
         self.move_requested.emit(source, target)
 
 
 class Canvas(QWidget):
     hotspot = Signal(int, int)
     imported = Signal(list)
+    edit_started = Signal()
+    edit_finished = Signal()
 
     def __init__(self):
         super().__init__()
@@ -135,7 +172,7 @@ class Canvas(QWidget):
         self.pixel = True
         self.background = "checker"
         self.zoom = 1.0
-        self.setMinimumSize(300, 300)
+        self.setMinimumSize(220, 220)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setAcceptDrops(True)
         self.setCursor(Qt.CursorShape.CrossCursor)
@@ -189,7 +226,13 @@ class Canvas(QWidget):
     def mousePressEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton:
             self.setFocus()
+            self.edit_started.emit()
             self.pick(e.position())
+
+    def mouseReleaseEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self.edit_finished.emit()
+        super().mouseReleaseEvent(e)
 
     def mouseMoveEvent(self, e):
         if e.buttons() & Qt.MouseButton.LeftButton:
@@ -245,7 +288,7 @@ class Window(QMainWindow):
         super().__init__()
         self.setWindowTitle("鲸鱼娘 · 指针工坊")
         self.resize(1240, 880)
-        self.setMinimumSize(1060, 780)
+        self.setMinimumSize(1000, 680)
         self.autosave_path = user_dir() / "autosave.whalepack"
         self.schemes_dir = user_dir() / "schemes"
         self.schemes_dir.mkdir(exist_ok=True)
@@ -253,9 +296,14 @@ class Window(QMainWindow):
         self.group = "slots"
         self.key = "Arrow"
         self.frame_index = 0
+        self.trigger = "click"
+        self.interaction_trigger = "click"
+        self.history = History(30)
+        self._hot_gesture = False
+        self._history_loading = False
         self.syncing = False
         self.playing = False
-        self.undo_stack = []
+
         if project is None and self.autosave_path.exists():
             try:
                 self.project = Project.load(self.autosave_path)
@@ -263,6 +311,7 @@ class Window(QMainWindow):
                 QTimer.singleShot(
                     0, lambda msg=str(e): self.error("上次编辑未能恢复：" + msg)
                 )
+        self.project.migrate_events()
         self.save_timer = QTimer(self)
         self.save_timer.setSingleShot(True)
         self.save_timer.setInterval(700)
@@ -273,6 +322,9 @@ class Window(QMainWindow):
         self.preview_timer.setSingleShot(True)
         self.preview_timer.timeout.connect(self.next_frame)
         self.engine = Engine(self.runtime_error)
+        self.engine.overlay.setParent(self, self.engine.overlay.windowFlags())
+        self.engine.timer.setParent(self)
+        self.engine.sound.setParent(self)
         if native.WINDOWS:
             try:
                 native.recover_runtime()
@@ -285,12 +337,12 @@ class Window(QMainWindow):
         self.rebuild_slots()
         self.refresh()
         self.statusBar().showMessage(
-            "修改自动保存 · 普通安装无需常驻 · 互动功能需开启托盘模式"
+            "修改自动保存 · 保存完整方案用于命名与分享 · 互动总开关控制全部互动功能"
         )
 
     @property
     def frames(self):
-        return getattr(self.project, self.group).get(self.key, [])
+        return getattr(self.project, self.group).get(self.storage_key, [])
 
     @property
     def frame(self):
@@ -320,20 +372,17 @@ class Window(QMainWindow):
         self.save_timer.start()
         self.refresh_events()
 
-    def remember(self):
-        # A modest undo history avoids retaining unbounded animation data.
-        self.undo_stack.append((self.group, self.key, [f.clone() for f in self.frames]))
-        self.undo_stack = self.undo_stack[-12:]
+    def remember(self, description="编辑", token=None):
+        if self._history_loading:
+            return
+        self.history.push(self.project, self.selection(), token, time.monotonic())
+        self.update_history()
 
     def undo(self):
-        if not self.undo_stack:
-            return
-        self.group, self.key, frames = self.undo_stack.pop()
-        getattr(self.project, self.group)[self.key] = frames
-        self.group_box.setCurrentIndex(0 if self.group == "slots" else 1)
-        self.rebuild_slots()
-        self.rebuild_frames()
-        self.touch()
+        self.stop_play()
+        record = self.history.undo(self.project, self.selection())
+        if record:
+            self.restore_history(record)
 
     def build(self):
         root = QWidget()
@@ -349,7 +398,7 @@ class Window(QMainWindow):
         top.addStretch()
         self.name_label = label(self.project.name)
         top.addWidget(self.name_label)
-        top.addWidget(self.button("保存方案", self.save_scheme))
+        top.addWidget(self.button("保存完整方案…", self.save_scheme))
         top.addWidget(self.button("生成并安装", lambda: self.install(False), True))
         outer.addLayout(top)
         self.tabs = QTabWidget()
@@ -367,6 +416,11 @@ class Window(QMainWindow):
         action.setShortcut("Ctrl+Z")
         action.triggered.connect(self.undo)
         self.addAction(action)
+        for sequence in ("Ctrl+Y", "Ctrl+Shift+Z"):
+            redo = QAction("重做", self)
+            redo.setShortcut(sequence)
+            redo.triggered.connect(self.redo)
+            self.addAction(redo)
         save = QAction("保存方案", self)
         save.setShortcut("Ctrl+S")
         save.triggered.connect(self.save_scheme)
@@ -381,12 +435,19 @@ class Window(QMainWindow):
         sidebar, side = card()
         sidebar.setFixedWidth(195)
         self.group_box = QComboBox()
-        self.group_box.addItems(["系统指针 · 17 项", "互动动作 · 7 类"])
+        self.group_box.addItems(["系统指针 · 17 项", "互动指针 · 17 项"])
         self.group_box.currentIndexChanged.connect(self.change_group)
         side.addWidget(self.group_box)
+        self.trigger_box = QComboBox()
+        self.trigger_box.addItems(list(EVENTS.values()))
+        self.trigger_box.currentIndexChanged.connect(self.change_trigger)
+        self.trigger_box.hide()
+        side.addWidget(self.trigger_box)
         self.slot_list = QListWidget()
         self.slot_list.setIconSize(QSize(32, 32))
         self.slot_list.currentRowChanged.connect(self.select_slot)
+        self.slot_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.slot_list.customContextMenuRequested.connect(self.slot_menu)
         side.addWidget(self.slot_list, 1)
         layout.addWidget(sidebar)
         main = QVBoxLayout()
@@ -403,12 +464,27 @@ class Window(QMainWindow):
         more.setMenu(self.import_menu())
         bar.addWidget(more)
         main.addLayout(bar)
+        history_bar = QHBoxLayout()
+        frame_ops = self.button("帧操作", lambda: None)
+        frame_ops.setMenu(self.frame_menu())
+        history_bar.addWidget(frame_ops)
+        self.undo_button = self.button("撤销 Ctrl+Z", self.undo)
+        self.redo_button = self.button("重做 Ctrl+Y", self.redo)
+        history_bar.addWidget(self.undo_button)
+        history_bar.addWidget(self.redo_button)
+        self.history_label = label("编辑历史 0 / 30", "muted")
+        history_bar.addWidget(self.history_label)
+        history_bar.addStretch()
+        main.addLayout(history_bar)
+        self.update_history()
         work = QHBoxLayout()
         main.addLayout(work, 1)
         canvas_card, cc = card()
         cc.setContentsMargins(0, 0, 0, 0)
         self.canvas = Canvas()
         self.canvas.hotspot.connect(self.set_hot)
+        self.canvas.edit_started.connect(self.begin_hot_gesture)
+        self.canvas.edit_finished.connect(self.end_hot_gesture)
         self.canvas.imported.connect(
             lambda p: self.guard(lambda: self.load_files(p, False))
         )
@@ -427,8 +503,17 @@ class Window(QMainWindow):
         pv = QVBoxLayout(preview_page)
         prop.setContentsMargins(0, 8, 0, 0)
         pv.setContentsMargins(0, 8, 0, 0)
-        prop_tabs.addTab(settings_page, "参数")
-        prop_tabs.addTab(preview_page, "试用")
+        prop.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
+        pv.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
+        prop.setSpacing(12)
+        pv.setSpacing(12)
+        for inner, title in ((settings_page, "参数"), (preview_page, "试用")):
+            area = QScrollArea()
+            area.setWidgetResizable(True)
+            area.setWidget(inner)
+            area.setMinimumWidth(0)
+            prop_tabs.addTab(area, title)
+        self.inspector_tabs = prop_tabs
         prop.addWidget(label("点击热点", "title"))
         form = QFormLayout()
         self.hot_x = QSpinBox()
@@ -436,6 +521,9 @@ class Window(QMainWindow):
         for b in (self.hot_x, self.hot_y):
             b.setRange(0, 255)
             b.valueChanged.connect(self.hot_fields)
+        form.setVerticalSpacing(12)
+        self.hot_x.setMinimumHeight(34)
+        self.hot_y.setMinimumHeight(34)
         form.addRow("X", self.hot_x)
         form.addRow("Y", self.hot_y)
         prop.addLayout(form)
@@ -448,10 +536,13 @@ class Window(QMainWindow):
         self.size_combo.addItems([str(v) for v in SIZES])
         self.size_combo.setCurrentText(str(self.project.size))
         self.size_combo.currentTextChanged.connect(self.size_changed)
+        form.setVerticalSpacing(12)
+        self.size_combo.setMinimumHeight(34)
         form.addRow("输出尺寸", self.size_combo)
         self.duration = QSpinBox()
         self.duration.setRange(17, 60000)
         self.duration.setSuffix(" ms")
+        self.duration.setMinimumHeight(34)
         self.duration.valueChanged.connect(self.duration_changed)
         form.addRow("本帧停留", self.duration)
         prop.addLayout(form)
@@ -487,10 +578,12 @@ class Window(QMainWindow):
         self.frame_info = label("1 帧", "muted")
         frame_top.addWidget(self.frame_info)
         frame_top.addStretch()
-        frame_top.addWidget(self.button("帧操作", lambda: None))
-        frame_top.itemAt(frame_top.count() - 1).widget().setMenu(self.frame_menu())
+        frame_top.addWidget(label("Ctrl+C / V 复制粘贴 · Delete 删除", "muted"))
         fc.addLayout(frame_top)
         self.frame_list = FrameList()
+        self.frame_list.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection
+        )
         self.frame_list.setViewMode(QListWidget.ViewMode.IconMode)
         self.frame_list.setFlow(QListWidget.Flow.LeftToRight)
         self.frame_list.setWrapping(False)
@@ -501,6 +594,7 @@ class Window(QMainWindow):
         self.frame_list.currentRowChanged.connect(self.select_frame)
         self.frame_list.move_requested.connect(self.reorder_frames)
         fc.addWidget(self.frame_list)
+        self.install_frame_shortcuts()
 
     def import_menu(self):
         menu = QMenu(self)
@@ -511,7 +605,7 @@ class Window(QMainWindow):
             ("导出当前 CUR / ANI", lambda: self.export(True)),
             ("导出整套 CUR / ANI", lambda: self.export(False)),
             ("检查方案", self.check_project),
-            ("撤销上次帧编辑", self.undo),
+            ("撤销最近修改 · Ctrl+Z", self.undo),
         ]:
             menu.addAction(text, lambda checked=False, f=fn: self.guard(f))
         return menu
@@ -519,8 +613,10 @@ class Window(QMainWindow):
     def frame_menu(self):
         menu = QMenu(self)
         for text, fn in [
-            ("复制当前帧", self.duplicate_frame),
-            ("删除当前帧", self.delete_frame),
+            ("复制帧 · Ctrl+C", self.copy_frames),
+            ("粘贴帧 · Ctrl+V", self.paste_frames),
+            ("删除帧 · Delete", self.delete_frame),
+            ("复制并插入 · Ctrl+D", self.duplicate_frame),
             ("向前移动", lambda: self.move_frame(-1)),
             ("向后移动", lambda: self.move_frame(1)),
             ("反转顺序", self.reverse_frames),
@@ -534,26 +630,29 @@ class Window(QMainWindow):
     def change_group(self, index):
         if self.syncing:
             return
+        self.stop_play()
         self.group = "slots" if index == 0 else "events"
-        self.key = next(iter(SLOTS if index == 0 else EVENTS))
+        self.trigger_box.setVisible(index == 1)
         self.frame_index = 0
         self.rebuild_slots()
 
     def rebuild_slots(self):
         self.syncing = True
         self.slot_list.clear()
-        mapping = SLOTS if self.group == "slots" else EVENTS
-        for key, name in mapping.items():
-            frames = getattr(self.project, self.group).get(key, [])
-            item = QListWidgetItem(
-                name + ("\n" + str(len(frames)) + " 帧" if len(frames) > 1 else "")
+        for role, name in SLOTS.items():
+            frames = (
+                self.project.slots.get(role, [])
+                if self.group == "slots"
+                else self.project.event_frames(role, self.trigger)
             )
-            item.setData(Qt.ItemDataRole.UserRole, key)
+            item = QListWidgetItem(
+                name + "\n" + (str(len(frames)) + " 帧" if frames else "未设置")
+            )
+            item.setData(Qt.ItemDataRole.UserRole, role)
             if frames:
                 item.setIcon(QIcon(pixmap(frames[0].image)))
             self.slot_list.addItem(item)
-        keys = list(mapping)
-        self.slot_list.setCurrentRow(keys.index(self.key) if self.key in keys else 0)
+        self.slot_list.setCurrentRow(list(SLOTS).index(self.key))
         self.syncing = False
         self.rebuild_frames()
 
@@ -584,12 +683,19 @@ class Window(QMainWindow):
         self.frame_index = row
         self.refresh()
 
-    def reorder_frames(self, source, target):
-        if self.syncing or source == target:
+    def reorder_frames(self, source, boundary):
+        if (
+            self.syncing
+            or not 0 <= source < len(self.frames)
+            or not 0 <= boundary <= len(self.frames)
+        ):
             return
-        if not (0 <= source < len(self.frames) and 0 <= target < len(self.frames)):
+        # The drop position is a gap, so inserting after the source first removes its old slot.
+        target = boundary - (1 if source < boundary else 0)
+        if target == source:
             return
-        self.remember()
+        self.stop_play()
+        self.remember("插入排序")
         self.frames.insert(target, self.frames.pop(source))
         self.frame_index = target
         self.touch()
@@ -602,7 +708,8 @@ class Window(QMainWindow):
         self.canvas.pixel = self.project.pixel
         self.canvas.update()
         self.edit_title.setText(
-            (SLOTS if self.group == "slots" else EVENTS).get(self.key, self.key)
+            SLOTS[self.key]
+            + (" / " + EVENTS[self.trigger] if self.group == "events" else "")
         )
         self.name_label.setText(self.project.name)
         if f:
@@ -644,8 +751,13 @@ class Window(QMainWindow):
         self.syncing = False
 
     def set_hot(self, x, y):
-        if not self.frame:
+        if not self.frame or (x, y) == (self.frame.x, self.frame.y):
             return
+        if not self._hot_gesture:
+            self.remember(
+                "热点位置",
+                token=("hot", self.group, self.storage_key, self.frame_index),
+            )
         self.frame.x = x
         self.frame.y = y
         self.refresh()
@@ -667,21 +779,30 @@ class Window(QMainWindow):
         self.refresh()
 
     def duration_changed(self, value):
-        if not self.syncing and self.frame:
+        if not self.syncing and self.frame and self.frame.duration != value:
+            self.remember(
+                "帧时长",
+                token=("duration", self.group, self.storage_key, self.frame_index),
+            )
             self.frame.duration = value
             self.touch()
+            item = self.frame_list.item(self.frame_index)
+            if item:
+                item.setText(f"{self.frame_index + 1} · {value}ms")
             self.frame_info.setText(
                 f"{len(self.frames)} 帧 · 共 {sum(f.duration for f in self.frames) / 1000:.2f} 秒"
             )
 
     def size_changed(self, value):
-        if not self.syncing:
+        if not self.syncing and self.project.size != int(value):
+            self.remember("输出尺寸")
             self.project.size = int(value)
             self.touch()
             self.refresh()
 
     def pixel_changed(self, value):
-        if not self.syncing:
+        if not self.syncing and self.project.pixel != value:
+            self.remember("缩放方式")
             self.project.pixel = value
             self.touch()
             self.refresh()
@@ -703,7 +824,7 @@ class Window(QMainWindow):
             return
         self.stop_play()
         self.remember()
-        getattr(self.project, self.group)[self.key] = (
+        getattr(self.project, self.group)[self.storage_key] = (
             self.frames + result if append else result
         )
         self.frame_index = 0
@@ -712,26 +833,26 @@ class Window(QMainWindow):
 
     def batch_import(self):
         files, _ = QFileDialog.getOpenFileNames(
-            self, "按文件名匹配用途，例如 Arrow.gif 或 正常选择_Arrow.png", "", FILTER
+            self, "选择多张图片或动画，下一步调整 17 项匹配", "", FILTER
         )
-        staged = {}
-        skipped = []
-        for file in files:
-            name = Path(file).stem
-            key = name.rsplit("_", 1)[-1]
-            key = next(
-                (k for k, n in SLOTS.items() if k.lower() == key.lower() or n == name),
-                None,
-            )
-            if key:
-                staged[key] = import_images(Path(file), self.project.pixel)
-            else:
-                skipped.append(Path(file).name)
-        self.project.slots.update(staged)
-        self.rebuild_slots()
-        self.touch()
-        if skipped:
-            self.error("未匹配的文件：\n" + "\n".join(skipped))
+        if not files:
+            return
+        assets = []
+        errors = []
+        for path in files:
+            try:
+                frames = import_images(Path(path), self.project.pixel)
+                if frames:
+                    assets.append({"path": path, "frames": frames})
+            except Exception as error:
+                errors.append(Path(path).name + "：" + str(error))
+        if errors:
+            self.error("以下文件无法读取，其他文件仍可匹配：\n" + "\n".join(errors))
+        if not assets:
+            return
+        dialog = MatchDialog(assets, self)
+        if dialog.exec():
+            self.apply_matching(dialog.result_mapping())
 
     def import_sheet(self):
         file, _ = QFileDialog.getOpenFileName(
@@ -765,7 +886,7 @@ class Window(QMainWindow):
                     image, cols.value(), rows.value(), count.value(), self.project.pixel
                 )
             self.remember()
-            getattr(self.project, self.group)[self.key] = frames
+            getattr(self.project, self.group)[self.storage_key] = frames
             self.frame_index = 0
             self.rebuild_slots()
             self.touch()
@@ -775,7 +896,7 @@ class Window(QMainWindow):
         if self.group == "slots":
             self.project.slots[self.key] = Project.defaults().slots[self.key]
         else:
-            self.project.events.pop(self.key, None)
+            self.project.events.pop(self.storage_key, None)
         self.rebuild_slots()
         self.touch()
 
@@ -791,14 +912,14 @@ class Window(QMainWindow):
         self.touch()
 
     def delete_frame(self):
-        if not self.frame:
+        indices = self.selected_frame_indices()
+        if not indices:
             return
-        if len(self.frames) == 1 and self.group == "slots":
-            raise ValueError("系统用途至少需要一帧，可用还原内置图片")
-        self.remember()
-        self.frames.pop(self.frame_index)
-        if not self.frames and self.group == "events":
-            self.project.events.pop(self.key, None)
+        self.stop_play()
+        self.remember("删除帧")
+        for index in reversed(indices):
+            self.frames.pop(index)
+        self.frame_index = min(indices)
         self.rebuild_slots()
         self.touch()
 
@@ -979,38 +1100,64 @@ class Window(QMainWindow):
         banner, b = card()
         line = QHBoxLayout()
         texts = QVBoxLayout()
-        texts.addWidget(label("让角色回应你的操作", "title"))
+        texts.addWidget(label("桌面互动 · 总开关", "title"))
+        self.runtime_status = label("● 已停止")
+        self.runtime_status.setStyleSheet("color:#6C7E74;font-weight:600;")
+        texts.addWidget(self.runtime_status)
         texts.addWidget(label("开启后在托盘运行；停止时恢复原指针。", "muted"))
         line.addLayout(texts, 1)
         line.addStretch()
         self.runtime_button = self.button("开启桌面互动", self.toggle_engine, True)
+        self.runtime_button.setCheckable(True)
+        self.runtime_button.setMinimumWidth(146)
         line.addWidget(self.runtime_button)
         b.addLayout(line)
         layout.addWidget(banner)
-        row = QHBoxLayout()
-        layout.addLayout(row)
+        columns = QHBoxLayout()
+        layout.addLayout(columns)
         actions, ac = card()
-        row.addWidget(actions, 1)
-        ac.addWidget(label("动作素材", "title"))
+        columns.addWidget(actions, 1)
+        ac.addWidget(label("互动素材 · 17 种用途", "title"))
         ac.addWidget(
             label(
-                "可使用不同于系统指针的素材。动态动作逐帧播放，点击动作播放一次后回到正常状态。",
+                "选择触发动作，为每一种系统用途分别配置动画。旧版 7 类素材已保留在正常选择下。",
                 "muted",
             )
         )
+        self.interaction_trigger_box = QComboBox()
+        self.interaction_trigger_box.addItems(list(EVENTS.values()))
+        self.interaction_trigger_box.currentIndexChanged.connect(
+            self.change_interaction_trigger
+        )
+        ac.addWidget(self.interaction_trigger_box)
+        action_area = QScrollArea()
+        action_area.setWidgetResizable(True)
+        action_body = QWidget()
+        action_body.setStyleSheet("background:white;")
+        action_layout = QVBoxLayout(action_body)
+        action_layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
+        action_layout.setContentsMargins(0, 0, 0, 0)
+        action_area.setWidget(action_body)
+        action_area.setMinimumHeight(380)
+        ac.addWidget(action_area, 1)
         self.event_status = {}
-        for key, name in EVENTS.items():
-            r = QHBoxLayout()
-            r.addWidget(label(name))
+        self.event_thumbs = {}
+        for role, name in SLOTS.items():
+            row = QHBoxLayout()
+            thumb = AnimatedThumb(size=40)
+            self.event_thumbs[role] = thumb
+            row.addWidget(thumb)
+            text = QVBoxLayout()
+            text.addWidget(label(name))
             count = label("未设置", "muted")
-            self.event_status[key] = count
-            r.addWidget(count)
-            r.addStretch()
-            r.addWidget(self.button("导入", lambda k=key: self.import_event(k)))
-            r.addWidget(self.button("编辑", lambda k=key: self.edit_event(k)))
-            ac.addLayout(r)
+            self.event_status[role] = count
+            text.addWidget(count)
+            row.addLayout(text, 1)
+            row.addWidget(self.button("导入", lambda r=role: self.import_event(r)))
+            row.addWidget(self.button("编辑", lambda r=role: self.edit_event(r)))
+            action_layout.addLayout(row)
         effects, ef = card()
-        row.addWidget(effects, 1)
+        columns.addWidget(effects, 1)
         ef.addWidget(label("效果与响应", "title"))
         form = QFormLayout()
         self.click_effect = QComboBox()
@@ -1045,7 +1192,7 @@ class Window(QMainWindow):
             ef.addWidget(check)
         ef.addWidget(
             label(
-                "互动动作暂时替换普通箭头；文本、链接等用途仍由应用决定。已有系统指针动画使用原生 ANI。",
+                "根据当前系统用途播放对应互动素材；未设置时使用该用途的原动画。手写等特殊用途由应用自身控制，仍支持原生 ANI 安装。",
                 "muted",
             )
         )
@@ -1087,39 +1234,63 @@ class Window(QMainWindow):
         self.refresh_events()
 
     def refresh_events(self):
-        if hasattr(self, "event_status"):
-            for key, w in self.event_status.items():
-                w.setText(
-                    f"{len(self.project.events[key])} 帧"
-                    if self.project.events.get(key)
-                    else "未设置"
+        if not hasattr(self, "event_status"):
+            return
+        for role, widget in self.event_status.items():
+            frames = self.project.event_frames(role, self.interaction_trigger)
+            widget.setText(
+                (
+                    str(len(frames))
+                    + " 帧 · "
+                    + str(round(sum(f.duration for f in frames) / 1000, 2))
+                    + "s"
                 )
+                if frames
+                else "未设置"
+            )
+            self.event_thumbs[role].set_frames(frames)
 
-    def import_event(self, key):
+    def import_event(self, role):
         files, _ = QFileDialog.getOpenFileNames(
-            self, EVENTS[key] + "：选择图片或动画", "", FILTER
+            self, SLOTS[role] + " / " + EVENTS[self.interaction_trigger], "", FILTER
         )
         if not files:
             return
-        old_group, old_key = self.group, self.key
+        old = self.selection()
         self.group = "events"
-        self.key = key
-        self.load_files(files, False)
+        self.key = role
+        self.trigger = self.interaction_trigger
+        try:
+            self.load_files(files, False)
+        finally:
+            self.group, self.key, self.frame_index, self.trigger = old
+            self.rebuild_slots()
         self.refresh_events()
-        self.group, self.key = old_group, old_key
-        self.rebuild_slots()
-        self.statusBar().showMessage(EVENTS[key] + "已载入，点编辑可设置热点和帧时长")
+        self.statusBar().showMessage(
+            SLOTS[role] + " 的 " + EVENTS[self.interaction_trigger] + " 已读取"
+        )
 
-    def edit_event(self, key):
+    def edit_event(self, role, trigger=None):
+        if role in EVENTS:
+            trigger = role
+            role = "Arrow"
+        self.stop_play()
         self.group = "events"
-        self.key = key
+        self.key = role
+        self.trigger = trigger or self.interaction_trigger
+        self.frame_index = 0
         self.syncing = True
         self.group_box.setCurrentIndex(1)
+        self.trigger_box.setCurrentIndex(list(EVENTS).index(self.trigger))
+        self.trigger_box.show()
         self.syncing = False
         self.rebuild_slots()
         self.tabs.setCurrentIndex(0)
 
     def setting(self, key, value):
+        if self.project.settings.get(key) == value:
+            return
+        self.remember("互动设置", token=("setting", key))
         self.project.settings[key] = value
         self.touch()
         if hasattr(self, "sound_label"):
@@ -1127,7 +1298,7 @@ class Window(QMainWindow):
                 Path(self.project.settings.get("sound", "")).name or "未设置音频"
             )
         if self.engine.active:
-            self.statusBar().showMessage("互动设置已保存；停止并重新开启桌面互动后生效")
+            self.statusBar().showMessage("运行中；设置已修改，停止并重新开启后生效")
 
     def choose_sound(self):
         file, _ = QFileDialog.getOpenFileName(
@@ -1165,6 +1336,7 @@ class Window(QMainWindow):
         )
         if path:
             Project.load(path)
+            self.remember("添加应用规则")
             self.project.settings.setdefault("app_rules", []).append(
                 {"exe": exe.lower(), "scheme": path}
             )
@@ -1174,24 +1346,32 @@ class Window(QMainWindow):
     def remove_rule(self):
         i = self.rules.currentRow()
         if i >= 0:
+            self.remember("删除应用规则")
             self.project.settings["app_rules"].pop(i)
             self.refresh_rules()
             self.touch()
 
     def toggle_engine(self):
-        if self.engine.active:
-            self.engine.stop()
-            self.runtime_button.setText("开启桌面互动")
-            self.statusBar().showMessage("桌面互动已停止，原来的指针已恢复")
-        else:
-            self.engine.start(self.project)
-            self.runtime_button.setText("停止桌面互动")
-            self.statusBar().showMessage(
-                "桌面互动运行中 · 关闭窗口可留在托盘 · 托盘菜单可停止或退出"
-            )
+        running = self.engine.active
+        self.set_runtime_state("stopping" if running else "starting")
+        QApplication.processEvents()
+        try:
+            if running:
+                self.engine.stop()
+                self.set_runtime_state("stopped")
+                self.statusBar().showMessage("桌面互动已停止，开启前方案已恢复")
+            else:
+                self.engine.start(self.project)
+                self.set_runtime_state("running")
+                self.statusBar().showMessage(
+                    "桌面互动正在运行 · 总开关控制下方全部互动功能 · 托盘菜单也可停止"
+                )
+        except Exception:
+            self.set_runtime_state("error")
+            raise
 
     def runtime_error(self, message):
-        self.runtime_button.setText("开启桌面互动")
+        self.set_runtime_state("error")
         self.error("桌面互动已停止：" + message)
 
     def build_schemes(self):
@@ -1248,14 +1428,30 @@ class Window(QMainWindow):
             self.scheme_list.addItem(item)
 
     def save_scheme(self):
-        name, ok = QInputDialog.getText(
-            self, "保存方案", "方案名称", text=self.project.name
+        dlg = QDialog(self)
+        dlg.setWindowTitle("保存完整方案")
+        dlg.resize(540, 300)
+        layout = QVBoxLayout(dlg)
+        layout.addWidget(label("将保存以下内容", "title"))
+        layout.addWidget(label(self.save_summary()))
+        name_box = QLineEdit(self.project.name)
+        form = QFormLayout()
+        form.addRow("方案名称", name_box)
+        layout.addLayout(form)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save
+            | QDialogButtonBox.StandardButton.Cancel
         )
-        if not ok or not name.strip():
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        layout.addWidget(buttons)
+        if not dlg.exec() or not name_box.text().strip():
             return
         import re
 
-        name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name.strip()).strip(". ")[:100]
+        name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name_box.text().strip()).strip(
+            ". "
+        )[:100]
         if not name:
             raise ValueError("方案名称无效")
         path = self.schemes_dir / (name + ".whalepack")
@@ -1265,14 +1461,19 @@ class Window(QMainWindow):
             != QMessageBox.StandardButton.Yes
         ):
             return
-        self.project.name = name
+        if name != self.project.name:
+            self.remember("方案名称")
+            self.project.name = name
         self.project.save(path)
         self.touch()
         self.refresh_schemes()
         self.refresh()
-        self.statusBar().showMessage("方案已保存：" + name)
+        self.statusBar().showMessage(
+            "完整方案已保存：" + name + "（图片、动画、热点和互动设置；未改变系统）"
+        )
 
     def copy_scheme(self):
+        self.remember("复制方案")
         self.project.name += " 副本"
         self.save_scheme()
 
@@ -1318,16 +1519,19 @@ class Window(QMainWindow):
             self.refresh_schemes()
 
     def set_project(self, project):
+        if not self._history_loading:
+            self.remember("切换方案")
+        project.migrate_events()
         if self.engine.active:
             self.toggle_engine()
         self.stop_play()
         self.project = project
-        self.undo_stack = []
         self.group = "slots"
         self.key = "Arrow"
         self.frame_index = 0
         self.syncing = True
         self.group_box.setCurrentIndex(0)
+        self.trigger_box.hide()
         self.size_combo.setCurrentText(str(project.size))
         self.pixel.setChecked(project.pixel)
         self.syncing = False
@@ -1435,7 +1639,7 @@ class Window(QMainWindow):
         a.addWidget(label("关于", "title"))
         a.addWidget(
             label(
-                "鲸鱼娘指针工坊 2.0\n原生 CUR / ANI 安装无需常驻；桌面互动在托盘运行，可随时停止。\n方案与导入素材保存在当前用户目录，程序不上传图片或鼠标操作。\n支持 Windows 10 / 11。游戏、远程桌面和部分自绘指针应用可能使用自己的指针。"
+                "鲸鱼娘指针工坊 2.1\n原生 CUR / ANI 安装无需常驻；桌面互动在托盘运行，可随时停止。\n方案与导入素材保存在当前用户目录，程序不上传图片或鼠标操作。\n支持 Windows 10 / 11。游戏、远程桌面和部分自绘指针应用可能使用自己的指针。"
             )
         )
         a.addWidget(
@@ -1451,6 +1655,8 @@ class Window(QMainWindow):
         self.canvas.update()
 
     def multi_changed(self, value):
+        if self.project.multi_size != value:
+            self.remember("多尺寸设置")
         self.project.multi_size = value
         self.touch()
 
@@ -1465,14 +1671,12 @@ class Window(QMainWindow):
         self.statusBar().showMessage("系统鼠标选项已应用")
 
     def check_project(self):
-        issues = self.project.problems()
-        QMessageBox.information(
-            self,
-            "方案检查",
-            "\n".join(issues)
-            if issues
-            else "检查通过：17 种用途的画布、热点和帧时长均有效。",
-        )
+        self.setCursor(Qt.CursorShape.WaitCursor)
+        try:
+            rows = self.project.inspect()
+        finally:
+            self.unsetCursor()
+        InspectionDialog(rows, self).exec()
 
     def install(self, only):
         if only and self.group != "slots":
@@ -1506,7 +1710,7 @@ class Window(QMainWindow):
                 raise ValueError("当前动作没有图片")
             dest.mkdir()
             animated = len(self.frames) > 1
-            (dest / (self.key + (".ani" if animated else ".cur"))).write_bytes(
+            (dest / (self.storage_key + (".ani" if animated else ".cur"))).write_bytes(
                 encode_ani(self.frames, (self.project.size,), self.project.pixel)
                 if animated
                 else encode_cur(self.frame, (self.project.size,), self.project.pixel)
@@ -1517,7 +1721,10 @@ class Window(QMainWindow):
         self.statusBar().showMessage("已导出到 " + str(dest))
 
     def build_tray(self):
-        icon = QIcon(pixmap(self.project.slots["Arrow"][0].image))
+        source = (self.project.slots.get("Arrow") or Project.defaults().slots["Arrow"])[
+            0
+        ]
+        icon = QIcon(pixmap(source.image))
         self.setWindowIcon(icon)
         self.tray = QSystemTrayIcon(icon, self)
         self.tray.setToolTip("鲸鱼娘 · 指针工坊")
@@ -1569,3 +1776,178 @@ class Window(QMainWindow):
         except Exception as e:
             self.error(e)
             event.ignore()
+
+    @property
+    def storage_key(self):
+        return self.key if self.group == "slots" else event_key(self.key, self.trigger)
+
+    def selection(self):
+        return (self.group, self.key, self.frame_index, self.trigger)
+
+    def update_history(self):
+        if hasattr(self, "undo_button"):
+            self.undo_button.setEnabled(bool(self.history.past))
+            self.redo_button.setEnabled(bool(self.history.future))
+            self.history_label.setText(f"编辑历史 {len(self.history.past)} / 30")
+
+    def redo(self):
+        self.stop_play()
+        record = self.history.redo(self.project, self.selection())
+        if record:
+            self.restore_history(record)
+
+    def restore_history(self, record):
+        project, selection = record
+        self._history_loading = True
+        try:
+            self.set_project(project)
+            self.group, self.key, self.frame_index, self.trigger = selection
+            self.group_box.blockSignals(True)
+            self.group_box.setCurrentIndex(0 if self.group == "slots" else 1)
+            self.group_box.blockSignals(False)
+            self.trigger_box.blockSignals(True)
+            self.trigger_box.setCurrentIndex(list(EVENTS).index(self.trigger))
+            self.trigger_box.blockSignals(False)
+            self.trigger_box.setVisible(self.group == "events")
+            self.rebuild_slots()
+        finally:
+            self._history_loading = False
+        self.update_history()
+        self.touch()
+
+    def change_trigger(self, index):
+        if self.syncing:
+            return
+        self.stop_play()
+        self.trigger = list(EVENTS)[index]
+        self.frame_index = 0
+        self.rebuild_slots()
+
+    def begin_hot_gesture(self):
+        if self.frame:
+            self.remember("热点拖动")
+            self._hot_gesture = True
+
+    def end_hot_gesture(self):
+        self._hot_gesture = False
+        self.history.break_group()
+
+    def apply_matching(self, mapping):
+        if not mapping:
+            return
+        self.remember("批量匹配")
+        for role, frames in mapping.items():
+            target = role if self.group == "slots" else event_key(role, self.trigger)
+            getattr(self.project, self.group)[target] = [f.clone() for f in frames]
+        self.frame_index = 0
+        self.rebuild_slots()
+        self.touch()
+        self.statusBar().showMessage(f"已读取匹配结果：{len(mapping)} 种用途")
+
+    def slot_menu(self, pos):
+        item = self.slot_list.itemAt(pos)
+        if item is None:
+            return
+        self.slot_list.setCurrentItem(item)
+        menu = QMenu(self)
+        for text, fn in [
+            ("导入 / 替换图片或动画", lambda: self.import_files(False)),
+            ("追加帧", lambda: self.import_files(True)),
+            ("删除当前素材", self.clear_slot),
+        ]:
+            menu.addAction(text, lambda checked=False, f=fn: self.guard(f))
+        menu.exec(self.slot_list.viewport().mapToGlobal(pos))
+
+    def clear_slot(self):
+        if not self.frames:
+            return
+        self.remember("删除素材")
+        getattr(self.project, self.group)[self.storage_key] = []
+        self.frame_index = 0
+        self.rebuild_slots()
+        self.touch()
+
+    def selected_frame_indices(self):
+        rows = sorted(
+            {self.frame_list.row(item) for item in self.frame_list.selectedItems()}
+        )
+        return rows or ([self.frame_index] if self.frame else [])
+
+    def install_frame_shortcuts(self):
+        for widget in (self.frame_list, self.canvas):
+            for sequence, name, fn in [
+                ("Ctrl+C", "复制帧", self.copy_frames),
+                ("Ctrl+V", "粘贴帧", self.paste_frames),
+                ("Ctrl+X", "剪切帧", self.cut_frames),
+                ("Delete", "删除帧", self.delete_frame),
+                ("Ctrl+D", "复制并插入", self.duplicate_frame),
+            ]:
+                action = QAction(name, widget)
+                action.setShortcut(sequence)
+                action.setShortcutContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+                action.triggered.connect(lambda checked=False, f=fn: self.guard(f))
+                widget.addAction(action)
+
+    def copy_frames(self):
+        indices = self.selected_frame_indices()
+        if not indices:
+            return
+        mime = QMimeData()
+        mime.setData(
+            "application/x-whale-frames",
+            encode_clipboard([self.frames[i] for i in indices]),
+        )
+        QApplication.clipboard().setMimeData(mime)
+        self.statusBar().showMessage(f"已复制 {len(indices)} 帧；Ctrl+V 在当前帧后插入")
+
+    def paste_frames(self):
+        mime = QApplication.clipboard().mimeData()
+        if not mime or not mime.hasFormat("application/x-whale-frames"):
+            return
+        frames = decode_clipboard(bytes(mime.data("application/x-whale-frames")))
+        if len(frames) + len(self.frames) > 512:
+            raise ValueError("粘贴后超过 512 帧")
+        self.stop_play()
+        self.remember("粘贴帧")
+        index = self.frame_index + 1 if self.frames else 0
+        target = getattr(self.project, self.group).setdefault(self.storage_key, [])
+        target[index:index] = frames
+        self.frame_index = index
+        self.rebuild_slots()
+        self.touch()
+
+    def cut_frames(self):
+        self.copy_frames()
+        self.delete_frame()
+
+    def change_interaction_trigger(self, index):
+        self.interaction_trigger = list(EVENTS)[index]
+        self.refresh_events()
+
+    def set_runtime_state(self, state, error=""):
+        labels = {
+            "stopped": ("● 已停止", "#6C7E74", "开启桌面互动"),
+            "starting": ("◷ 正在启动…", "#AD7B1A", "正在启动…"),
+            "running": ("● 正在运行", "#24734F", "停止桌面互动"),
+            "stopping": ("◷ 正在停止…", "#AD7B1A", "正在停止…"),
+            "error": ("● 已停止 · 启动或恢复失败", "#B54444", "重新开启互动"),
+        }
+        text, color, button = labels[state]
+        self.runtime_status.setText(text)
+        self.runtime_status.setStyleSheet(
+            f"color:{color};font-size:15px;font-weight:600;"
+        )
+        self.runtime_button.setText(button)
+        self.runtime_button.setChecked(state == "running")
+        self.runtime_button.setEnabled(state not in ("starting", "stopping"))
+        self.runtime_button.setStyleSheet(
+            "background:#B44D4D;color:white;" if state == "running" else ""
+        )
+
+    def save_summary(self):
+        system = sum(bool(frames) for frames in self.project.slots.values())
+        events = sum(bool(frames) for frames in self.project.events.values())
+        frames = sum(len(v) for v in self.project.slots.values()) + sum(
+            len(v) for v in self.project.events.values()
+        )
+        return f"保存 {system}/17 种系统素材、{events} 组互动素材，共 {frames} 帧；包含图片、动画顺序、每帧时长、热点、尺寸、音效与应用规则。\n保存不会安装指针，也不会开启桌面互动；Windows 系统鼠标选项不包含在方案内。"

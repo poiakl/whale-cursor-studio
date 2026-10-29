@@ -9,7 +9,16 @@ import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from PIL import Image
-from .codec import Frame, MAX_FRAMES, SIZES, encode_ani, encode_cur, validate
+from .codec import (
+    Frame,
+    MAX_FRAMES,
+    SIZES,
+    encode_ani,
+    encode_cur,
+    validate,
+    decode_ani,
+    decode_cur,
+)
 
 SLOTS = dict(
     zip(
@@ -62,6 +71,26 @@ EVENTS = {
     "up": "向上移动",
     "down": "向下移动",
 }
+
+
+def event_key(role, trigger):
+    if role not in SLOTS or trigger not in EVENTS:
+        raise ValueError("未知的指针用途或触发动作")
+    return role + "." + trigger
+
+
+def event_parts(key):
+    if key in EVENTS:
+        return "Arrow", key
+    role, sep, trigger = key.partition(".")
+    if sep and role in SLOTS and trigger in EVENTS:
+        return role, trigger
+    raise ValueError("未知的互动素材：" + key)
+
+
+def event_name(key):
+    role, trigger = event_parts(key)
+    return SLOTS[role] + " / " + EVENTS[trigger]
 
 
 def assets_dir():
@@ -120,7 +149,7 @@ class Project:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         manifest = {
-            "version": 2,
+            "version": 3,
             "name": self.name,
             "size": self.size,
             "pixel": self.pixel,
@@ -135,7 +164,7 @@ class Project:
                 for group in ("slots", "events"):
                     for key, frames in getattr(self, group).items():
                         records = []
-                        if not 1 <= len(frames) <= MAX_FRAMES:
+                        if not 0 <= len(frames) <= MAX_FRAMES:
                             raise ValueError("每组需要 1～512 帧")
                         for i, f in enumerate(frames):
                             validate(f)
@@ -171,7 +200,7 @@ class Project:
             if z.getinfo("project.json").file_size > 2 * 1024 * 1024:
                 raise ValueError("方案索引过大")
             m = json.loads(z.read("project.json"))
-            if m.get("version") != 2 or m.get("size") not in SIZES:
+            if m.get("version") not in (2, 3) or m.get("size") not in SIZES:
                 raise ValueError("不支持的方案版本 / 尺寸")
             p = cls.defaults()
             p.name = str(m.get("name", "未命名"))[:120]
@@ -181,9 +210,17 @@ class Project:
             p.settings.update(m.get("settings", {}))
             for group, allowed in (("slots", SLOTS), ("events", EVENTS)):
                 for key, records in m.get(group, {}).items():
-                    if key not in allowed:
-                        continue
-                    if not 1 <= len(records) <= MAX_FRAMES:
+                    if group == "events":
+                        try:
+                            role, trigger = event_parts(key)
+                            target = event_key(role, trigger)
+                        except ValueError:
+                            continue
+                    else:
+                        if key not in allowed:
+                            continue
+                        target = key
+                    if not 0 <= len(records) <= MAX_FRAMES:
                         raise ValueError("方案帧数无效")
                     frames = []
                     for r in records:
@@ -198,7 +235,7 @@ class Project:
                             )
                             validate(f)
                             frames.append(f)
-                    getattr(p, group)[key] = frames
+                    getattr(p, group)[target] = frames
             if p.settings.get("sound") == "@embedded":
                 audio = z.read("audio/click.wav")
                 dest = user_dir() / "audio"
@@ -215,7 +252,7 @@ class Project:
         folder.mkdir(parents=True, exist_ok=True)
         paths = {}
         for key, frames in self.slots.items():
-            if only and key != only:
+            if (only and key != only) or not frames:
                 continue
             # The chosen size is authoritative unless the user explicitly requests multi-resolution.
             sizes = SIZES if self.multi_size else (self.size,)
@@ -227,18 +264,80 @@ class Project:
                 else encode_cur(frames[0], sizes, self.pixel)
             )
             paths[key] = str(path.resolve())
+        if not paths:
+            raise ValueError("没有可生成的指针素材，请先导入图片或动画")
         return paths
 
+    def event_frames(self, role, trigger):
+        return self.events.get(
+            event_key(role, trigger),
+            self.events.get(trigger, []) if role == "Arrow" else [],
+        )
+
+    def migrate_events(self):
+        for key in list(self.events):
+            role, trigger = event_parts(key)
+            target = event_key(role, trigger)
+            if target != key:
+                self.events.setdefault(target, self.events[key])
+                del self.events[key]
+
+    def inspect(self):
+        rows = []
+        for group in ("slots", "events"):
+            for key, frames in getattr(self, group).items():
+                name = (
+                    ("系统 · " + SLOTS[key])
+                    if group == "slots"
+                    else ("互动 · " + event_name(key))
+                )
+                issues = []
+                if not frames:
+                    issues.append("未配置素材（安装时保留原系统用途）")
+                for i, f in enumerate(frames):
+                    try:
+                        validate(f)
+                    except ValueError as e:
+                        issues.append(f"第 {i + 1} 帧：{e}")
+                    if f.image.getbbox() is None:
+                        issues.append(f"第 {i + 1} 帧完全透明")
+                if len({(f.x, f.y) for f in frames}) > 1:
+                    issues.append("各帧热点不同，请确认指向点稳定（提示）")
+                if frames and not any(
+                    "第 " in issue and "完全透明" not in issue for issue in issues
+                ):
+                    try:
+                        if len(frames) > 1:
+                            decoded = decode_ani(
+                                encode_ani(frames, (self.size,), self.pixel)
+                            )
+                            if len(decoded) != len(frames):
+                                issues.append("ANI 导出后帧数不一致")
+                            if any(
+                                abs(a.duration - b.duration) > 9
+                                for a, b in zip(frames, decoded)
+                            ):
+                                issues.append("ANI 时长换算异常")
+                        else:
+                            decode_cur(encode_cur(frames[0], (self.size,), self.pixel))
+                    except Exception as e:
+                        issues.append("格式 / 动画时序检查失败：" + str(e))
+                rows.append(
+                    {
+                        "group": group,
+                        "key": key,
+                        "name": name,
+                        "frames": frames,
+                        "count": len(frames),
+                        "duration": sum(f.duration for f in frames),
+                        "issues": issues,
+                    }
+                )
+        return rows
+
     def problems(self):
-        issues = []
-        for key, frames in self.slots.items():
-            for i, f in enumerate(frames):
-                try:
-                    validate(f)
-                except ValueError as e:
-                    issues.append(f"{SLOTS[key]} 第 {i + 1} 帧：{e}")
-                if f.image.getbbox() is None:
-                    issues.append(f"{SLOTS[key]} 第 {i + 1} 帧完全透明")
-            if len({(f.x, f.y) for f in frames}) > 1:
-                issues.append(f"{SLOTS[key]} 各帧热点不同，请确认指向点稳定（提示）")
-        return issues
+        return [
+            row["name"] + "：" + issue
+            for row in self.inspect()
+            for issue in row["issues"]
+        ]

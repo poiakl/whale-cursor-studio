@@ -25,6 +25,23 @@ jobs:
       - run: python -m pytest -q
         env:
           QT_QPA_PLATFORM: offscreen
+      - name: Check native Windows compositor at multiple scales
+        shell: pwsh
+        run: |
+          foreach ($scale in @("1", "1.25", "1.5", "2")) {
+            $env:QT_SCALE_FACTOR = $scale
+            python tests/desktop_render_probe.py
+            if ($LASTEXITCODE -ne 0) { throw "Compositor probe failed at scale $scale" }
+          }
+        env:
+          QT_QPA_PLATFORM: windows
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: desktop-render-diagnostics
+          path: render-diagnostics
+          if-no-files-found: ignore
+          retention-days: 30
       - name: Package portable Windows app
         run: python -m PyInstaller --noconfirm --clean --windowed --onedir --name WhaleCursorStudio --add-data "assets;assets" --collect-all PySide6.QtMultimedia main.py
       - name: Launch packaged app and check all pages
@@ -61,5 +78,5 @@ jobs:
           }
           gh api --method PATCH "repos/$env:GITHUB_REPOSITORY/git/refs/tags/desktop-latest" -f "sha=$env:GITHUB_SHA" -F force=true
           if ($LASTEXITCODE -ne 0) { throw "Could not update rolling release source tag" }
-          gh release edit desktop-latest --title "Windows 便携版 · 2.7" --notes "新增热点 JSON 预览导入、AI 额外指令；修复效果关闭不生效、应用切换后装饰消失及互动指针尺寸跳变；保留参考图 API 生图、返回预览和可撤销的对应帧覆盖。完整解压后运行 WhaleCursorStudio.exe。"
+          gh release edit desktop-latest --title "Windows 便携版 · 2.8" --notes "按制作像素尺寸统一互动绘制与 DPI 换算；点击素材单次播放，固定分块特效窗口，避免首帧回跳及窗口移动缩放引起的闪烁。包含热点 JSON、AI 额外指令和 API 生图功能。完整解压后运行 WhaleCursorStudio.exe。"
           gh release upload desktop-latest WhaleCursorStudio-Windows.zip --clobber

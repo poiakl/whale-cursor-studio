@@ -165,12 +165,12 @@ class Overlay(QWidget):
             # Reserve the whole hotspot range once. Individual animation frames
             # must not move or resize the native window at a stationary pointer.
             size = self.cursor_size
-            rect = QRect(
+            rect = QRectF(
                 self.cursor_pos.x() - size - 2,
                 self.cursor_pos.y() - size - 2,
                 size * 2 + 4,
                 size * 2 + 4,
-            )
+            ).toAlignedRect()
         if self.sprite is not None:
             rect = rect.united(
                 QRect(
@@ -336,7 +336,10 @@ class Overlay(QWidget):
             custom = self.effects.get("trail" if kind == "trail" else "click", [])
             if custom and kind in ("custom", "trail"):
                 total = sum(duration for _, duration in custom)
-                elapsed = (age * 1000) % total
+                # Transient feedback is a one-shot clip, not a looping sprite.
+                # Wrapping a transparent last frame back to an opaque first frame
+                # creates a visible flash when effect lifetime exceeds clip length.
+                elapsed = min(max(0, age * 1000), max(0, total - 0.001))
                 index = 0
                 while index < len(custom) - 1 and elapsed >= custom[index][1]:
                     elapsed -= custom[index][1]
@@ -395,6 +398,166 @@ class Overlay(QWidget):
         p.end()
 
 
+class EffectLayer(Overlay):
+    """Fixed, input-transparent tiles: clicks never move or resize a layered HWND.
+
+    Only tiles touched by live effects are repainted. Blank tiles stay mapped,
+    so starting/ending a click does not expose recycled compositor contents.
+    """
+
+    TILE = 512
+
+    def __init__(self):
+        super().__init__()
+        self._tiles = []
+        self._screens = None
+        self._primary_particles = []
+        self._active_tiles = []
+
+    @staticmethod
+    def screen_areas():
+        return [
+            (screen, screen.availableGeometry().adjusted(1, 1, -1, -1))
+            for screen in QApplication.screens()
+        ]
+
+    def fit_screens(self):
+        self.release_tiles()
+        areas = self.screen_areas()
+        self._screens = [
+            (rect.getRect(), screen.devicePixelRatio()) for screen, rect in areas
+        ]
+        cells = []
+        for screen, area in areas:
+            for y in range(area.top(), area.bottom() + 1, self.TILE):
+                for x in range(area.left(), area.right() + 1, self.TILE):
+                    cells.append(
+                        (
+                            screen,
+                            QRect(
+                                x,
+                                y,
+                                min(self.TILE, area.right() - x + 1),
+                                min(self.TILE, area.bottom() - y + 1),
+                            ),
+                        )
+                    )
+        # Keep the primary test/preview surface at the current pointer's tile.
+        point = QCursor.pos()
+        cells.sort(key=lambda pair: not pair[1].contains(point))
+        self.particles = []
+        self._primary_particles = []
+        for index, (screen, rect) in enumerate(cells):
+            tile = self if index == 0 else Overlay()
+            tile.setGeometry(rect)
+            tile.render_time = time.monotonic()
+            tile._tile_active = False
+            tile.show()
+            self._tiles.append(tile)
+        self._particle_bounds.clear()
+        self._effect_bounds = QRect()
+
+    def release_tiles(self):
+        for tile in self._tiles:
+            QWidget.hide(tile)
+            if tile is not self:
+                tile.deleteLater()
+        self._tiles = []
+        self._active_tiles = []
+        self._screens = None
+
+    def paintEvent(self, event):
+        particles = self.particles
+        self.particles = self._primary_particles
+        try:
+            super().paintEvent(event)
+        finally:
+            self.particles = particles
+
+    def present(self, now=None):
+        now = time.monotonic() if now is None else now
+        signature = [
+            (rect.getRect(), screen.devicePixelRatio())
+            for screen, rect in self.screen_areas()
+        ]
+        if signature != self._screens:
+            particles = self.particles
+            self.fit_screens()
+            self.particles = particles
+        self.render_time = now
+        self.particles = [
+            particle
+            for particle in self.particles
+            if now - particle[1]
+            < max(
+                0.1,
+                self.settings.get(
+                    "trail_lifetime" if particle[2] == "trail" else "effect_lifetime",
+                    850,
+                )
+                / 1000,
+            )
+        ]
+        active = {id(particle) for particle in self.particles}
+        self._particle_bounds = {
+            key: value for key, value in self._particle_bounds.items() if key in active
+        }
+        for particle in self.particles:
+            if id(particle) not in self._particle_bounds:
+                self._particle_bounds[id(particle)] = (
+                    particle,
+                    self.particle_bounds(particle),
+                )
+        self._active_tiles = []
+        for tile in self._tiles:
+            selected = [
+                particle
+                for particle in self.particles
+                if self._particle_bounds[id(particle)][1].intersects(tile.geometry())
+            ]
+            was_active = tile._tile_active
+            tile.settings, tile.effects, tile.keyframes = (
+                self.settings,
+                self.effects,
+                self.keyframes,
+            )
+            tile.render_time = now
+            if tile is self:
+                self._primary_particles = selected
+            else:
+                tile.particles = selected
+            tile._tile_active = bool(selected)
+            if selected:
+                self._active_tiles.append(tile)
+            if selected or was_active:
+                tile.update()
+
+    def active_handles(self):
+        return [int(tile.winId()) for tile in self._active_tiles if tile.isVisible()]
+
+    def clear(self):
+        self.particles = []
+        self._primary_particles = []
+        self._particle_bounds.clear()
+        self._effect_bounds = QRect()
+        self._active_tiles = []
+        for tile in self._tiles:
+            if tile is not self:
+                tile.particles = []
+            if tile._tile_active:
+                tile._tile_active = False
+                tile.repaint()
+
+    def hide(self):
+        for tile in self._tiles:
+            QWidget.hide(tile)
+        super().hide()
+
+    def deleteLater(self):
+        self.release_tiles()
+        super().deleteLater()
+
+
 class Engine:
     def __init__(self, on_error=lambda message: None):
         self.on_error = on_error
@@ -402,7 +565,7 @@ class Engine:
         self.timer.timeout.connect(self.tick)
         self.active = False
         self.overlay = Overlay()
-        self.effect_overlay = Overlay()
+        self.effect_overlay = EffectLayer()
         self.effect_overlay.keep_visible = True
         self.sound = QSoundEffect()
         self.sounds = {}
@@ -424,12 +587,6 @@ class Engine:
         self.project.migrate_events()
         self.base_project = self.project
         self.initial = native.snapshot()
-        actual_size = native.cursor_bitmap_size()
-        screen = QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
-        ratio = screen.devicePixelRatio() if screen else 1
-        self.cursor_scale = (
-            actual_size / ratio / self.project.size if actual_size else 1
-        )
         self.feedback_stamp = None
         self.active = True
         self.temp = user_dir() / "runtime" / uuid.uuid4().hex
@@ -518,6 +675,7 @@ class Engine:
         self.rule_futures.clear()
         self.overlay.hide()
         self.effect_overlay.hide()
+        self.effect_overlay.release_tiles()
         self.effect_overlay.particles = []
         self.effect_overlay._effect_bounds = QRect()
         self.effect_overlay._particle_bounds.clear()
@@ -797,9 +955,12 @@ class Engine:
             self.index = (self.index + 1) % len(frames)
         frame_key = (id(self.project), group, self.index)
         self.overlay.cursor_frame = frames[self.index]
-        self.overlay.cursor_size = max(
-            8, min(512, round(self.project.size * self.cursor_scale))
-        )
+        screen = QApplication.screenAt(pos) or QApplication.primaryScreen()
+        ratio = screen.devicePixelRatio() if screen else 1
+        # Project.size is the physical pixel size written to CUR/ANI. Qt paints
+        # in logical pixels; convert exactly once instead of inferring a scale
+        # from an unrelated application cursor handle.
+        self.overlay.cursor_size = self.project.size / ratio
         if role not in self.dirty_roles:
             if native.set_live_cursor(role, self.blank_cursor, 32):
                 self.dirty_roles.add(role)
@@ -934,13 +1095,7 @@ class Engine:
         self.clear_effect_layer()
 
     def clear_effect_layer(self):
-        self.effect_overlay.particles = []
-        self.effect_overlay._effect_bounds = QRect()
-        self.effect_overlay._particle_bounds.clear()
-        self.effect_overlay.render_time = None
-        if self.effect_overlay.isVisible():
-            self.effect_overlay.repaint()
-            self.effect_overlay._idle_clean = True
+        self.effect_overlay.clear()
 
     def present_layers(self, now):
         self.effect_overlay.present(now)
@@ -949,8 +1104,7 @@ class Engine:
         # Restore only these unowned, nonactivating layers, never the main window.
         native.restack_overlays(
             [
-                int(layer.winId())
-                for layer in (self.effect_overlay, self.overlay)
-                if layer.isVisible()
+                *self.effect_overlay.active_handles(),
+                *([int(self.overlay.winId())] if self.overlay.isVisible() else []),
             ]
         )

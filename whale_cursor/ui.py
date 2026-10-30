@@ -658,6 +658,9 @@ class Window(QMainWindow):
         self.size_combo.addItems([str(v) for v in SIZES])
         self.size_combo.setCurrentText(str(self.project.size))
         self.size_combo.setFixedSize(78, 34)
+        self.size_combo.setToolTip(
+            "实际像素尺寸；CUR / ANI 导出与桌面互动使用同一尺寸，屏幕缩放只换算一次。"
+        )
         self.size_combo.currentTextChanged.connect(self.size_changed)
         self.duration = NumberBox()
         self.duration.setRange(17, 60000)
@@ -2103,7 +2106,7 @@ class Window(QMainWindow):
         a.addWidget(label("关于", "title"))
         a.addWidget(
             label(
-                "鲸鱼娘指针工坊 2.7\n原生 CUR / ANI 安装无需常驻；桌面互动在托盘运行，可随时停止。\n方案与素材保存在当前用户目录；仅点击 AI 发送时上传参考图和提示词，不上传鼠标操作。\n支持 Windows 10 / 11。游戏、远程桌面和部分自绘指针应用可能使用自己的指针。"
+                "鲸鱼娘指针工坊 2.8\n原生 CUR / ANI 安装无需常驻；桌面互动在托盘运行，可随时停止。\n方案与素材保存在当前用户目录；仅点击 AI 发送时上传参考图和提示词，不上传鼠标操作。\n支持 Windows 10 / 11。游戏、远程桌面和部分自绘指针应用可能使用自己的指针。"
             )
         )
         a.addWidget(

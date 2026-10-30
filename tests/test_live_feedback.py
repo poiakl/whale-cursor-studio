@@ -17,7 +17,7 @@ def live(app, monkeypatch):
     monkeypatch.setattr(native, "validate_file", lambda *a: None)
     monkeypatch.setattr(native, "set_live_cursor", lambda *a: True)
     monkeypatch.setattr(native, "shell_surface_active", lambda: False)
-    monkeypatch.setattr(native, "cursor_bitmap_size", lambda: None)
+    monkeypatch.setattr(native, "cursor_bitmap_size", lambda: None, raising=False)
     monkeypatch.setattr(native, "current_role", lambda: role[0])
     monkeypatch.setattr(native, "button_down", lambda button: buttons[button])
     monkeypatch.setattr(native, "foreground_exe", lambda: "")
@@ -99,27 +99,29 @@ def test_trail_and_companion_persist_across_app_switch_and_unknown_role(
 
 @pytest.mark.parametrize(
     "physical,ratio,expected",
-    [(32, 1, 32), (80, 1.25, 64), (96, 1.5, 64), (128, 2, 64)],
+    [(32, 1, 64), (80, 1.25, 51.2), (96, 1.5, 64 / 1.5), (128, 2, 32)],
 )
-def test_start_matches_native_cursor_size_instead_of_growing(
+def test_interaction_matches_project_physical_pixels(
     live, monkeypatch, physical, ratio, expected
 ):
     engine, clock, position, role, buttons = live
     screen = SimpleNamespace(
         devicePixelRatio=lambda: ratio, geometry=lambda: QRect(0, 0, 1000, 800)
     )
-    monkeypatch.setattr(native, "cursor_bitmap_size", lambda: physical)
+    monkeypatch.setattr(native, "cursor_bitmap_size", lambda: physical, raising=False)
     monkeypatch.setattr(runtime.QApplication, "screenAt", lambda *a: screen)
     p = Project.defaults()
     p.size = 64
     engine.start(p)
     engine.timer.stop()
     engine._tick()
-    assert engine.overlay.cursor_size == expected
+    assert engine.overlay.cursor_size == pytest.approx(expected)
+    assert engine.overlay.cursor_size * ratio == pytest.approx(p.size)
     p.settings.update(click_size=256, effect_size=256)
     engine.sync_feedback(p)
     engine._tick()
-    assert engine.overlay.cursor_size == expected
+    assert engine.overlay.cursor_size == pytest.approx(expected)
+    assert engine.overlay.cursor_size * ratio == pytest.approx(p.size)
 
 
 def test_off_emitter_cannot_create_fallback_rings(app):

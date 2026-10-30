@@ -64,6 +64,10 @@ if WINDOWS:
         W.UINT,
     ]
     user32.SetWindowPos.restype = W.BOOL
+    user32.GetWindow.argtypes = [W.HWND, W.UINT]
+    user32.GetWindow.restype = W.HWND
+    user32.IsWindowVisible.argtypes = [W.HWND]
+    user32.IsWindowVisible.restype = W.BOOL
     user32.GetForegroundWindow.restype = W.HWND
     user32.GetWindowThreadProcessId.argtypes = [W.HWND, ctypes.POINTER(W.DWORD)]
     kernel32.OpenProcess.argtypes = [W.DWORD, W.BOOL, W.DWORD]
@@ -375,7 +379,21 @@ def recover_runtime():
 
 def restack_overlays(handles):
     """Reassert topmost order without activation, ownership or editor changes."""
-    if not WINDOWS:
+    if not WINDOWS or not handles:
+        return
+
+    def previous_visible(handle):
+        for _ in range(64):
+            handle = user32.GetWindow(handle, 3)  # GW_HWNDPREV
+            if not handle or user32.IsWindowVisible(handle):
+                return handle
+        return handle
+
+    top_down = list(reversed(handles))
+    if not previous_visible(top_down[0]) and all(
+        previous_visible(handle) == above
+        for above, handle in zip(top_down, top_down[1:])
+    ):
         return
     for handle in handles:
         user32.SetWindowPos(

@@ -142,10 +142,32 @@ def test_windows_restack_never_activates_or_moves_window(monkeypatch):
     monkeypatch.setattr(
         native,
         "user32",
-        SimpleNamespace(SetWindowPos=lambda *a: calls.append(a)),
+        SimpleNamespace(
+            SetWindowPos=lambda *a: calls.append(a),
+            GetWindow=lambda *a: 999,
+            IsWindowVisible=lambda *a: True,
+        ),
         raising=False,
     )
     native.restack_overlays([100, 200])
     assert [args[0] for args in calls] == [100, 200]
     assert all(args[1].value == -1 % (1 << 64) or args[1].value == -1 for args in calls)
     assert all(args[-1] & 0x10 and args[-1] & 3 == 3 for args in calls)
+
+
+def test_windows_stable_layers_do_not_reorder_on_every_frame(monkeypatch):
+    calls = []
+    monkeypatch.setattr(native, "WINDOWS", True)
+    monkeypatch.setattr(
+        native,
+        "user32",
+        SimpleNamespace(
+            SetWindowPos=lambda *a: calls.append(a),
+            GetWindow=lambda handle, cmd: {200: 0, 100: 200}[handle],
+            IsWindowVisible=lambda *a: True,
+        ),
+        raising=False,
+    )
+    for _ in range(10):
+        native.restack_overlays([100, 200])
+    assert not calls

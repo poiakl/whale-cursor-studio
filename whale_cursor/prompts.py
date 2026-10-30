@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLineEdit,
     QApplication,
+    QTabWidget,
 )
 from .project import SLOTS, EVENTS, EFFECTS
 from .codec import MAX_FRAMES
@@ -177,13 +178,20 @@ def make_brief(project, selected, size, columns, style):
         "hotspot_px 是该格内的目标点击/对齐锚点，请让相应部位对齐；不要画热点标记。"
         "它来自当前方案参考，生成后仍需在制作页核对热点。\n"
         "生成器若无法精确满足大图尺寸，请分条目或分批生成，保持单格尺寸与帧序。"
-        "导入时选择对应格尺寸切分；本页只生成需求文本，不会调用 AI 或改动素材。\n\n"
+        "导入时选择对应格尺寸切分；保持每格为正方形，尺寸限制不允许时按比例等比缩放整张序列图。\n\n"
         + json.dumps(request, ensure_ascii=False, indent=2)
     )
 
 
 class PromptPage(QWidget):
-    def __init__(self, project_getter, changed, parent=None):
+    def __init__(
+        self,
+        project_getter,
+        changed,
+        parent=None,
+        apply_frames=None,
+        frame_getter=lambda: None,
+    ):
         super().__init__(parent)
         self.project_getter = project_getter
         self.changed = changed
@@ -211,16 +219,26 @@ class PromptPage(QWidget):
         split = QSplitter()
         self.tree = QTreeWidget()
         self.tree.setHeaderLabels(["生成内容", "帧数"])
-        self.tree.setColumnWidth(0, 235)
+        self.tree.setMinimumWidth(330)
+        self.tree.setColumnWidth(0, 265)
         self.tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        self.tree.header().setSectionResizeMode(
-            1, QHeaderView.ResizeMode.ResizeToContents
-        )
+        self.tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        self.tree.setColumnWidth(1, 55)
         self.tree.setItemDelegate(FrameDelegate(self.tree))
         split.addWidget(self.tree)
         self.output = QPlainTextEdit()
         self.output.setReadOnly(True)
-        split.addWidget(self.output)
+        self.right_tabs = QTabWidget()
+        self.right_tabs.addTab(self.output, "提示词")
+        self.ai = None
+        if apply_frames is not None:
+            from .ai_ui import GenerationPanel
+
+            self.ai = GenerationPanel(
+                project_getter, self.generation_tasks, apply_frames, frame_getter
+            )
+            self.right_tabs.addTab(self.ai, "生成与回传")
+        split.addWidget(self.right_tabs)
         split.setStretchFactor(0, 2)
         split.setStretchFactor(1, 3)
         layout.addWidget(split, 1)
@@ -344,3 +362,27 @@ class PromptPage(QWidget):
         self.timer.stop()
         self.regenerate()
         QApplication.clipboard().setText(self.output.toPlainText())
+
+    def generation_tasks(self):
+        self.timer.stop()
+        self.regenerate()
+        tasks = []
+        for key, item in self.leaves.items():
+            if item.checkState(0) != Qt.CheckState.Checked:
+                continue
+            prompt = make_brief(
+                self.project_getter(),
+                {key: int(item.text(1))},
+                self.size.value(),
+                self.columns.value(),
+                self.style.text(),
+            )
+            spec = json.loads(prompt[prompt.index("{") :])["items"][0]
+            tasks.append(
+                dict(
+                    prompt="若附有参考图，请保持参考角色、画风与配色，按下面要求重新绘制完整序列图，不要照搬参考图的排版。\n"
+                    + prompt,
+                    spec=spec,
+                )
+            )
+        return tasks

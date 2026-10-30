@@ -39,6 +39,9 @@ if WINDOWS:
 
     user32 = ctypes.WinDLL("user32", use_last_error=True)
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    dwmapi = ctypes.WinDLL("dwmapi")
+    dwmapi.DwmGetWindowAttribute.argtypes = [W.HWND, W.DWORD, ctypes.c_void_p, W.DWORD]
+    dwmapi.DwmGetWindowAttribute.restype = ctypes.c_long
     user32.LoadImageW.argtypes = [
         W.HINSTANCE,
         W.LPCWSTR,
@@ -68,6 +71,18 @@ if WINDOWS:
     user32.GetWindow.restype = W.HWND
     user32.IsWindowVisible.argtypes = [W.HWND]
     user32.IsWindowVisible.restype = W.BOOL
+    user32.FindWindowW.argtypes = [W.LPCWSTR, W.LPCWSTR]
+    user32.FindWindowW.restype = W.HWND
+    user32.GetCursorPos.argtypes = [ctypes.POINTER(W.POINT)]
+    user32.GetCursorPos.restype = W.BOOL
+    user32.WindowFromPoint.argtypes = [W.POINT]
+    user32.WindowFromPoint.restype = W.HWND
+    user32.GetAncestor.argtypes = [W.HWND, W.UINT]
+    user32.GetAncestor.restype = W.HWND
+    user32.GetClassNameW.argtypes = [W.HWND, W.LPWSTR, ctypes.c_int]
+    user32.GetClassNameW.restype = ctypes.c_int
+    user32.GetWindowRect.argtypes = [W.HWND, ctypes.POINTER(W.RECT)]
+    user32.GetWindowRect.restype = W.BOOL
     user32.GetForegroundWindow.restype = W.HWND
     user32.GetWindowThreadProcessId.argtypes = [W.HWND, ctypes.POINTER(W.DWORD)]
     kernel32.OpenProcess.argtypes = [W.DWORD, W.BOOL, W.DWORD]
@@ -399,3 +414,45 @@ def restack_overlays(handles):
         user32.SetWindowPos(
             handle, W.HWND(-1), 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010 | 0x0200
         )
+
+
+def shell_surface_active():
+    """Use the OS cursor around taskbar/DWM previews, outside app window bands."""
+    if not WINDOWS:
+        return False
+    for name in ("TaskListThumbnailWnd",):
+        window = user32.FindWindowW(name, None)
+        if window and user32.IsWindowVisible(window):
+            cloaked = W.DWORD()
+            compositor = globals().get("dwmapi")
+            if (
+                compositor
+                and compositor.DwmGetWindowAttribute(
+                    window, 14, ctypes.byref(cloaked), ctypes.sizeof(cloaked)
+                )
+                == 0
+                and cloaked.value
+            ):
+                continue
+            rect = W.RECT()
+            if (
+                user32.GetWindowRect(window, ctypes.byref(rect))
+                and rect.right > rect.left
+                and rect.bottom > rect.top
+            ):
+                return True
+    point = W.POINT()
+    if not user32.GetCursorPos(ctypes.byref(point)):
+        return False
+    window = user32.WindowFromPoint(point)
+    if not window:
+        return False
+    root = user32.GetAncestor(window, 2) or window
+    name = ctypes.create_unicode_buffer(256)
+    user32.GetClassNameW(root, name, len(name))
+    return name.value in (
+        "Shell_TrayWnd",
+        "Shell_SecondaryTrayWnd",
+        "TaskListThumbnailWnd",
+        "TaskListOverlayWnd",
+    )

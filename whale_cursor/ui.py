@@ -506,7 +506,13 @@ class Window(QMainWindow):
         self.build_schemes()
         self.build_settings()
         from .prompts import PromptPage
-        self.prompt_page = PromptPage(lambda: self.project, self.touch)
+
+        self.prompt_page = PromptPage(
+            lambda: self.project,
+            self.touch,
+            apply_frames=self.apply_ai_frames,
+            frame_getter=lambda: self.frame,
+        )
         self.tabs.addTab(self.prompt_page, "AI 生图")
         self.tabs.currentChanged.connect(
             lambda index: self.prompt_page.reload() if index == 4 else None
@@ -2080,7 +2086,7 @@ class Window(QMainWindow):
         a.addWidget(label("关于", "title"))
         a.addWidget(
             label(
-                "鲸鱼娘指针工坊 2.5\n原生 CUR / ANI 安装无需常驻；桌面互动在托盘运行，可随时停止。\n方案与导入素材保存在当前用户目录，程序不上传图片或鼠标操作。\n支持 Windows 10 / 11。游戏、远程桌面和部分自绘指针应用可能使用自己的指针。"
+                "鲸鱼娘指针工坊 2.6\n原生 CUR / ANI 安装无需常驻；桌面互动在托盘运行，可随时停止。\n方案与导入素材保存在当前用户目录，程序不上传图片或鼠标操作。\n支持 Windows 10 / 11。游戏、远程桌面和部分自绘指针应用可能使用自己的指针。"
             )
         )
         a.addWidget(
@@ -2191,6 +2197,8 @@ class Window(QMainWindow):
 
     def quit_app(self):
         def quit_now():
+            if self.prompt_page.ai:
+                self.prompt_page.ai.cancel()
             if self.engine.active:
                 self.engine.stop()
             self.flush_save()
@@ -2208,6 +2216,8 @@ class Window(QMainWindow):
             )
             return
         try:
+            if self.prompt_page.ai:
+                self.prompt_page.ai.cancel()
             if self.engine.active:
                 self.engine.stop()
             self.flush_save()
@@ -2850,3 +2860,23 @@ class Window(QMainWindow):
         )
         QTimer.singleShot(0, play)
         dialog.exec()
+
+    def apply_ai_frames(self, project, target, frames):
+        if project is not self.project:
+            raise ValueError("当前方案已改变，未覆盖。")
+        group, key = target.split(".", 1)
+        if group not in ("slots", "events", "effects", "animations"):
+            raise ValueError("未知的生图目标。")
+        if group == "animations" and not any(
+            r["id"] == key for r in self.project.settings.get("animation_rules", [])
+        ):
+            raise ValueError("该条件动画已被删除，未覆盖。")
+        self.stop_play()
+        if self.engine.active:
+            self.toggle_engine()
+        self.remember("应用 AI 生图")
+        getattr(self.project, group)[key] = frames
+        self.frame_index = 0
+        self.rebuild_slots()
+        self.refresh_interaction_views()
+        self.touch()

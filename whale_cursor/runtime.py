@@ -661,6 +661,7 @@ class Engine:
         distance = math.hypot(delta.x(), delta.y())
         settings = self.project.settings
         detected = native.current_role()
+        shell_surface = native.shell_surface_active()
         context = self.inputs.update(
             now,
             (pos.x(), pos.y()),
@@ -758,7 +759,7 @@ class Engine:
             self.elapsed = 0
             self.last_frame = None
         self.state = state
-        if not frames:
+        if not frames or shell_surface:
             if self.dirty_roles:
                 native.reload()
                 self.dirty_roles.clear()

@@ -167,6 +167,10 @@ def test_all_replaced_animations_and_edge_scheme_need_no_ani_loader(
         exe[0] = "msedge.exe"
         now[0] += 1
         engine._tick()
+        # Scheme decoding is asynchronous; the GUI remains free to render.
+        engine.rule_futures[str(filename)].result(timeout=10)
+        now[0] += 0.02
+        engine._tick()
         assert engine.overlay.cursor_frame.x == 222
         exe[0] = ""
         now[0] += 1

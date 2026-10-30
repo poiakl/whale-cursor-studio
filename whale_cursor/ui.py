@@ -79,6 +79,11 @@ QPushButton:pressed {background:#D5EADD;}QPushButton:disabled {color:#A7B2AB;bac
 QPushButton#primary {background:#347D68;color:white;border:1px solid #347D68;}QPushButton#primary:hover {background:#276C58;}
 QTabWidget::pane {border:0;}QTabBar::tab {padding:11px 23px;border-bottom:2px solid transparent;color:#7B8C83;}
 QTabBar::tab:selected {color:#286C55;border-bottom:2px solid #347D68;font-weight:600;}
+QTreeWidget {background:white;border:1px solid #E1E8E2;border-radius:8px;outline:0;}
+QTreeWidget::item {padding:3px;}
+QTreeWidget::item:selected {background:#E4F1E9;color:#215C48;}
+QHeaderView::section {background:#EDF3EF;border:0;padding:7px;color:#567363;}
+QPlainTextEdit {background:white;border:1px solid #E1E8E2;border-radius:8px;padding:8px;}
 QListWidget {background:white;border:0;outline:0;border-radius:8px;}QListWidget::item {padding:6px;border-radius:7px;margin:2px;}
 QListWidget::item:selected {background:#E4F1E9;color:#215C48;}QListWidget::item:hover {background:#F0F6F2;}
 QSpinBox,QDoubleSpinBox,QComboBox,QLineEdit,QTextEdit {background:white;border:1px solid #DCE5DE;border-radius:6px;padding:6px;min-height:20px;}
@@ -500,6 +505,12 @@ class Window(QMainWindow):
         self.build_interactions()
         self.build_schemes()
         self.build_settings()
+        from .prompts import PromptPage
+        self.prompt_page = PromptPage(lambda: self.project, self.touch)
+        self.tabs.addTab(self.prompt_page, "AI 生图")
+        self.tabs.currentChanged.connect(
+            lambda index: self.prompt_page.reload() if index == 4 else None
+        )
         self.tabs.currentChanged.connect(
             lambda index: self.refresh_interaction_views() if index == 1 else None
         )
@@ -2069,7 +2080,7 @@ class Window(QMainWindow):
         a.addWidget(label("关于", "title"))
         a.addWidget(
             label(
-                "鲸鱼娘指针工坊 2.4\n原生 CUR / ANI 安装无需常驻；桌面互动在托盘运行，可随时停止。\n方案与导入素材保存在当前用户目录，程序不上传图片或鼠标操作。\n支持 Windows 10 / 11。游戏、远程桌面和部分自绘指针应用可能使用自己的指针。"
+                "鲸鱼娘指针工坊 2.5\n原生 CUR / ANI 安装无需常驻；桌面互动在托盘运行，可随时停止。\n方案与导入素材保存在当前用户目录，程序不上传图片或鼠标操作。\n支持 Windows 10 / 11。游戏、远程桌面和部分自绘指针应用可能使用自己的指针。"
             )
         )
         a.addWidget(

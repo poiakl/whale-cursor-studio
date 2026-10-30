@@ -54,6 +54,16 @@ if WINDOWS:
     user32.SetSystemCursor.restype = W.BOOL
     user32.SystemParametersInfoW.argtypes = [W.UINT, W.UINT, ctypes.c_void_p, W.UINT]
     user32.SystemParametersInfoW.restype = W.BOOL
+    user32.SetWindowPos.argtypes = [
+        W.HWND,
+        W.HWND,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        W.UINT,
+    ]
+    user32.SetWindowPos.restype = W.BOOL
     user32.GetForegroundWindow.restype = W.HWND
     user32.GetWindowThreadProcessId.argtypes = [W.HWND, ctypes.POINTER(W.DWORD)]
     kernel32.OpenProcess.argtypes = [W.DWORD, W.BOOL, W.DWORD]
@@ -361,3 +371,13 @@ def recover_runtime():
         shutil.rmtree(folder, ignore_errors=True)
     path.unlink()
     return True
+
+
+def restack_overlays(handles):
+    """Reassert topmost order without activation, ownership or editor changes."""
+    if not WINDOWS:
+        return
+    for handle in handles:
+        user32.SetWindowPos(
+            handle, W.HWND(-1), 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010 | 0x0200
+        )

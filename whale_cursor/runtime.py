@@ -9,6 +9,7 @@ import shutil
 import json
 import time
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from PySide6.QtCore import Qt, QTimer, QPoint, QRectF, QRect
 from PySide6.QtGui import QCursor, QPainter, QColor, QPen
 from PySide6.QtWidgets import QWidget, QApplication
@@ -73,6 +74,8 @@ class Overlay(QWidget):
         self.effects = {}
         self.keyframes = parse_keyframes(EXAMPLE)
         self.render_time = None
+        self.keep_visible = False
+        self._idle_clean = False
         self._effect_bounds = QRect()
         self._particle_bounds = {}
 
@@ -172,7 +175,17 @@ class Overlay(QWidget):
             self._effect_bounds = QRect()
             self._particle_bounds.clear()
         if rect.isNull():
-            self.hide()
+            if self.keep_visible:
+                # A transparent idle surface stays mapped: repeated clicks never
+                # unmap/remap a layered HWND or expose its previous backing store.
+                if not self.isVisible():
+                    self.show()
+                    self._idle_clean = False
+                if not self._idle_clean:
+                    self.repaint()
+                    self._idle_clean = True
+            else:
+                self.hide()
             return
         anchor = (
             self.cursor_pos
@@ -186,13 +199,17 @@ class Overlay(QWidget):
         if rect.isEmpty():
             self.hide()
             return
-        if self.geometry() != rect:
+        self._idle_clean = False
+        changed = self.geometry() != rect
+        hidden = not self.isVisible()
+        if changed:
             self.setGeometry(rect)
-        if not self.isVisible():
+        if hidden:
             self.show()
-            if native.WINDOWS:
-                self.raise_()
-        self.update()
+        if hidden or changed:
+            self.repaint()
+        else:
+            self.update()
 
     def emit_at(self, pos, kind):
         now = time.monotonic()
@@ -228,6 +245,11 @@ class Overlay(QWidget):
 
     def paintEvent(self, event):
         p = QPainter(self)
+        # Explicitly replace every pixel, including transparent ones. Windows may
+        # reuse a layered window's backing store after show/resize.
+        p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
+        p.fillRect(self.rect(), Qt.GlobalColor.transparent)
+        p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.setRenderHint(
             QPainter.RenderHint.SmoothPixmapTransform,
@@ -303,7 +325,11 @@ class Overlay(QWidget):
                     local.y() - size // 2,
                     size,
                     size,
-                    custom[index][0],
+                    (
+                        pixmap(custom[index][0])
+                        if isinstance(custom[index][0], Image.Image)
+                        else custom[index][0]
+                    ),
                 )
                 p.restore()
                 continue
@@ -352,6 +378,7 @@ class Engine:
         self.active = False
         self.overlay = Overlay()
         self.effect_overlay = Overlay()
+        self.effect_overlay.keep_visible = True
         self.sound = QSoundEffect()
         self.sounds = {}
         self.sound_indices = {}
@@ -359,6 +386,9 @@ class Engine:
         self.initial = None
         self.frame_cache = {}
         self.rule_cache = {}
+        self.rule_loader = None
+        self.rule_futures = {}
+        self.requested_rule = ""
 
     def start(self, project):
         native.require()
@@ -374,6 +404,11 @@ class Engine:
         self.temp.mkdir(parents=True)
         self.frame_cache = {}
         self.rule_cache = {}
+        self.rule_futures = {}
+        self.requested_rule = ""
+        self.rule_loader = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="scheme"
+        )
         recovery = user_dir() / "runtime-recovery.json"
         tmp = recovery.with_suffix(".tmp")
         tmp.write_text(
@@ -429,7 +464,7 @@ class Engine:
             self.project.settings.get("effect_keyframes", EXAMPLE)
         )
         self.overlay.effects = {
-            key: [(pixmap(frame.image), frame.duration) for frame in frames]
+            key: [(frame.image, frame.duration) for frame in frames]
             for key, frames in self.project.effects.items()
         }
         self.configure_effect_layer()
@@ -453,6 +488,10 @@ class Engine:
         if not self.active:
             return
         self.timer.stop()
+        if self.rule_loader is not None:
+            self.rule_loader.shutdown(wait=False, cancel_futures=True)
+            self.rule_loader = None
+        self.rule_futures.clear()
         self.overlay.hide()
         self.effect_overlay.hide()
         self.effect_overlay.particles = []
@@ -478,23 +517,38 @@ class Engine:
             self.temp = None
 
     def switch_rule(self, now):
-        if now - self.last_app_check < 0.6:
-            return
-        self.last_app_check = now
-        exe = native.foreground_exe()
-        rule_path = ""
-        for rule in self.base_project.settings.get("app_rules", []):
-            if str(rule.get("exe", "")).lower() == exe:
-                rule_path = rule.get("scheme", "")
-                break
+        if now - self.last_app_check >= 0.6:
+            self.last_app_check = now
+            exe = native.foreground_exe()
+            rule_path = ""
+            for rule in self.base_project.settings.get("app_rules", []):
+                if str(rule.get("exe", "")).lower() == exe:
+                    rule_path = rule.get("scheme", "")
+                    break
+            if rule_path != self.requested_rule:
+                self.requested_rule = rule_path
+                # Remove the old effect immediately, before any disk decoding.
+                self.clear_effect_layer()
+                for path, future in list(self.rule_futures.items()):
+                    if path != rule_path and future.cancel():
+                        del self.rule_futures[path]
+        rule_path = self.requested_rule
         if rule_path == self.last_rule:
             return
-        # Decode each application scheme once; playback never goes through the Windows ANI loader.
         if rule_path:
             if rule_path not in self.rule_cache:
-                p = Project.load(rule_path)
-                self.prepare_frames(p)
-                self.rule_cache[rule_path] = p
+                future = self.rule_futures.get(rule_path)
+                if future is None:
+                    self.rule_futures[rule_path] = self.rule_loader.submit(
+                        Project.load, rule_path
+                    )
+                    return
+                if not future.done():
+                    return
+                project = future.result()
+                self.prepare_frames(project)
+                self.rule_cache[rule_path] = project
+                del self.rule_futures[rule_path]
             self.project = self.rule_cache[rule_path]
         else:
             self.project = self.base_project
@@ -504,7 +558,7 @@ class Engine:
             self.project.settings.get("effect_keyframes", EXAMPLE)
         )
         self.overlay.effects = {
-            key: [(pixmap(f.image), f.duration) for f in frames]
+            key: [(f.image, f.duration) for f in frames]
             for key, frames in self.project.effects.items()
         }
         self.configure_effect_layer()
@@ -519,6 +573,11 @@ class Engine:
         self.state = ""
         self.index = 0
         self.elapsed = 0
+        self.animation_identity = None
+        # A switch is not a mouse action; don't replay presses from the old scheme.
+        self.inputs = Inputs(
+            now, (QCursor.pos().x(), QCursor.pos().y()), self.read_buttons()
+        )
 
     def tick(self):
         if not self.active:
@@ -779,14 +838,26 @@ class Engine:
         self.effect_overlay.settings = self.overlay.settings
         self.effect_overlay.effects = self.overlay.effects
         self.effect_overlay.keyframes = self.overlay.keyframes
+        self.clear_effect_layer()
+
+    def clear_effect_layer(self):
         self.effect_overlay.particles = []
         self.effect_overlay._effect_bounds = QRect()
         self.effect_overlay._particle_bounds.clear()
-        self.effect_overlay.hide()
+        self.effect_overlay.render_time = None
+        if self.effect_overlay.isVisible():
+            self.effect_overlay.repaint()
+            self.effect_overlay._idle_clean = True
 
     def present_layers(self, now):
-        was_visible = self.effect_overlay.isVisible()
         self.effect_overlay.present(now)
         self.overlay.present(now)
-        if native.WINDOWS and not was_visible and self.effect_overlay.isVisible():
-            self.overlay.raise_()
+        # Native popups (combo lists/menus) can enter the topmost band after us.
+        # Restore only these unowned, nonactivating layers, never the main window.
+        native.restack_overlays(
+            [
+                int(layer.winId())
+                for layer in (self.effect_overlay, self.overlay)
+                if layer.isVisible()
+            ]
+        )

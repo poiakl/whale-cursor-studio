@@ -66,7 +66,7 @@ def test_import_animation_and_events(window, tmp_path):
 
 
 def test_clean_layout_all_tabs(window, app):
-    for i in range(4):
+    for i in range(window.tabs.count()):
         window.tabs.setCurrentIndex(i)
         app.processEvents()
         assert window.tabs.currentWidget().isVisible()

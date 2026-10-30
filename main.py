@@ -15,7 +15,7 @@ def main():
         window = Window(Project.defaults())
         window.show()
         app.processEvents()
-        for index in range(4):
+        for index in range(window.tabs.count()):
             window.tabs.setCurrentIndex(index)
             app.processEvents()
         if not window.project.slots or window.canvas.width() < 100:

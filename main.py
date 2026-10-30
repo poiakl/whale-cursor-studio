@@ -11,9 +11,11 @@ def main():
     app.setStyle("Fusion")
     app.setStyleSheet(STYLE)
     if "--smoke-test" in sys.argv:
-        from whale_cursor.project import Project
+        from whale_cursor.project import Project, user_dir
+        from whale_cursor import native
 
-        window = Window(Project.defaults())
+        before = native.snapshot() if native.WINDOWS else None
+        window = Window()
         window.show()
         app.processEvents()
         for index in range(window.tabs.count()):
@@ -21,8 +23,20 @@ def main():
             app.processEvents()
         if not window.project.slots or window.canvas.width() < 100:
             raise RuntimeError("打包程序资源 / 窗口检查失败")
+        bundled = user_dir() / "schemes" / "鲸鱼娘（自带）.whalepack"
+        if len(Project.load(bundled).slots) != 17:
+            raise RuntimeError("打包程序自带方案检查失败")
+        if window.project.name != "本机原有指针":
+            raise RuntimeError("首次打开未读取本机指针")
         window.close()
         app.processEvents()
+        resumed = Window()
+        if resumed.project.name != "本机原有指针":
+            raise RuntimeError("重新打开未恢复编辑内容")
+        resumed.close()
+        app.processEvents()
+        if native.WINDOWS and native.snapshot() != before:
+            raise RuntimeError("首次打开改变了系统指针")
         return 0
 
     def release_clipboard():

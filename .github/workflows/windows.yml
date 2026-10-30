@@ -49,8 +49,12 @@ jobs:
         env:
           QT_QPA_PLATFORM: offscreen
         run: |
-          $env:LOCALAPPDATA = Join-Path $env:RUNNER_TEMP "whale-cursor-smoke"
-          $process = Start-Process -FilePath "dist/WhaleCursorStudio/WhaleCursorStudio.exe" -ArgumentList "--smoke-test" -PassThru
+          $portableRoot = Join-Path $env:RUNNER_TEMP "便携程序 测试"
+          Copy-Item "dist/WhaleCursorStudio" $portableRoot -Recurse
+          $env:LOCALAPPDATA = Join-Path $env:RUNNER_TEMP "全新用户 数据"
+          $exePath = Join-Path $portableRoot "WhaleCursorStudio.exe"
+          # The executable must not depend on its working directory or a Python install.
+          $process = Start-Process -FilePath $exePath -WorkingDirectory $env:WINDIR -ArgumentList "--smoke-test" -PassThru
           if (-not $process.WaitForExit(60000)) { $process.Kill(); throw "Packaged app did not complete its launch check" }
           if ($process.ExitCode -ne 0) {
             Get-Content "$env:LOCALAPPDATA/WhaleCursorStudio2/error.log" -ErrorAction SilentlyContinue
@@ -60,6 +64,8 @@ jobs:
         shell: pwsh
         run: |
           Copy-Item README.md dist/WhaleCursorStudio/使用说明.md
+          python -c "from whale_cursor.project import Project; Project.defaults().save('dist/WhaleCursorStudio/Schemes/Whale-Maid.whalepack')"
+          if ($LASTEXITCODE -ne 0) { throw "Could not include bundled cursor scheme" }
           Compress-Archive -Path dist/WhaleCursorStudio -DestinationPath WhaleCursorStudio-Windows.zip
       - uses: actions/upload-artifact@v4
         with:
@@ -78,5 +84,5 @@ jobs:
           }
           gh api --method PATCH "repos/$env:GITHUB_REPOSITORY/git/refs/tags/desktop-latest" -f "sha=$env:GITHUB_SHA" -F force=true
           if ($LASTEXITCODE -ne 0) { throw "Could not update rolling release source tag" }
-          gh release edit desktop-latest --title "Windows 便携版 · 2.9" --notes "新增逐条 AI 提示词、紧凑列表、开机自启动及背景主题；补充多显示器任务栏预览和通知浮层的原生指针回退。保留固定分块特效、热点 JSON 和 API 生图。完整解压后运行 WhaleCursorStudio.exe。"
+          gh release edit desktop-latest --title "Windows 便携版 · 3.0" --notes "首次运行读取本机当前指针；自带鲸鱼娘图片独立保存到我的方案。修复空方案混入自带图片，增加全新用户、中文及空格路径、异工作目录便携启动验证。完整解压后运行 WhaleCursorStudio.exe，无需安装 Python。"
           gh release upload desktop-latest WhaleCursorStudio-Windows.zip --clobber

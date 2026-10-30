@@ -381,7 +381,35 @@ class Window(QMainWindow):
         self.autosave_path = user_dir() / "autosave.whalepack"
         self.schemes_dir = user_dir() / "schemes"
         self.schemes_dir.mkdir(exist_ok=True)
-        self.project = project or Project.defaults()
+        from .first_run import bundled_scheme, read_system_project
+
+        startup_messages = []
+        if native.WINDOWS:
+            try:
+                native.recover_runtime()
+            except Exception as error:
+                # Do not take an interrupted session's hidden cursors as the local theme.
+                raise RuntimeError("上次互动恢复未完成：" + str(error)) from error
+        bundled_scheme()
+        self.project = project
+        if self.project is None:
+            if self.autosave_path.exists():
+                try:
+                    self.project = Project.load(self.autosave_path)
+                except Exception as error:
+                    startup_messages.append("上次编辑未能恢复：" + str(error))
+            if self.project is None:
+                self.project, warnings = read_system_project()
+                startup_messages.extend(warnings)
+                if self.project.slots:
+                    original = self.schemes_dir / "本机原有指针.whalepack"
+                    if not original.exists():
+                        self.project.save(original)
+        self.source_slots = {
+            key: [f.clone() for f in frames]
+            for key, frames in self.project.slots.items()
+        }
+        self.project._source_slots = self.source_slots
         self.group = "slots"
         self.key = "Arrow"
         self.frame_index = 0
@@ -397,13 +425,6 @@ class Window(QMainWindow):
         self.syncing = False
         self.playing = False
 
-        if project is None and self.autosave_path.exists():
-            try:
-                self.project = Project.load(self.autosave_path)
-            except Exception as e:
-                QTimer.singleShot(
-                    0, lambda msg=str(e): self.error("上次编辑未能恢复：" + msg)
-                )
         self.project.migrate_events()
         self.history.limit = max(
             1, min(200, int(self.project.settings.get("history_limit", 30)))
@@ -418,18 +439,15 @@ class Window(QMainWindow):
         self.engine = Engine(self.runtime_error)
         self.engine.timer.setParent(self)
         self.engine.sound.setParent(self)
-        if native.WINDOWS:
-            try:
-                native.recover_runtime()
-            except Exception as e:
-                QTimer.singleShot(
-                    0, lambda msg=str(e): self.error("上次互动恢复未完成：" + msg)
-                )
         self.build()
         self.build_tray()
         self.rebuild_slots()
         self.refresh()
-        self.statusBar().showMessage("已就绪")
+        self.statusBar().showMessage("；".join(startup_messages) or "已就绪")
+        if startup_messages:
+            (user_dir() / "startup.log").write_text(
+                "\n".join(startup_messages), encoding="utf-8"
+            )
 
     @property
     def frames(self):
@@ -1048,7 +1066,9 @@ class Window(QMainWindow):
     def reset_slot(self):
         self.remember()
         if self.group == "slots":
-            self.project.slots[self.key] = Project.defaults().slots[self.key]
+            self.project.slots[self.key] = [
+                f.clone() for f in self.source_slots.get(self.key, [])
+            ]
         else:
             getattr(self.project, self.group).pop(self.storage_key, None)
         self.rebuild_slots()
@@ -1953,6 +1973,14 @@ class Window(QMainWindow):
             self.toggle_engine()
         self.stop_play()
         self.project = project
+        if not self._history_loading:
+            self.source_slots = {
+                key: [f.clone() for f in frames]
+                for key, frames in project.slots.items()
+            }
+            project._source_slots = self.source_slots
+        else:
+            self.source_slots = getattr(project, "_source_slots", {})
         self.history.limit = int(project.settings.get("history_limit", 30))
         self.history_limit.blockSignals(True)
         self.history_limit.setValue(self.history.limit)
@@ -2157,7 +2185,7 @@ class Window(QMainWindow):
         a.addWidget(label("关于", "title"))
         a.addWidget(
             label(
-                "鲸鱼娘指针工坊 2.9\n原生 CUR / ANI 安装无需常驻；桌面互动在托盘运行，可随时停止。\n方案与素材保存在当前用户目录；仅点击 AI 发送时上传参考图和提示词，不上传鼠标操作。\n支持 Windows 10 / 11。游戏、远程桌面和部分自绘指针应用可能使用自己的指针。"
+                "鲸鱼娘指针工坊 3.0\n原生 CUR / ANI 安装无需常驻；桌面互动在托盘运行，可随时停止。\n方案与素材保存在当前用户目录；仅点击 AI 发送时上传参考图和提示词，不上传鼠标操作。\n支持 Windows 10 / 11。游戏、远程桌面和部分自绘指针应用可能使用自己的指针。"
             )
         )
         a.addWidget(

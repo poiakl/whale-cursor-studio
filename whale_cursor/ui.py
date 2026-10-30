@@ -55,6 +55,8 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QKeySequenceEdit,
     QPlainTextEdit,
+    QTableWidget,
+    QTableWidgetItem,
 )
 from .codec import import_images, split_sheet, transform, SIZES
 from .project import Project, SLOTS, EVENTS, EFFECTS, user_dir, event_key
@@ -448,6 +450,8 @@ class Window(QMainWindow):
 
     def touch(self):
         self.save_timer.start()
+        if self.engine.active:
+            self.engine.sync_feedback(self.project)
         if self.tabs.currentIndex() == 1:
             self.refresh_events()
             self.refresh_conditions()
@@ -629,7 +633,13 @@ class Window(QMainWindow):
         prop_tabs.addTab(settings_page, "参数")
         prop_tabs.addTab(preview_page, "试用")
         self.inspector_tabs = prop_tabs
-        prop.addWidget(label("点击热点"))
+        hotspot_row = QHBoxLayout()
+        hotspot_row.addWidget(label("点击热点"))
+        hotspot_row.addStretch()
+        hotspot_import = self.button("导入热点…", self.import_hotspots)
+        hotspot_import.setStyleSheet("padding:3px 7px;")
+        hotspot_row.addWidget(hotspot_import)
+        prop.addLayout(hotspot_row)
         grid = QGridLayout()
         grid.setHorizontalSpacing(5)
         grid.setVerticalSpacing(8)
@@ -707,6 +717,7 @@ class Window(QMainWindow):
         for text, fn in [
             ("批量匹配", self.batch_import),
             ("精灵图切帧", self.import_sheet),
+            ("导入热点 JSON…", self.import_hotspots),
             ("图像调整", self.image_tools),
             ("导出当前 CUR / ANI", lambda: self.export(True)),
             ("导出整套 CUR / ANI", lambda: self.export(False)),
@@ -1604,7 +1615,13 @@ class Window(QMainWindow):
         if key == "sounds":
             self.refresh_sound_list()
         if self.engine.active:
-            self.statusBar().showMessage("运行中；设置已修改，停止并重新开启后生效")
+            from .runtime import FEEDBACK_KEYS
+
+            self.statusBar().showMessage(
+                "效果设置已即时应用"
+                if key in FEEDBACK_KEYS
+                else "运行中；设置已修改，停止并重新开启后生效"
+            )
 
     def choose_sound(self):
         files, _ = QFileDialog.getOpenFileNames(self, "添加音频", "", "PCM WAV (*.wav)")
@@ -2086,7 +2103,7 @@ class Window(QMainWindow):
         a.addWidget(label("关于", "title"))
         a.addWidget(
             label(
-                "鲸鱼娘指针工坊 2.6\n原生 CUR / ANI 安装无需常驻；桌面互动在托盘运行，可随时停止。\n方案与导入素材保存在当前用户目录，程序不上传图片或鼠标操作。\n支持 Windows 10 / 11。游戏、远程桌面和部分自绘指针应用可能使用自己的指针。"
+                "鲸鱼娘指针工坊 2.7\n原生 CUR / ANI 安装无需常驻；桌面互动在托盘运行，可随时停止。\n方案与素材保存在当前用户目录；仅点击 AI 发送时上传参考图和提示词，不上传鼠标操作。\n支持 Windows 10 / 11。游戏、远程桌面和部分自绘指针应用可能使用自己的指针。"
             )
         )
         a.addWidget(
@@ -2879,4 +2896,69 @@ class Window(QMainWindow):
         self.frame_index = 0
         self.rebuild_slots()
         self.refresh_interaction_views()
+        self.touch()
+
+    def import_hotspots(self):
+        import json
+        from .hotspots import parse_hotspots
+
+        path, _ = QFileDialog.getOpenFileName(
+            self, "导入热点 JSON", "", "JSON (*.json)"
+        )
+        if not path:
+            return
+        source = Path(path)
+        if source.stat().st_size > 2 * 1024 * 1024:
+            raise ValueError("热点 JSON 不能超过 2 MB。")
+        changes = parse_hotspots(
+            json.loads(source.read_text("utf-8-sig")),
+            self.project,
+            (self.group, self.storage_key),
+        )
+        dialog = QDialog(self)
+        dialog.setWindowTitle("预览导入热点")
+        dialog.resize(680, 480)
+        layout = QVBoxLayout(dialog)
+        table = QTableWidget(len(changes), 5)
+        table.setHorizontalHeaderLabels(["用途", "帧", "x", "y", "停留 ms"])
+        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        for row, change in enumerate(changes):
+            for col, value in enumerate(
+                (
+                    change.group + "." + change.key,
+                    change.frame + 1,
+                    change.x,
+                    change.y,
+                    change.duration or "保持原值",
+                )
+            ):
+                table.setItem(row, col, QTableWidgetItem(str(value)))
+        table.resizeColumnsToContents()
+        layout.addWidget(table, 1)
+        timing = QCheckBox("同时导入帧时长")
+        layout.addWidget(timing)
+        layout.addWidget(
+            label("坐标已换算到 256×256 编辑画布；仅修改热点，不替换图片。", "muted")
+        )
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("应用热点")
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.apply_hotspot_changes(changes, timing.isChecked())
+
+    def apply_hotspot_changes(self, changes, timing=False):
+        self.stop_play()
+        if self.engine.active:
+            self.toggle_engine()
+        self.remember("导入热点 JSON")
+        for change in changes:
+            frame = getattr(self.project, change.group)[change.key][change.frame]
+            frame.x, frame.y = change.x, change.y
+            if timing and change.duration is not None:
+                frame.duration = change.duration
+        self.refresh()
         self.touch()

@@ -61,5 +61,5 @@ jobs:
           }
           gh api --method PATCH "repos/$env:GITHUB_REPOSITORY/git/refs/tags/desktop-latest" -f "sha=$env:GITHUB_SHA" -F force=true
           if ($LASTEXITCODE -ne 0) { throw "Could not update rolling release source tag" }
-          gh release edit desktop-latest --title "Windows 便携版 · 2.6" --notes "修复任务栏缩略图遮挡指针；AI 生图新增可配置的 Images API、参考图上传、异步生成和返回预览，按原目标覆盖帧并支持撤销。完整解压后运行 WhaleCursorStudio.exe。"
+          gh release edit desktop-latest --title "Windows 便携版 · 2.7" --notes "新增热点 JSON 预览导入、AI 额外指令；修复效果关闭不生效、应用切换后装饰消失及互动指针尺寸跳变；保留参考图 API 生图、返回预览和可撤销的对应帧覆盖。完整解压后运行 WhaleCursorStudio.exe。"
           gh release upload desktop-latest WhaleCursorStudio-Windows.zip --clobber

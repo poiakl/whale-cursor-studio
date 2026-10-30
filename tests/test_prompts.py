@@ -97,3 +97,29 @@ def test_prompt_size_ignores_wheel(app):
     finally:
         page.deleteLater()
         app.processEvents()
+
+
+def test_extra_user_instructions_are_copied_sent_and_saved(app, tmp_path):
+    from whale_cursor.ui import Window
+
+    w = Window(Project.defaults())
+    try:
+        page = w.prompt_page
+        text = "不要箭头，角色向右弹跳三次。\n保留蓝色头饰，最后一次眨眼。"
+        page.extra.setPlainText(text)
+        page.copy_text()
+        copied = payload(QApplication.clipboard().text())
+        assert copied["user_instructions"] == text
+        tasks = page.generation_tasks()
+        assert all(payload(t["prompt"])["user_instructions"] == text for t in tasks)
+        saved = tmp_path / "instructions.whalepack"
+        w.project.save(saved)
+        restored = Project.load(saved)
+        assert restored.settings["ai_prompt"]["extra"] == text
+        page.reload()
+        assert page.extra.toPlainText() == text
+    finally:
+        w.save_timer.stop()
+        w.close()
+        w.deleteLater()
+        app.processEvents()

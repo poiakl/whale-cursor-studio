@@ -456,3 +456,57 @@ def shell_surface_active():
         "TaskListThumbnailWnd",
         "TaskListOverlayWnd",
     )
+
+
+def cursor_bitmap_size():
+    """Actual native cursor pixels before masking, independent of DPI virtualization."""
+    if not WINDOWS:
+        return None
+
+    class IconInfo(ctypes.Structure):
+        _fields_ = [
+            ("icon", W.BOOL),
+            ("x", W.DWORD),
+            ("y", W.DWORD),
+            ("mask", W.HBITMAP),
+            ("color", W.HBITMAP),
+        ]
+
+    class Bitmap(ctypes.Structure):
+        _fields_ = [
+            ("type", W.LONG),
+            ("width", W.LONG),
+            ("height", W.LONG),
+            ("stride", W.LONG),
+            ("planes", W.WORD),
+            ("bits", W.WORD),
+            ("data", ctypes.c_void_p),
+        ]
+
+    info = CursorInfo()
+    info.cbSize = ctypes.sizeof(info)
+    user32.GetCursorInfo.argtypes = [ctypes.POINTER(CursorInfo)]
+    user32.GetCursorInfo.restype = W.BOOL
+    if not user32.GetCursorInfo(ctypes.byref(info)) or not info.hCursor:
+        return None
+    user32.GetIconInfo.argtypes = [W.HANDLE, ctypes.POINTER(IconInfo)]
+    user32.GetIconInfo.restype = W.BOOL
+    details = IconInfo()
+    if not user32.GetIconInfo(info.hCursor, ctypes.byref(details)):
+        return None
+    gdi = ctypes.WinDLL("gdi32", use_last_error=True)
+    gdi.GetObjectW.argtypes = [W.HANDLE, ctypes.c_int, ctypes.c_void_p]
+    gdi.GetObjectW.restype = ctypes.c_int
+    gdi.DeleteObject.argtypes = [W.HANDLE]
+    gdi.DeleteObject.restype = W.BOOL
+    try:
+        bitmap = Bitmap()
+        if gdi.GetObjectW(
+            details.color or details.mask, ctypes.sizeof(bitmap), ctypes.byref(bitmap)
+        ):
+            return bitmap.width if 1 <= bitmap.width <= 1024 else None
+    finally:
+        for handle in (details.mask, details.color):
+            if handle:
+                gdi.DeleteObject(handle)
+    return None

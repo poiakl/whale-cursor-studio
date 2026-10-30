@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 import math
+import copy
 import os
 import random
 import uuid
@@ -21,6 +22,28 @@ from .project import Project, user_dir
 from . import native
 from .conditions import Inputs, Resolver, ORDER, owners
 from .fx import pose, parse_keyframes, EXAMPLE
+
+
+FEEDBACK_KEYS = {
+    "click_effect",
+    "effect_motion",
+    "effect_keyframes",
+    "effect_size",
+    "effect_lifetime",
+    "effect_opacity",
+    "click_size",
+    "click_opacity",
+    "trail",
+    "trail_size",
+    "trail_opacity",
+    "trail_lifetime",
+    "trail_spacing",
+    "companion",
+    "companion_size",
+    "companion_opacity",
+    "companion_x",
+    "companion_y",
+}
 
 
 _pixmap_cache = OrderedDict()
@@ -212,6 +235,8 @@ class Overlay(QWidget):
             self.update()
 
     def emit_at(self, pos, kind):
+        if kind in (None, "none", "off", False):
+            return
         now = time.monotonic()
         if self.settings.get("effect_motion") == "burst" and kind not in (
             "trail",
@@ -399,6 +424,13 @@ class Engine:
         self.project.migrate_events()
         self.base_project = self.project
         self.initial = native.snapshot()
+        actual_size = native.cursor_bitmap_size()
+        screen = QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
+        ratio = screen.devicePixelRatio() if screen else 1
+        self.cursor_scale = (
+            actual_size / ratio / self.project.size if actual_size else 1
+        )
+        self.feedback_stamp = None
         self.active = True
         self.temp = user_dir() / "runtime" / uuid.uuid4().hex
         self.temp.mkdir(parents=True)
@@ -459,15 +491,7 @@ class Engine:
         self.last_rule = ""
         self.last_app_check = 0
         self.prepare_sounds(project)
-        self.overlay.settings = dict(self.project.settings, pixel=self.project.pixel)
-        self.overlay.keyframes = parse_keyframes(
-            self.project.settings.get("effect_keyframes", EXAMPLE)
-        )
-        self.overlay.effects = {
-            key: [(frame.image, frame.duration) for frame in frames]
-            for key, frames in self.project.effects.items()
-        }
-        self.configure_effect_layer()
+        self.apply_feedback(clear=True)
         self.overlay.fit_screens()
         self.effect_overlay.fit_screens()
         self.timer.start(16)
@@ -553,15 +577,7 @@ class Engine:
         else:
             self.project = self.base_project
         self.prepare_sounds(self.project)
-        self.overlay.settings = dict(self.project.settings, pixel=self.project.pixel)
-        self.overlay.keyframes = parse_keyframes(
-            self.project.settings.get("effect_keyframes", EXAMPLE)
-        )
-        self.overlay.effects = {
-            key: [(f.image, f.duration) for f in frames]
-            for key, frames in self.project.effects.items()
-        }
-        self.configure_effect_layer()
+        self.apply_feedback(clear=True)
         self.resolver = Resolver()
         self.active_audio = set()
         self.last_sound_trigger = ""
@@ -659,7 +675,7 @@ class Engine:
         pos = QCursor.pos()
         delta = pos - self.last_position
         distance = math.hypot(delta.x(), delta.y())
-        settings = self.project.settings
+        settings = self.feedback_settings()
         detected = native.current_role()
         shell_surface = native.shell_surface_active()
         context = self.inputs.update(
@@ -781,7 +797,9 @@ class Engine:
             self.index = (self.index + 1) % len(frames)
         frame_key = (id(self.project), group, self.index)
         self.overlay.cursor_frame = frames[self.index]
-        self.overlay.cursor_size = self.project.size
+        self.overlay.cursor_size = max(
+            8, min(512, round(self.project.size * self.cursor_scale))
+        )
         if role not in self.dirty_roles:
             if native.set_live_cursor(role, self.blank_cursor, 32):
                 self.dirty_roles.add(role)
@@ -811,8 +829,8 @@ class Engine:
                 self.sounds[trigger].append(sound)
 
     def update_companion(self, pos, now, group=None):
-        settings = self.project.settings
-        companion = self.project.effects.get("companion", [])
+        settings = self.feedback_settings()
+        companion = self.base_project.effects.get("companion", [])
         self.overlay.sprite = None
         if settings.get("companion"):
             if companion:
@@ -824,16 +842,90 @@ class Engine:
                     elapsed -= companion[index].duration
                     index += 1
                 self.overlay.sprite = pixmap(companion[index].image)
-            elif group:
-                self.overlay.sprite = pixmap(
-                    self.project._runtime_frames[group][self.index].image
+            else:
+                fallback = self.project._runtime_frames.get(group, []) if group else []
+                fallback = (
+                    fallback
+                    or self.project.slots.get(self.role, [])
+                    or self.base_project.slots.get("Arrow", [])
                 )
+                if fallback:
+                    self.overlay.sprite = pixmap(
+                        fallback[self.index % len(fallback)].image
+                    )
         self.overlay.sprite_size = settings.get(
             "companion_size", settings.get("effect_size", self.project.size)
         )
         self.overlay.sprite_pos = pos + QPoint(
             settings.get("companion_x", 20), settings.get("companion_y", 20)
         )
+
+    def feedback_settings(self):
+        return dict(
+            self.project.settings,
+            **{
+                key: value
+                for key, value in self.base_project.settings.items()
+                if key in FEEDBACK_KEYS
+            },
+        )
+
+    def apply_feedback(self, clear=False):
+        settings = self.feedback_settings()
+        self.overlay.settings = dict(settings, pixel=self.project.pixel)
+        self.overlay.keyframes = parse_keyframes(
+            settings.get("effect_keyframes", EXAMPLE)
+        )
+        self.overlay.effects = {
+            key: [(f.image, f.duration) for f in frames]
+            for key, frames in self.base_project.effects.items()
+        }
+        self.effect_overlay.settings = self.overlay.settings
+        self.effect_overlay.effects = self.overlay.effects
+        self.effect_overlay.keyframes = self.overlay.keyframes
+        if clear:
+            self.clear_effect_layer()
+        else:
+            self.effect_overlay.particles = [
+                p
+                for p in self.effect_overlay.particles
+                if (p[2] == "trail" and settings.get("trail"))
+                or (
+                    p[2] != "trail"
+                    and settings.get("click_effect") not in (None, "none", "off", False)
+                )
+            ]
+            self.effect_overlay._particle_bounds.clear()
+            self.effect_overlay._effect_bounds = QRect()
+            if not settings.get("companion"):
+                self.overlay.sprite = None
+            self.present_layers(time.monotonic())
+
+    def sync_feedback(self, project):
+        if not self.active:
+            return False
+        values = {
+            key: copy.deepcopy(value)
+            for key, value in project.settings.items()
+            if key in FEEDBACK_KEYS
+        }
+        stamp = (
+            repr(values),
+            tuple(
+                (key, tuple((id(f.image), f.x, f.y, f.duration) for f in frames))
+                for key, frames in project.effects.items()
+            ),
+        )
+        if stamp == self.feedback_stamp:
+            return False
+        self.feedback_stamp = stamp
+        self.base_project.settings.update(values)
+        self.base_project.effects = {
+            key: [Frame(f.image, f.x, f.y, f.duration) for f in frames]
+            for key, frames in project.effects.items()
+        }
+        self.apply_feedback()
+        return True
 
     def configure_effect_layer(self):
         self.effect_overlay.settings = self.overlay.settings

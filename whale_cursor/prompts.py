@@ -21,6 +21,8 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QApplication,
     QTabWidget,
+    QDialog,
+    QDialogButtonBox,
 )
 from .project import SLOTS, EVENTS, EFFECTS
 from .codec import MAX_FRAMES
@@ -76,7 +78,7 @@ def entries(project):
         )
 
 
-def make_brief(project, selected, size, columns, style):
+def make_brief(project, selected, size, columns, style, extra=""):
     items = []
     for key, path, title, frames, role in entries(project):
         if key not in selected:
@@ -165,6 +167,7 @@ def make_brief(project, selected, size, columns, style):
         project=project.name,
         style=style.strip() or "保持同一角色、配色和画风",
         coordinate_origin="每个单帧左上角；x 向右，y 向下；单位像素",
+        user_instructions=extra.strip(),
         items=items,
     )
     return (
@@ -215,7 +218,14 @@ class PromptPage(QWidget):
         layout.addLayout(controls)
         self.style = QLineEdit()
         self.style.setPlaceholderText("画风、角色、配色或其他生图要求…")
-        layout.addWidget(self.style)
+        style_row = QHBoxLayout()
+        style_row.addWidget(self.style, 1)
+        self.extra_button = QPushButton("额外指令…")
+        self.extra_button.clicked.connect(self.edit_extra)
+        style_row.addWidget(self.extra_button)
+        layout.addLayout(style_row)
+        self.extra = QPlainTextEdit(self)
+        self.extra.hide()
         split = QSplitter()
         self.tree = QTreeWidget()
         self.tree.setHeaderLabels(["生成内容", "帧数"])
@@ -253,6 +263,7 @@ class PromptPage(QWidget):
         self.timer.timeout.connect(self.regenerate)
         self.tree.itemChanged.connect(self.edited)
         self.style.textChanged.connect(self.edited)
+        self.extra.textChanged.connect(self.extra_changed)
         self.size.valueChanged.connect(self.edited)
         self.columns.valueChanged.connect(self.edited)
         # Number inputs deliberately don't react to the wheel.
@@ -278,6 +289,7 @@ class PromptPage(QWidget):
             self.size.setValue(config.get("size", 256))
             self.columns.setValue(config.get("columns", 4))
             self.style.setText(config.get("style", ""))
+            self.extra.setPlainText(config.get("extra", ""))
             self.tree.clear()
             self.leaves.clear()
             groups = {}
@@ -345,6 +357,7 @@ class PromptPage(QWidget):
                 self.size.value(),
                 self.columns.value(),
                 self.style.text(),
+                self.extra.toPlainText(),
             )
         )
         self.copy.setEnabled(bool(selected))
@@ -355,6 +368,7 @@ class PromptPage(QWidget):
                 size=self.size.value(),
                 columns=self.columns.value(),
                 style=self.style.text(),
+                extra=self.extra.toPlainText(),
             )
             self.changed()
 
@@ -362,6 +376,40 @@ class PromptPage(QWidget):
         self.timer.stop()
         self.regenerate()
         QApplication.clipboard().setText(self.output.toPlainText())
+
+    def extra_changed(self):
+        self.extra_button.setText(
+            "额外指令 ✓" if self.extra.toPlainText().strip() else "额外指令…"
+        )
+        self.extra_button.setToolTip(
+            self.extra.toPlainText() or "具体动作、构图、表情、必须保留或禁止的内容"
+        )
+        self.edited()
+
+    def edit_extra(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("AI 生图 · 额外指令")
+        dialog.resize(600, 420)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(
+            QLabel("追加到复制文本和每个 API 请求；用途、帧数和热点数据仍会保留。")
+        )
+        editor = QPlainTextEdit()
+        editor.setPlaceholderText(
+            "例如：不要箭头；角色向右弹跳三次；保留蓝色头饰；最后一次眨眼。"
+        )
+        editor.setPlainText(self.extra.toPlainText())
+        layout.addWidget(editor, 1)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.extra.setPlainText(editor.toPlainText())
+            self.regenerate()
 
     def generation_tasks(self):
         self.timer.stop()
@@ -376,6 +424,7 @@ class PromptPage(QWidget):
                 self.size.value(),
                 self.columns.value(),
                 self.style.text(),
+                self.extra.toPlainText(),
             )
             spec = json.loads(prompt[prompt.index("{") :])["items"][0]
             tasks.append(

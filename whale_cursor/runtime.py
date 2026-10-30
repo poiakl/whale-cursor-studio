@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 import math
+import copy
 import os
 import random
 import uuid
@@ -21,6 +22,28 @@ from .project import Project, user_dir
 from . import native
 from .conditions import Inputs, Resolver, ORDER, owners
 from .fx import pose, parse_keyframes, EXAMPLE
+
+
+FEEDBACK_KEYS = {
+    "click_effect",
+    "effect_motion",
+    "effect_keyframes",
+    "effect_size",
+    "effect_lifetime",
+    "effect_opacity",
+    "click_size",
+    "click_opacity",
+    "trail",
+    "trail_size",
+    "trail_opacity",
+    "trail_lifetime",
+    "trail_spacing",
+    "companion",
+    "companion_size",
+    "companion_opacity",
+    "companion_x",
+    "companion_y",
+}
 
 
 _pixmap_cache = OrderedDict()
@@ -142,12 +165,12 @@ class Overlay(QWidget):
             # Reserve the whole hotspot range once. Individual animation frames
             # must not move or resize the native window at a stationary pointer.
             size = self.cursor_size
-            rect = QRect(
+            rect = QRectF(
                 self.cursor_pos.x() - size - 2,
                 self.cursor_pos.y() - size - 2,
                 size * 2 + 4,
                 size * 2 + 4,
-            )
+            ).toAlignedRect()
         if self.sprite is not None:
             rect = rect.united(
                 QRect(
@@ -212,6 +235,8 @@ class Overlay(QWidget):
             self.update()
 
     def emit_at(self, pos, kind):
+        if kind in (None, "none", "off", False):
+            return
         now = time.monotonic()
         if self.settings.get("effect_motion") == "burst" and kind not in (
             "trail",
@@ -311,7 +336,10 @@ class Overlay(QWidget):
             custom = self.effects.get("trail" if kind == "trail" else "click", [])
             if custom and kind in ("custom", "trail"):
                 total = sum(duration for _, duration in custom)
-                elapsed = (age * 1000) % total
+                # Transient feedback is a one-shot clip, not a looping sprite.
+                # Wrapping a transparent last frame back to an opaque first frame
+                # creates a visible flash when effect lifetime exceeds clip length.
+                elapsed = min(max(0, age * 1000), max(0, total - 0.001))
                 index = 0
                 while index < len(custom) - 1 and elapsed >= custom[index][1]:
                     elapsed -= custom[index][1]
@@ -370,6 +398,166 @@ class Overlay(QWidget):
         p.end()
 
 
+class EffectLayer(Overlay):
+    """Fixed, input-transparent tiles: clicks never move or resize a layered HWND.
+
+    Only tiles touched by live effects are repainted. Blank tiles stay mapped,
+    so starting/ending a click does not expose recycled compositor contents.
+    """
+
+    TILE = 512
+
+    def __init__(self):
+        super().__init__()
+        self._tiles = []
+        self._screens = None
+        self._primary_particles = []
+        self._active_tiles = []
+
+    @staticmethod
+    def screen_areas():
+        return [
+            (screen, screen.availableGeometry().adjusted(1, 1, -1, -1))
+            for screen in QApplication.screens()
+        ]
+
+    def fit_screens(self):
+        self.release_tiles()
+        areas = self.screen_areas()
+        self._screens = [
+            (rect.getRect(), screen.devicePixelRatio()) for screen, rect in areas
+        ]
+        cells = []
+        for screen, area in areas:
+            for y in range(area.top(), area.bottom() + 1, self.TILE):
+                for x in range(area.left(), area.right() + 1, self.TILE):
+                    cells.append(
+                        (
+                            screen,
+                            QRect(
+                                x,
+                                y,
+                                min(self.TILE, area.right() - x + 1),
+                                min(self.TILE, area.bottom() - y + 1),
+                            ),
+                        )
+                    )
+        # Keep the primary test/preview surface at the current pointer's tile.
+        point = QCursor.pos()
+        cells.sort(key=lambda pair: not pair[1].contains(point))
+        self.particles = []
+        self._primary_particles = []
+        for index, (screen, rect) in enumerate(cells):
+            tile = self if index == 0 else Overlay()
+            tile.setGeometry(rect)
+            tile.render_time = time.monotonic()
+            tile._tile_active = False
+            tile.show()
+            self._tiles.append(tile)
+        self._particle_bounds.clear()
+        self._effect_bounds = QRect()
+
+    def release_tiles(self):
+        for tile in self._tiles:
+            QWidget.hide(tile)
+            if tile is not self:
+                tile.deleteLater()
+        self._tiles = []
+        self._active_tiles = []
+        self._screens = None
+
+    def paintEvent(self, event):
+        particles = self.particles
+        self.particles = self._primary_particles
+        try:
+            super().paintEvent(event)
+        finally:
+            self.particles = particles
+
+    def present(self, now=None):
+        now = time.monotonic() if now is None else now
+        signature = [
+            (rect.getRect(), screen.devicePixelRatio())
+            for screen, rect in self.screen_areas()
+        ]
+        if signature != self._screens:
+            particles = self.particles
+            self.fit_screens()
+            self.particles = particles
+        self.render_time = now
+        self.particles = [
+            particle
+            for particle in self.particles
+            if now - particle[1]
+            < max(
+                0.1,
+                self.settings.get(
+                    "trail_lifetime" if particle[2] == "trail" else "effect_lifetime",
+                    850,
+                )
+                / 1000,
+            )
+        ]
+        active = {id(particle) for particle in self.particles}
+        self._particle_bounds = {
+            key: value for key, value in self._particle_bounds.items() if key in active
+        }
+        for particle in self.particles:
+            if id(particle) not in self._particle_bounds:
+                self._particle_bounds[id(particle)] = (
+                    particle,
+                    self.particle_bounds(particle),
+                )
+        self._active_tiles = []
+        for tile in self._tiles:
+            selected = [
+                particle
+                for particle in self.particles
+                if self._particle_bounds[id(particle)][1].intersects(tile.geometry())
+            ]
+            was_active = tile._tile_active
+            tile.settings, tile.effects, tile.keyframes = (
+                self.settings,
+                self.effects,
+                self.keyframes,
+            )
+            tile.render_time = now
+            if tile is self:
+                self._primary_particles = selected
+            else:
+                tile.particles = selected
+            tile._tile_active = bool(selected)
+            if selected:
+                self._active_tiles.append(tile)
+            if selected or was_active:
+                tile.update()
+
+    def active_handles(self):
+        return [int(tile.winId()) for tile in self._active_tiles if tile.isVisible()]
+
+    def clear(self):
+        self.particles = []
+        self._primary_particles = []
+        self._particle_bounds.clear()
+        self._effect_bounds = QRect()
+        self._active_tiles = []
+        for tile in self._tiles:
+            if tile is not self:
+                tile.particles = []
+            if tile._tile_active:
+                tile._tile_active = False
+                tile.repaint()
+
+    def hide(self):
+        for tile in self._tiles:
+            QWidget.hide(tile)
+        super().hide()
+
+    def deleteLater(self):
+        self.release_tiles()
+        super().deleteLater()
+
+
 class Engine:
     def __init__(self, on_error=lambda message: None):
         self.on_error = on_error
@@ -377,7 +565,7 @@ class Engine:
         self.timer.timeout.connect(self.tick)
         self.active = False
         self.overlay = Overlay()
-        self.effect_overlay = Overlay()
+        self.effect_overlay = EffectLayer()
         self.effect_overlay.keep_visible = True
         self.sound = QSoundEffect()
         self.sounds = {}
@@ -392,6 +580,7 @@ class Engine:
 
     def start(self, project):
         native.require()
+        native.reset_shell_scan()
         if self.active:
             self.stop()
         native.recover_runtime()
@@ -399,6 +588,7 @@ class Engine:
         self.project.migrate_events()
         self.base_project = self.project
         self.initial = native.snapshot()
+        self.feedback_stamp = None
         self.active = True
         self.temp = user_dir() / "runtime" / uuid.uuid4().hex
         self.temp.mkdir(parents=True)
@@ -459,15 +649,7 @@ class Engine:
         self.last_rule = ""
         self.last_app_check = 0
         self.prepare_sounds(project)
-        self.overlay.settings = dict(self.project.settings, pixel=self.project.pixel)
-        self.overlay.keyframes = parse_keyframes(
-            self.project.settings.get("effect_keyframes", EXAMPLE)
-        )
-        self.overlay.effects = {
-            key: [(frame.image, frame.duration) for frame in frames]
-            for key, frames in self.project.effects.items()
-        }
-        self.configure_effect_layer()
+        self.apply_feedback(clear=True)
         self.overlay.fit_screens()
         self.effect_overlay.fit_screens()
         self.timer.start(16)
@@ -494,6 +676,7 @@ class Engine:
         self.rule_futures.clear()
         self.overlay.hide()
         self.effect_overlay.hide()
+        self.effect_overlay.release_tiles()
         self.effect_overlay.particles = []
         self.effect_overlay._effect_bounds = QRect()
         self.effect_overlay._particle_bounds.clear()
@@ -553,15 +736,7 @@ class Engine:
         else:
             self.project = self.base_project
         self.prepare_sounds(self.project)
-        self.overlay.settings = dict(self.project.settings, pixel=self.project.pixel)
-        self.overlay.keyframes = parse_keyframes(
-            self.project.settings.get("effect_keyframes", EXAMPLE)
-        )
-        self.overlay.effects = {
-            key: [(f.image, f.duration) for f in frames]
-            for key, frames in self.project.effects.items()
-        }
-        self.configure_effect_layer()
+        self.apply_feedback(clear=True)
         self.resolver = Resolver()
         self.active_audio = set()
         self.last_sound_trigger = ""
@@ -659,8 +834,9 @@ class Engine:
         pos = QCursor.pos()
         delta = pos - self.last_position
         distance = math.hypot(delta.x(), delta.y())
-        settings = self.project.settings
+        settings = self.feedback_settings()
         detected = native.current_role()
+        shell_surface = native.shell_surface_active()
         context = self.inputs.update(
             now,
             (pos.x(), pos.y()),
@@ -758,10 +934,12 @@ class Engine:
             self.elapsed = 0
             self.last_frame = None
         self.state = state
-        if not frames:
+        if not frames or shell_surface:
             if self.dirty_roles:
                 native.reload()
                 self.dirty_roles.clear()
+                if shell_surface:
+                    native.refresh_pointer_shape()
             self.overlay.cursor_frame = None
             self.update_companion(pos, now)
             self.present_layers(now)
@@ -780,7 +958,12 @@ class Engine:
             self.index = (self.index + 1) % len(frames)
         frame_key = (id(self.project), group, self.index)
         self.overlay.cursor_frame = frames[self.index]
-        self.overlay.cursor_size = self.project.size
+        screen = QApplication.screenAt(pos) or QApplication.primaryScreen()
+        ratio = screen.devicePixelRatio() if screen else 1
+        # Project.size is the physical pixel size written to CUR/ANI. Qt paints
+        # in logical pixels; convert exactly once instead of inferring a scale
+        # from an unrelated application cursor handle.
+        self.overlay.cursor_size = self.project.size / ratio
         if role not in self.dirty_roles:
             if native.set_live_cursor(role, self.blank_cursor, 32):
                 self.dirty_roles.add(role)
@@ -810,8 +993,8 @@ class Engine:
                 self.sounds[trigger].append(sound)
 
     def update_companion(self, pos, now, group=None):
-        settings = self.project.settings
-        companion = self.project.effects.get("companion", [])
+        settings = self.feedback_settings()
+        companion = self.base_project.effects.get("companion", [])
         self.overlay.sprite = None
         if settings.get("companion"):
             if companion:
@@ -823,16 +1006,90 @@ class Engine:
                     elapsed -= companion[index].duration
                     index += 1
                 self.overlay.sprite = pixmap(companion[index].image)
-            elif group:
-                self.overlay.sprite = pixmap(
-                    self.project._runtime_frames[group][self.index].image
+            else:
+                fallback = self.project._runtime_frames.get(group, []) if group else []
+                fallback = (
+                    fallback
+                    or self.project.slots.get(self.role, [])
+                    or self.base_project.slots.get("Arrow", [])
                 )
+                if fallback:
+                    self.overlay.sprite = pixmap(
+                        fallback[self.index % len(fallback)].image
+                    )
         self.overlay.sprite_size = settings.get(
             "companion_size", settings.get("effect_size", self.project.size)
         )
         self.overlay.sprite_pos = pos + QPoint(
             settings.get("companion_x", 20), settings.get("companion_y", 20)
         )
+
+    def feedback_settings(self):
+        return dict(
+            self.project.settings,
+            **{
+                key: value
+                for key, value in self.base_project.settings.items()
+                if key in FEEDBACK_KEYS
+            },
+        )
+
+    def apply_feedback(self, clear=False):
+        settings = self.feedback_settings()
+        self.overlay.settings = dict(settings, pixel=self.project.pixel)
+        self.overlay.keyframes = parse_keyframes(
+            settings.get("effect_keyframes", EXAMPLE)
+        )
+        self.overlay.effects = {
+            key: [(f.image, f.duration) for f in frames]
+            for key, frames in self.base_project.effects.items()
+        }
+        self.effect_overlay.settings = self.overlay.settings
+        self.effect_overlay.effects = self.overlay.effects
+        self.effect_overlay.keyframes = self.overlay.keyframes
+        if clear:
+            self.clear_effect_layer()
+        else:
+            self.effect_overlay.particles = [
+                p
+                for p in self.effect_overlay.particles
+                if (p[2] == "trail" and settings.get("trail"))
+                or (
+                    p[2] != "trail"
+                    and settings.get("click_effect") not in (None, "none", "off", False)
+                )
+            ]
+            self.effect_overlay._particle_bounds.clear()
+            self.effect_overlay._effect_bounds = QRect()
+            if not settings.get("companion"):
+                self.overlay.sprite = None
+            self.present_layers(time.monotonic())
+
+    def sync_feedback(self, project):
+        if not self.active:
+            return False
+        values = {
+            key: copy.deepcopy(value)
+            for key, value in project.settings.items()
+            if key in FEEDBACK_KEYS
+        }
+        stamp = (
+            repr(values),
+            tuple(
+                (key, tuple((id(f.image), f.x, f.y, f.duration) for f in frames))
+                for key, frames in project.effects.items()
+            ),
+        )
+        if stamp == self.feedback_stamp:
+            return False
+        self.feedback_stamp = stamp
+        self.base_project.settings.update(values)
+        self.base_project.effects = {
+            key: [Frame(f.image, f.x, f.y, f.duration) for f in frames]
+            for key, frames in project.effects.items()
+        }
+        self.apply_feedback()
+        return True
 
     def configure_effect_layer(self):
         self.effect_overlay.settings = self.overlay.settings
@@ -841,13 +1098,7 @@ class Engine:
         self.clear_effect_layer()
 
     def clear_effect_layer(self):
-        self.effect_overlay.particles = []
-        self.effect_overlay._effect_bounds = QRect()
-        self.effect_overlay._particle_bounds.clear()
-        self.effect_overlay.render_time = None
-        if self.effect_overlay.isVisible():
-            self.effect_overlay.repaint()
-            self.effect_overlay._idle_clean = True
+        self.effect_overlay.clear()
 
     def present_layers(self, now):
         self.effect_overlay.present(now)
@@ -856,8 +1107,7 @@ class Engine:
         # Restore only these unowned, nonactivating layers, never the main window.
         native.restack_overlays(
             [
-                int(layer.winId())
-                for layer in (self.effect_overlay, self.overlay)
-                if layer.isVisible()
+                *self.effect_overlay.active_handles(),
+                *([int(self.overlay.winId())] if self.overlay.isVisible() else []),
             ]
         )

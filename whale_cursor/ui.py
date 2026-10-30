@@ -55,6 +55,9 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QKeySequenceEdit,
     QPlainTextEdit,
+    QTableWidget,
+    QTableWidgetItem,
+    QColorDialog,
 )
 from .codec import import_images, split_sheet, transform, SIZES
 from .project import Project, SLOTS, EVENTS, EFFECTS, user_dir, event_key
@@ -362,6 +365,16 @@ class Preview(QLabel):
 class Window(QMainWindow):
     def __init__(self, project=None):
         super().__init__()
+        from . import preferences
+
+        self.preferences = preferences.load()
+        theme_style = preferences.stylesheet(
+            STYLE,
+            self.preferences.get("theme", "mint"),
+            self.preferences.get("background", "#F4F7F5"),
+        )
+        if QApplication.instance().styleSheet() != theme_style:
+            QApplication.instance().setStyleSheet(theme_style)
         self.setWindowTitle("鲸鱼娘 · 指针工坊")
         self.resize(1240, 880)
         self.setMinimumSize(1000, 680)
@@ -448,6 +461,8 @@ class Window(QMainWindow):
 
     def touch(self):
         self.save_timer.start()
+        if self.engine.active:
+            self.engine.sync_feedback(self.project)
         if self.tabs.currentIndex() == 1:
             self.refresh_events()
             self.refresh_conditions()
@@ -506,7 +521,13 @@ class Window(QMainWindow):
         self.build_schemes()
         self.build_settings()
         from .prompts import PromptPage
-        self.prompt_page = PromptPage(lambda: self.project, self.touch)
+
+        self.prompt_page = PromptPage(
+            lambda: self.project,
+            self.touch,
+            apply_frames=self.apply_ai_frames,
+            frame_getter=lambda: self.frame,
+        )
         self.tabs.addTab(self.prompt_page, "AI 生图")
         self.tabs.currentChanged.connect(
             lambda index: self.prompt_page.reload() if index == 4 else None
@@ -623,7 +644,13 @@ class Window(QMainWindow):
         prop_tabs.addTab(settings_page, "参数")
         prop_tabs.addTab(preview_page, "试用")
         self.inspector_tabs = prop_tabs
-        prop.addWidget(label("点击热点"))
+        hotspot_row = QHBoxLayout()
+        hotspot_row.addWidget(label("点击热点"))
+        hotspot_row.addStretch()
+        hotspot_import = self.button("导入热点…", self.import_hotspots)
+        hotspot_import.setStyleSheet("padding:3px 7px;")
+        hotspot_row.addWidget(hotspot_import)
+        prop.addLayout(hotspot_row)
         grid = QGridLayout()
         grid.setHorizontalSpacing(5)
         grid.setVerticalSpacing(8)
@@ -642,6 +669,9 @@ class Window(QMainWindow):
         self.size_combo.addItems([str(v) for v in SIZES])
         self.size_combo.setCurrentText(str(self.project.size))
         self.size_combo.setFixedSize(78, 34)
+        self.size_combo.setToolTip(
+            "实际像素尺寸；CUR / ANI 导出与桌面互动使用同一尺寸，屏幕缩放只换算一次。"
+        )
         self.size_combo.currentTextChanged.connect(self.size_changed)
         self.duration = NumberBox()
         self.duration.setRange(17, 60000)
@@ -701,6 +731,7 @@ class Window(QMainWindow):
         for text, fn in [
             ("批量匹配", self.batch_import),
             ("精灵图切帧", self.import_sheet),
+            ("导入热点 JSON…", self.import_hotspots),
             ("图像调整", self.image_tools),
             ("导出当前 CUR / ANI", lambda: self.export(True)),
             ("导出整套 CUR / ANI", lambda: self.export(False)),
@@ -1217,7 +1248,9 @@ class Window(QMainWindow):
         scroll.setWidgetResizable(True)
         box.addWidget(scroll)
         body = QWidget()
+        body.setObjectName("themeBody")
         scroll.setWidget(body)
+        body.setAutoFillBackground(False)
         layout = QVBoxLayout(body)
         layout.setContentsMargins(0, 0, 0, 0)
         banner, b = card()
@@ -1598,7 +1631,13 @@ class Window(QMainWindow):
         if key == "sounds":
             self.refresh_sound_list()
         if self.engine.active:
-            self.statusBar().showMessage("运行中；设置已修改，停止并重新开启后生效")
+            from .runtime import FEEDBACK_KEYS
+
+            self.statusBar().showMessage(
+                "效果设置已即时应用"
+                if key in FEEDBACK_KEYS
+                else "运行中；设置已修改，停止并重新开启后生效"
+            )
 
     def choose_sound(self):
         files, _ = QFileDialog.getOpenFileNames(self, "添加音频", "", "PCM WAV (*.wav)")
@@ -1991,9 +2030,47 @@ class Window(QMainWindow):
         scroll.setWidgetResizable(True)
         layout.addWidget(scroll)
         body = QWidget()
+        body.setObjectName("themeBody")
         scroll.setWidget(body)
+        body.setAutoFillBackground(False)
         b = QVBoxLayout(body)
         b.setContentsMargins(0, 0, 0, 0)
+        appearance, appearance_layout = card()
+        b.addWidget(appearance)
+        appearance_layout.addWidget(label("外观与启动", "title"))
+        theme_row = QHBoxLayout()
+        theme_row.addWidget(label("背景主题"))
+        from .preferences import THEMES
+
+        self.theme_box = ChoiceBox()
+        for key, title in THEMES.items():
+            self.theme_box.addItem(title, key)
+        self.theme_box.setCurrentIndex(
+            max(0, self.theme_box.findData(self.preferences.get("theme", "mint")))
+        )
+        self.theme_box.currentIndexChanged.connect(
+            lambda _: self.change_theme(self.theme_box.currentData())
+        )
+        theme_row.addWidget(self.theme_box, 1)
+        theme_row.addWidget(self.button("自定义背景色…", self.choose_theme_color))
+        appearance_layout.addLayout(theme_row)
+        self.startup_box = QCheckBox("开机自启动（登录后在托盘运行）")
+        self.startup_box.setChecked(native.startup_enabled())
+        self.startup_box.setEnabled(native.WINDOWS)
+        self.startup_box.toggled.connect(self.change_startup)
+        appearance_layout.addWidget(self.startup_box)
+        self.startup_interaction = QCheckBox("自启动时开启桌面互动")
+        self.startup_interaction.setChecked(
+            bool(self.preferences.get("startup_interaction", False))
+        )
+        self.startup_interaction.setEnabled(
+            native.WINDOWS and self.startup_box.isChecked()
+        )
+        self.startup_interaction.toggled.connect(self.change_startup_interaction)
+        appearance_layout.addWidget(self.startup_interaction)
+        appearance_layout.addWidget(
+            label("自启动绑定当前程序路径；移动便携版后需重新设置。", "muted")
+        )
         pane, p = card()
         b.addWidget(pane)
         p.addWidget(label("编辑与输出", "title"))
@@ -2080,7 +2157,7 @@ class Window(QMainWindow):
         a.addWidget(label("关于", "title"))
         a.addWidget(
             label(
-                "鲸鱼娘指针工坊 2.5\n原生 CUR / ANI 安装无需常驻；桌面互动在托盘运行，可随时停止。\n方案与导入素材保存在当前用户目录，程序不上传图片或鼠标操作。\n支持 Windows 10 / 11。游戏、远程桌面和部分自绘指针应用可能使用自己的指针。"
+                "鲸鱼娘指针工坊 2.9\n原生 CUR / ANI 安装无需常驻；桌面互动在托盘运行，可随时停止。\n方案与素材保存在当前用户目录；仅点击 AI 发送时上传参考图和提示词，不上传鼠标操作。\n支持 Windows 10 / 11。游戏、远程桌面和部分自绘指针应用可能使用自己的指针。"
             )
         )
         a.addWidget(
@@ -2090,6 +2167,54 @@ class Window(QMainWindow):
             )
         )
         b.addStretch()
+
+    def change_theme(self, name):
+        from . import preferences
+
+        if name not in preferences.THEMES:
+            return
+        self.preferences["theme"] = name
+        preferences.save(self.preferences)
+        theme_style = preferences.stylesheet(
+            STYLE, name, self.preferences.get("background", "#F4F7F5")
+        )
+        if QApplication.instance().styleSheet() != theme_style:
+            QApplication.instance().setStyleSheet(theme_style)
+
+    def choose_theme_color(self):
+        color = QColorDialog.getColor(
+            QColor(self.preferences.get("background", "#F4F7F5")), self, "软件背景颜色"
+        )
+        if color.isValid():
+            self.preferences["background"] = color.name()
+            if self.theme_box.currentData() == "custom":
+                self.change_theme("custom")
+            else:
+                self.theme_box.setCurrentIndex(self.theme_box.findData("custom"))
+
+    def change_startup(self, enabled):
+        try:
+            native.set_startup(enabled)
+        except Exception as error:
+            self.startup_box.blockSignals(True)
+            self.startup_box.setChecked(native.startup_enabled())
+            self.startup_box.blockSignals(False)
+            self.error(error)
+        self.startup_interaction.setEnabled(self.startup_box.isChecked())
+
+    def change_startup_interaction(self, enabled):
+        from . import preferences
+
+        self.preferences["startup_interaction"] = bool(enabled)
+        preferences.save(self.preferences)
+
+    def launch_at_login(self):
+        if QSystemTrayIcon.isSystemTrayAvailable():
+            self.hide()
+        else:
+            self.showMinimized()
+        if self.preferences.get("startup_interaction") and not self.engine.active:
+            self.guard(self.toggle_engine)
 
     def set_background(self, value):
         self.canvas.background = value
@@ -2191,6 +2316,8 @@ class Window(QMainWindow):
 
     def quit_app(self):
         def quit_now():
+            if self.prompt_page.ai:
+                self.prompt_page.ai.cancel()
             if self.engine.active:
                 self.engine.stop()
             self.flush_save()
@@ -2208,6 +2335,8 @@ class Window(QMainWindow):
             )
             return
         try:
+            if self.prompt_page.ai:
+                self.prompt_page.ai.cancel()
             if self.engine.active:
                 self.engine.stop()
             self.flush_save()
@@ -2850,3 +2979,88 @@ class Window(QMainWindow):
         )
         QTimer.singleShot(0, play)
         dialog.exec()
+
+    def apply_ai_frames(self, project, target, frames):
+        if project is not self.project:
+            raise ValueError("当前方案已改变，未覆盖。")
+        group, key = target.split(".", 1)
+        if group not in ("slots", "events", "effects", "animations"):
+            raise ValueError("未知的生图目标。")
+        if group == "animations" and not any(
+            r["id"] == key for r in self.project.settings.get("animation_rules", [])
+        ):
+            raise ValueError("该条件动画已被删除，未覆盖。")
+        self.stop_play()
+        if self.engine.active:
+            self.toggle_engine()
+        self.remember("应用 AI 生图")
+        getattr(self.project, group)[key] = frames
+        self.frame_index = 0
+        self.rebuild_slots()
+        self.refresh_interaction_views()
+        self.touch()
+
+    def import_hotspots(self):
+        import json
+        from .hotspots import parse_hotspots
+
+        path, _ = QFileDialog.getOpenFileName(
+            self, "导入热点 JSON", "", "JSON (*.json)"
+        )
+        if not path:
+            return
+        source = Path(path)
+        if source.stat().st_size > 2 * 1024 * 1024:
+            raise ValueError("热点 JSON 不能超过 2 MB。")
+        changes = parse_hotspots(
+            json.loads(source.read_text("utf-8-sig")),
+            self.project,
+            (self.group, self.storage_key),
+        )
+        dialog = QDialog(self)
+        dialog.setWindowTitle("预览导入热点")
+        dialog.resize(680, 480)
+        layout = QVBoxLayout(dialog)
+        table = QTableWidget(len(changes), 5)
+        table.setHorizontalHeaderLabels(["用途", "帧", "x", "y", "停留 ms"])
+        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        for row, change in enumerate(changes):
+            for col, value in enumerate(
+                (
+                    change.group + "." + change.key,
+                    change.frame + 1,
+                    change.x,
+                    change.y,
+                    change.duration or "保持原值",
+                )
+            ):
+                table.setItem(row, col, QTableWidgetItem(str(value)))
+        table.resizeColumnsToContents()
+        layout.addWidget(table, 1)
+        timing = QCheckBox("同时导入帧时长")
+        layout.addWidget(timing)
+        layout.addWidget(
+            label("坐标已换算到 256×256 编辑画布；仅修改热点，不替换图片。", "muted")
+        )
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("应用热点")
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.apply_hotspot_changes(changes, timing.isChecked())
+
+    def apply_hotspot_changes(self, changes, timing=False):
+        self.stop_play()
+        if self.engine.active:
+            self.toggle_engine()
+        self.remember("导入热点 JSON")
+        for change in changes:
+            frame = getattr(self.project, change.group)[change.key][change.frame]
+            frame.x, frame.y = change.x, change.y
+            if timing and change.duration is not None:
+                frame.duration = change.duration
+        self.refresh()
+        self.touch()

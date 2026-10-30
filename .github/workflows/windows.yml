@@ -25,6 +25,23 @@ jobs:
       - run: python -m pytest -q
         env:
           QT_QPA_PLATFORM: offscreen
+      - name: Check native Windows compositor at multiple scales
+        shell: pwsh
+        run: |
+          foreach ($scale in @("1", "1.25", "1.5", "2")) {
+            $env:QT_SCALE_FACTOR = $scale
+            python tests/desktop_render_probe.py
+            if ($LASTEXITCODE -ne 0) { throw "Compositor probe failed at scale $scale" }
+          }
+        env:
+          QT_QPA_PLATFORM: windows
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: desktop-render-diagnostics
+          path: render-diagnostics
+          if-no-files-found: ignore
+          retention-days: 30
       - name: Package portable Windows app
         run: python -m PyInstaller --noconfirm --clean --windowed --onedir --name WhaleCursorStudio --add-data "assets;assets" --collect-all PySide6.QtMultimedia main.py
       - name: Launch packaged app and check all pages
@@ -61,5 +78,5 @@ jobs:
           }
           gh api --method PATCH "repos/$env:GITHUB_REPOSITORY/git/refs/tags/desktop-latest" -f "sha=$env:GITHUB_SHA" -F force=true
           if ($LASTEXITCODE -ne 0) { throw "Could not update rolling release source tag" }
-          gh release edit desktop-latest --title "Windows 便携版 · 2.5" --notes "修复特效闪烁、首次应用切换残留卡顿与下拉列表遮挡指针；新增 AI 生图提示词页面，多选用途、独立帧数、统一尺寸、热点与序列图数据一键复制。完整解压后运行 WhaleCursorStudio.exe。"
+          gh release edit desktop-latest --title "Windows 便携版 · 2.9" --notes "新增逐条 AI 提示词、紧凑列表、开机自启动及背景主题；补充多显示器任务栏预览和通知浮层的原生指针回退。保留固定分块特效、热点 JSON 和 API 生图。完整解压后运行 WhaleCursorStudio.exe。"
           gh release upload desktop-latest WhaleCursorStudio-Windows.zip --clobber

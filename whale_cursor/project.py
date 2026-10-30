@@ -253,7 +253,7 @@ class Project:
             m = json.loads(z.read("project.json"))
             if m.get("version") not in (2, 3, 4, 5) or m.get("size") not in SIZES:
                 raise ValueError("不支持的方案版本 / 尺寸")
-            p = cls.defaults()
+            p = cls()
             p.name = str(m.get("name", "未命名"))[:120]
             p.size = m["size"]
             p.pixel = bool(m.get("pixel", True))

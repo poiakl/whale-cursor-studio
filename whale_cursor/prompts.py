@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import math
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, QSize
 from PySide6.QtWidgets import (
     QWidget,
     QVBoxLayout,
@@ -30,11 +30,15 @@ from .conditions import describe
 
 
 class FrameDelegate(QStyledItemDelegate):
+    def sizeHint(self, option, index):
+        return QSize(super().sizeHint(option, index).width(), 20)
+
     def createEditor(self, parent, option, index):
         if index.column() != 1 or not index.data(Qt.ItemDataRole.UserRole):
             return None
         editor = QSpinBox(parent)
         editor.setRange(1, MAX_FRAMES)
+        editor.setStyleSheet("QSpinBox {padding:1px;min-height:16px;}")
         editor.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         editor.installEventFilter(self)
         return editor
@@ -78,7 +82,9 @@ def entries(project):
         )
 
 
-def make_brief(project, selected, size, columns, style, extra=""):
+def make_brief(
+    project, selected, size, columns, style, extra="", item_instructions=None
+):
     items = []
     for key, path, title, frames, role in entries(project):
         if key not in selected:
@@ -110,6 +116,7 @@ def make_brief(project, selected, size, columns, style, extra=""):
             dict(
                 id=key,
                 purpose=" / ".join((*path, title)),
+                extra_prompt=(item_instructions or {}).get(key, "").strip(),
                 frame_count=count,
                 cell_px=[size, size],
                 sheet_grid=[cols, rows],
@@ -172,6 +179,7 @@ def make_brief(project, selected, size, columns, style, extra=""):
     )
     return (
         "请为 Windows 鼠标指针与桌面互动制作透明 PNG 动画素材。\n"
+        "user_instructions 是共享要求；extra_prompt 仅作用于所属条目，动作与构图以该条目要求优先。不要把指令文字画进图片。\n"
         "每个 items 条目单独生成一张序列图，文件名使用 id；不同用途不要混在同一张图。\n"
         "严格按 sheet_grid 的列数、行数排列，从左到右、从上到下；每格大小为 cell_px，"
         "保留完整画布，不裁边、不留格间距，unused_cells 对应末尾透明空格。\n"
@@ -200,6 +208,7 @@ class PromptPage(QWidget):
         self.changed = changed
         self.loading = False
         self.leaves = {}
+        self.item_instructions = {}
         layout = QVBoxLayout(self)
         controls = QHBoxLayout()
         controls.addWidget(QLabel("单帧尺寸"))
@@ -220,7 +229,7 @@ class PromptPage(QWidget):
         self.style.setPlaceholderText("画风、角色、配色或其他生图要求…")
         style_row = QHBoxLayout()
         style_row.addWidget(self.style, 1)
-        self.extra_button = QPushButton("额外指令…")
+        self.extra_button = QPushButton("共享指令…")
         self.extra_button.clicked.connect(self.edit_extra)
         style_row.addWidget(self.extra_button)
         layout.addLayout(style_row)
@@ -228,12 +237,19 @@ class PromptPage(QWidget):
         self.extra.hide()
         split = QSplitter()
         self.tree = QTreeWidget()
-        self.tree.setHeaderLabels(["生成内容", "帧数"])
-        self.tree.setMinimumWidth(330)
-        self.tree.setColumnWidth(0, 265)
-        self.tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.tree.setHeaderLabels(["生成内容", "帧数", "额外提示词"])
+        self.tree.setMinimumWidth(420)
+        self.tree.setIndentation(13)
+        self.tree.setUniformRowHeights(True)
+        self.tree.setStyleSheet(
+            "QTreeWidget::item {padding:1px 0;} QHeaderView::section {padding:4px;} QTreeWidget {font-size:12px;}"
+        )
+        self.tree.setColumnWidth(0, 145)
+        self.tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
         self.tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
-        self.tree.setColumnWidth(1, 55)
+        self.tree.setColumnWidth(1, 42)
+        self.tree.header().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.tree.itemDoubleClicked.connect(self.edit_item_instruction)
         self.tree.setItemDelegate(FrameDelegate(self.tree))
         split.addWidget(self.tree)
         self.output = QPlainTextEdit()
@@ -249,14 +265,11 @@ class PromptPage(QWidget):
             )
             self.right_tabs.addTab(self.ai, "生成与回传")
         split.addWidget(self.right_tabs)
-        split.setStretchFactor(0, 2)
-        split.setStretchFactor(1, 3)
+        split.setStretchFactor(0, 3)
+        split.setStretchFactor(1, 2)
+        split.setSizes([540, 420])
         layout.addWidget(split, 1)
-        layout.addWidget(
-            QLabel(
-                "勾选分类可批量选择；双击帧数分别修改。尺寸指每一帧，序列图尺寸会自动计算。"
-            )
-        )
+        layout.addWidget(QLabel("双击帧数或额外提示词编辑；共享指令用于全部勾选项。"))
         self.timer = QTimer(self)
         self.timer.setSingleShot(True)
         self.timer.setInterval(150)
@@ -286,6 +299,7 @@ class PromptPage(QWidget):
             config = project.settings.get("ai_prompt", {})
             selected = config.get("selected", {"slots.Arrow": 1})
             counts = config.get("counts", {})
+            self.item_instructions = dict(config.get("item_instructions", {}))
             self.size.setValue(config.get("size", 256))
             self.columns.setValue(config.get("columns", 4))
             self.style.setText(config.get("style", ""))
@@ -318,7 +332,12 @@ class PromptPage(QWidget):
                         key, len(frames) or (1 if key.startswith("slots.") else 8)
                     ),
                 )
-                item = QTreeWidgetItem([title, str(count)])
+                instruction = self.item_instructions.get(key, "")
+                item = QTreeWidgetItem(
+                    [title, str(count), instruction.replace("\n", " / ")]
+                )
+                item.setToolTip(2, instruction)
+                item.setData(2, Qt.ItemDataRole.UserRole, key)
                 item.setData(0, Qt.ItemDataRole.UserRole, key)
                 item.setData(1, Qt.ItemDataRole.UserRole, key)
                 item.setFlags(
@@ -345,6 +364,7 @@ class PromptPage(QWidget):
             self.timer.start()
 
     def regenerate(self, save=True):
+        self.timer.stop()
         selected = {
             key: int(item.text(1))
             for key, item in self.leaves.items()
@@ -358,6 +378,7 @@ class PromptPage(QWidget):
                 self.columns.value(),
                 self.style.text(),
                 self.extra.toPlainText(),
+                self.item_instructions,
             )
         )
         self.copy.setEnabled(bool(selected))
@@ -369,6 +390,7 @@ class PromptPage(QWidget):
                 columns=self.columns.value(),
                 style=self.style.text(),
                 extra=self.extra.toPlainText(),
+                item_instructions=dict(self.item_instructions),
             )
             self.changed()
 
@@ -379,7 +401,7 @@ class PromptPage(QWidget):
 
     def extra_changed(self):
         self.extra_button.setText(
-            "额外指令 ✓" if self.extra.toPlainText().strip() else "额外指令…"
+            "共享指令 ✓" if self.extra.toPlainText().strip() else "共享指令…"
         )
         self.extra_button.setToolTip(
             self.extra.toPlainText() or "具体动作、构图、表情、必须保留或禁止的内容"
@@ -411,6 +433,41 @@ class PromptPage(QWidget):
             self.extra.setPlainText(editor.toPlainText())
             self.regenerate()
 
+    def set_item_instruction(self, key, text):
+        text = text.strip()
+        if text:
+            self.item_instructions[key] = text
+        else:
+            self.item_instructions.pop(key, None)
+        item = self.leaves[key]
+        item.setText(2, text.replace("\n", " / "))
+        item.setToolTip(2, text)
+        self.regenerate()
+
+    def edit_item_instruction(self, item, column):
+        key = item.data(2, Qt.ItemDataRole.UserRole)
+        if column != 2 or not key:
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("条目提示词 · " + item.text(0))
+        dialog.resize(560, 360)
+        layout = QVBoxLayout(dialog)
+        editor = QPlainTextEdit()
+        editor.setPlaceholderText(
+            "仅用于这个条目，例如：向右弹跳三次，最后眨眼；不要箭头。"
+        )
+        editor.setPlainText(self.item_instructions.get(key, ""))
+        layout.addWidget(editor, 1)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.set_item_instruction(key, editor.toPlainText())
+
     def generation_tasks(self):
         self.timer.stop()
         self.regenerate()
@@ -425,6 +482,7 @@ class PromptPage(QWidget):
                 self.columns.value(),
                 self.style.text(),
                 self.extra.toPlainText(),
+                self.item_instructions,
             )
             spec = json.loads(prompt[prompt.index("{") :])["items"][0]
             tasks.append(

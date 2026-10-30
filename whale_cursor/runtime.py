@@ -580,6 +580,7 @@ class Engine:
 
     def start(self, project):
         native.require()
+        native.reset_shell_scan()
         if self.active:
             self.stop()
         native.recover_runtime()
@@ -937,6 +938,8 @@ class Engine:
             if self.dirty_roles:
                 native.reload()
                 self.dirty_roles.clear()
+                if shell_surface:
+                    native.refresh_pointer_shape()
             self.overlay.cursor_frame = None
             self.update_companion(pos, now)
             self.present_layers(now)

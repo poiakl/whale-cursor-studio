@@ -78,5 +78,5 @@ jobs:
           }
           gh api --method PATCH "repos/$env:GITHUB_REPOSITORY/git/refs/tags/desktop-latest" -f "sha=$env:GITHUB_SHA" -F force=true
           if ($LASTEXITCODE -ne 0) { throw "Could not update rolling release source tag" }
-          gh release edit desktop-latest --title "Windows 便携版 · 2.8" --notes "按制作像素尺寸统一互动绘制与 DPI 换算；点击素材单次播放，固定分块特效窗口，避免首帧回跳及窗口移动缩放引起的闪烁。包含热点 JSON、AI 额外指令和 API 生图功能。完整解压后运行 WhaleCursorStudio.exe。"
+          gh release edit desktop-latest --title "Windows 便携版 · 2.9" --notes "新增逐条 AI 提示词、紧凑列表、开机自启动及背景主题；补充多显示器任务栏预览和通知浮层的原生指针回退。保留固定分块特效、热点 JSON 和 API 生图。完整解压后运行 WhaleCursorStudio.exe。"
           gh release upload desktop-latest WhaleCursorStudio-Windows.zip --clobber

@@ -57,6 +57,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QTableWidget,
     QTableWidgetItem,
+    QColorDialog,
 )
 from .codec import import_images, split_sheet, transform, SIZES
 from .project import Project, SLOTS, EVENTS, EFFECTS, user_dir, event_key
@@ -364,6 +365,16 @@ class Preview(QLabel):
 class Window(QMainWindow):
     def __init__(self, project=None):
         super().__init__()
+        from . import preferences
+
+        self.preferences = preferences.load()
+        theme_style = preferences.stylesheet(
+            STYLE,
+            self.preferences.get("theme", "mint"),
+            self.preferences.get("background", "#F4F7F5"),
+        )
+        if QApplication.instance().styleSheet() != theme_style:
+            QApplication.instance().setStyleSheet(theme_style)
         self.setWindowTitle("鲸鱼娘 · 指针工坊")
         self.resize(1240, 880)
         self.setMinimumSize(1000, 680)
@@ -1237,7 +1248,9 @@ class Window(QMainWindow):
         scroll.setWidgetResizable(True)
         box.addWidget(scroll)
         body = QWidget()
+        body.setObjectName("themeBody")
         scroll.setWidget(body)
+        body.setAutoFillBackground(False)
         layout = QVBoxLayout(body)
         layout.setContentsMargins(0, 0, 0, 0)
         banner, b = card()
@@ -2017,9 +2030,47 @@ class Window(QMainWindow):
         scroll.setWidgetResizable(True)
         layout.addWidget(scroll)
         body = QWidget()
+        body.setObjectName("themeBody")
         scroll.setWidget(body)
+        body.setAutoFillBackground(False)
         b = QVBoxLayout(body)
         b.setContentsMargins(0, 0, 0, 0)
+        appearance, appearance_layout = card()
+        b.addWidget(appearance)
+        appearance_layout.addWidget(label("外观与启动", "title"))
+        theme_row = QHBoxLayout()
+        theme_row.addWidget(label("背景主题"))
+        from .preferences import THEMES
+
+        self.theme_box = ChoiceBox()
+        for key, title in THEMES.items():
+            self.theme_box.addItem(title, key)
+        self.theme_box.setCurrentIndex(
+            max(0, self.theme_box.findData(self.preferences.get("theme", "mint")))
+        )
+        self.theme_box.currentIndexChanged.connect(
+            lambda _: self.change_theme(self.theme_box.currentData())
+        )
+        theme_row.addWidget(self.theme_box, 1)
+        theme_row.addWidget(self.button("自定义背景色…", self.choose_theme_color))
+        appearance_layout.addLayout(theme_row)
+        self.startup_box = QCheckBox("开机自启动（登录后在托盘运行）")
+        self.startup_box.setChecked(native.startup_enabled())
+        self.startup_box.setEnabled(native.WINDOWS)
+        self.startup_box.toggled.connect(self.change_startup)
+        appearance_layout.addWidget(self.startup_box)
+        self.startup_interaction = QCheckBox("自启动时开启桌面互动")
+        self.startup_interaction.setChecked(
+            bool(self.preferences.get("startup_interaction", False))
+        )
+        self.startup_interaction.setEnabled(
+            native.WINDOWS and self.startup_box.isChecked()
+        )
+        self.startup_interaction.toggled.connect(self.change_startup_interaction)
+        appearance_layout.addWidget(self.startup_interaction)
+        appearance_layout.addWidget(
+            label("自启动绑定当前程序路径；移动便携版后需重新设置。", "muted")
+        )
         pane, p = card()
         b.addWidget(pane)
         p.addWidget(label("编辑与输出", "title"))
@@ -2106,7 +2157,7 @@ class Window(QMainWindow):
         a.addWidget(label("关于", "title"))
         a.addWidget(
             label(
-                "鲸鱼娘指针工坊 2.8\n原生 CUR / ANI 安装无需常驻；桌面互动在托盘运行，可随时停止。\n方案与素材保存在当前用户目录；仅点击 AI 发送时上传参考图和提示词，不上传鼠标操作。\n支持 Windows 10 / 11。游戏、远程桌面和部分自绘指针应用可能使用自己的指针。"
+                "鲸鱼娘指针工坊 2.9\n原生 CUR / ANI 安装无需常驻；桌面互动在托盘运行，可随时停止。\n方案与素材保存在当前用户目录；仅点击 AI 发送时上传参考图和提示词，不上传鼠标操作。\n支持 Windows 10 / 11。游戏、远程桌面和部分自绘指针应用可能使用自己的指针。"
             )
         )
         a.addWidget(
@@ -2116,6 +2167,54 @@ class Window(QMainWindow):
             )
         )
         b.addStretch()
+
+    def change_theme(self, name):
+        from . import preferences
+
+        if name not in preferences.THEMES:
+            return
+        self.preferences["theme"] = name
+        preferences.save(self.preferences)
+        theme_style = preferences.stylesheet(
+            STYLE, name, self.preferences.get("background", "#F4F7F5")
+        )
+        if QApplication.instance().styleSheet() != theme_style:
+            QApplication.instance().setStyleSheet(theme_style)
+
+    def choose_theme_color(self):
+        color = QColorDialog.getColor(
+            QColor(self.preferences.get("background", "#F4F7F5")), self, "软件背景颜色"
+        )
+        if color.isValid():
+            self.preferences["background"] = color.name()
+            if self.theme_box.currentData() == "custom":
+                self.change_theme("custom")
+            else:
+                self.theme_box.setCurrentIndex(self.theme_box.findData("custom"))
+
+    def change_startup(self, enabled):
+        try:
+            native.set_startup(enabled)
+        except Exception as error:
+            self.startup_box.blockSignals(True)
+            self.startup_box.setChecked(native.startup_enabled())
+            self.startup_box.blockSignals(False)
+            self.error(error)
+        self.startup_interaction.setEnabled(self.startup_box.isChecked())
+
+    def change_startup_interaction(self, enabled):
+        from . import preferences
+
+        self.preferences["startup_interaction"] = bool(enabled)
+        preferences.save(self.preferences)
+
+    def launch_at_login(self):
+        if QSystemTrayIcon.isSystemTrayAvailable():
+            self.hide()
+        else:
+            self.showMinimized()
+        if self.preferences.get("startup_interaction") and not self.engine.active:
+            self.guard(self.toggle_engine)
 
     def set_background(self, value):
         self.canvas.background = value

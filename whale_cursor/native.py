@@ -10,6 +10,8 @@ import shutil
 import sys
 import uuid
 import logging
+import time
+import subprocess
 from contextlib import contextmanager
 from .project import SLOTS, user_dir
 
@@ -83,6 +85,22 @@ if WINDOWS:
     user32.GetClassNameW.restype = ctypes.c_int
     user32.GetWindowRect.argtypes = [W.HWND, ctypes.POINTER(W.RECT)]
     user32.GetWindowRect.restype = W.BOOL
+    user32.MonitorFromWindow.argtypes = [W.HWND, W.DWORD]
+    user32.MonitorFromWindow.restype = W.HANDLE
+    user32.GetMonitorInfoW.argtypes = [W.HANDLE, ctypes.c_void_p]
+    user32.GetMonitorInfoW.restype = W.BOOL
+    user32.GetTopWindow.argtypes = [W.HWND]
+    user32.GetTopWindow.restype = W.HWND
+    user32.SendMessageTimeoutW.argtypes = [
+        W.HWND,
+        W.UINT,
+        W.WPARAM,
+        W.LPARAM,
+        W.UINT,
+        W.UINT,
+        ctypes.POINTER(ctypes.c_size_t),
+    ]
+    user32.SendMessageTimeoutW.restype = ctypes.c_ssize_t
     user32.GetForegroundWindow.restype = W.HWND
     user32.GetWindowThreadProcessId.argtypes = [W.HWND, ctypes.POINTER(W.DWORD)]
     kernel32.OpenProcess.argtypes = [W.DWORD, W.BOOL, W.DWORD]
@@ -416,43 +434,251 @@ def restack_overlays(handles):
         )
 
 
+TASKBAR_CLASSES = {
+    "Shell_TrayWnd",
+    "Shell_SecondaryTrayWnd",
+    "TaskListThumbnailWnd",
+    "TaskListOverlayWnd",
+}
+SHELL_CLASSES = {
+    "Windows.UI.Core.CoreWindow",
+    "XamlExplorerHostIslandWindow",
+    "ControlCenterWindow",
+    "NotificationCenterWindow",
+    "ToastWnd",
+    "TopLevelWindowForOverflowXamlIsland",
+    "Windows.UI.Composition.DesktopWindowContentBridge",
+    "Windows.UI.Input.InputSite.WindowClass",
+}
+SHELL_PROCESSES = {
+    "shellexperiencehost.exe",
+    "shellhost.exe",
+    "notificationshost.exe",
+    "startmenuexperiencehost.exe",
+    "searchhost.exe",
+    "textinputhost.exe",
+    "widgets.exe",
+    "widgetservice.exe",
+}
+_shell_scan_time = -1.0
+_shell_candidates = []
+_shell_owner_cache = {}
+
+
+def window_class(window):
+    name = ctypes.create_unicode_buffer(256)
+    user32.GetClassNameW(window, name, len(name))
+    return name.value
+
+
+def window_exe(window):
+    now = time.monotonic()
+    pid = W.DWORD()
+    user32.GetWindowThreadProcessId(window, ctypes.byref(pid))
+    cached = _shell_owner_cache.get(pid.value)
+    if cached and now - cached[0] < 1:
+        return cached[1]
+    process = kernel32.OpenProcess(0x1000, False, pid.value)
+    result = ""
+    if process:
+        try:
+            buffer = ctypes.create_unicode_buffer(32768)
+            size = W.DWORD(len(buffer))
+            if kernel32.QueryFullProcessImageNameW(
+                process, 0, buffer, ctypes.byref(size)
+            ):
+                result = Path(buffer.value).name.lower()
+        finally:
+            kernel32.CloseHandle(process)
+    if len(_shell_owner_cache) > 64:
+        _shell_owner_cache.clear()
+    _shell_owner_cache[pid.value] = (now, result)
+    return result
+
+
+def visible_rect(window):
+    if hasattr(user32, "MonitorFromWindow") and not user32.MonitorFromWindow(window, 0):
+        return None
+    if not user32.IsWindowVisible(window):
+        return None
+    cloaked = W.DWORD()
+    compositor = globals().get("dwmapi")
+    if (
+        compositor
+        and compositor.DwmGetWindowAttribute(
+            window, 14, ctypes.byref(cloaked), ctypes.sizeof(cloaked)
+        )
+        == 0
+        and cloaked.value
+    ):
+        return None
+    rect = W.RECT()
+    if (
+        user32.GetWindowRect(window, ctypes.byref(rect))
+        and rect.right - rect.left > 4
+        and rect.bottom - rect.top > 4
+    ):
+        return rect
+    return None
+
+
+def shell_window(window, name):
+    if name in TASKBAR_CLASSES:
+        return True
+    if name not in SHELL_CLASSES:
+        return False
+    owner = window_exe(window)
+    return owner in SHELL_PROCESSES or owner == "explorer.exe"
+
+
+def bounded_shell_host(window, rect):
+    # Some shell composition hosts stay visible as an empty monitor-sized
+    # transparent window. Do not let that disable interaction on the desktop.
+    if not hasattr(user32, "MonitorFromWindow"):
+        return True
+
+    class MonitorInfo(ctypes.Structure):
+        _fields_ = [
+            ("size", W.DWORD),
+            ("monitor", W.RECT),
+            ("work", W.RECT),
+            ("flags", W.DWORD),
+        ]
+
+    monitor = user32.MonitorFromWindow(window, 0)
+    info = MonitorInfo()
+    info.size = ctypes.sizeof(info)
+    if not monitor or not user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+        return False
+    area = max(
+        1,
+        (info.monitor.right - info.monitor.left)
+        * (info.monitor.bottom - info.monitor.top),
+    )
+    return (rect.right - rect.left) * (rect.bottom - rect.top) < area * 0.9
+
+
+def reset_shell_scan():
+    global _shell_scan_time, _shell_candidates
+    _shell_scan_time = -1.0
+    _shell_candidates = []
+    _shell_owner_cache.clear()
+
+
+def scan_shell_windows():
+    """Enumerate all preview hosts, including secondary displays, without activation."""
+    result = []
+    window = user32.GetTopWindow(None)
+    visited = set()
+    while window and window not in visited and len(visited) < 512:
+        visited.add(window)
+        name = window_class(window)
+        if name == "TaskListThumbnailWnd" or (
+            name in SHELL_CLASSES and shell_window(window, name)
+        ):
+            rect = visible_rect(window)
+            if rect and (
+                name == "TaskListThumbnailWnd" or bounded_shell_host(window, rect)
+            ):
+                result.append((window, name))
+        window = user32.GetWindow(window, 2)  # GW_HWNDNEXT
+    return result
+
+
 def shell_surface_active():
-    """Use the OS cursor around taskbar/DWM previews, outside app window bands."""
+    """Use hardware cursors above taskbar previews and shell notification bands."""
+    global _shell_scan_time, _shell_candidates
     if not WINDOWS:
         return False
-    for name in ("TaskListThumbnailWnd",):
-        window = user32.FindWindowW(name, None)
-        if window and user32.IsWindowVisible(window):
-            cloaked = W.DWORD()
-            compositor = globals().get("dwmapi")
-            if (
-                compositor
-                and compositor.DwmGetWindowAttribute(
-                    window, 14, ctypes.byref(cloaked), ctypes.sizeof(cloaked)
-                )
-                == 0
-                and cloaked.value
-            ):
-                continue
-            rect = W.RECT()
-            if (
-                user32.GetWindowRect(window, ctypes.byref(rect))
-                and rect.right > rect.left
-                and rect.bottom > rect.top
-            ):
-                return True
     point = W.POINT()
     if not user32.GetCursorPos(ctypes.byref(point)):
         return False
+    now = time.monotonic()
+    if now < _shell_scan_time or now - _shell_scan_time >= 0.15:
+        _shell_candidates = scan_shell_windows()
+        _shell_scan_time = now
+    for window, name in _shell_candidates:
+        rect = visible_rect(window)
+        if rect and (
+            name == "TaskListThumbnailWnd"
+            or rect.left <= point.x < rect.right
+            and rect.top <= point.y < rect.bottom
+        ):
+            return True
     window = user32.WindowFromPoint(point)
     if not window:
         return False
     root = user32.GetAncestor(window, 2) or window
-    name = ctypes.create_unicode_buffer(256)
-    user32.GetClassNameW(root, name, len(name))
-    return name.value in (
-        "Shell_TrayWnd",
-        "Shell_SecondaryTrayWnd",
-        "TaskListThumbnailWnd",
-        "TaskListOverlayWnd",
+    return shell_window(root, window_class(root)) or shell_window(
+        window, window_class(window)
     )
+
+
+def refresh_pointer_shape():
+    """Ask the hovered window to refresh its native cursor after restoring resources."""
+    if not WINDOWS:
+        return
+    point = W.POINT()
+    if not user32.GetCursorPos(ctypes.byref(point)):
+        return
+    window = user32.WindowFromPoint(point)
+    if window:
+        result = ctypes.c_size_t()
+        user32.SendMessageTimeoutW(
+            window,
+            0x0020,
+            window,
+            1 | (0x0200 << 16),
+            0x0002 | 0x0020,
+            30,
+            ctypes.byref(result),
+        )
+
+
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+RUN_NAME = "WhaleCursorStudio"
+
+
+def startup_command():
+    executable = str(Path(sys.executable).resolve())
+    args = [executable]
+    if not getattr(sys, "frozen", False):
+        args.append(str(Path(__file__).resolve().parent.parent / "main.py"))
+    args.append("--startup")
+    command = subprocess.list2cmdline(args)
+    if len(command) > 260:
+        raise ValueError("程序路径过长，无法登记开机自启动。请将程序放到更短的路径。")
+    return command
+
+
+def startup_enabled():
+    if not WINDOWS:
+        return False
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_READ
+        ) as key:
+            value, kind = winreg.QueryValueEx(key, RUN_NAME)
+        return (
+            kind == winreg.REG_SZ and value.casefold() == startup_command().casefold()
+        )
+    except (FileNotFoundError, OSError, ValueError):
+        return False
+
+
+def set_startup(enabled):
+    require()
+    if enabled:
+        command = startup_command()
+        with winreg.CreateKeyEx(
+            winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE
+        ) as key:
+            winreg.SetValueEx(key, RUN_NAME, 0, winreg.REG_SZ, command)
+    else:
+        try:
+            with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE
+            ) as key:
+                winreg.DeleteValue(key, RUN_NAME)
+        except FileNotFoundError:
+            pass

@@ -1,6 +1,7 @@
 import sys
 from PySide6.QtWidgets import QApplication
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
+from PySide6.QtCore import QTimer
 from whale_cursor.ui import Window, STYLE
 
 
@@ -40,7 +41,7 @@ def main():
     probe = QLocalSocket()
     probe.connectToServer(name)
     if probe.waitForConnected(300):
-        probe.write(b"show")
+        probe.write(b"startup" if "--startup" in sys.argv else b"show")
         probe.waitForBytesWritten(300)
         return 0
     server = QLocalServer()
@@ -52,15 +53,22 @@ def main():
     def incoming():
         socket = server.nextPendingConnection()
         if socket:
+            if not socket.bytesAvailable():
+                socket.waitForReadyRead(100)
+            message = bytes(socket.readAll())
             socket.disconnectFromServer()
             socket.deleteLater()
-        window.show_window()
+            if message != b"startup":
+                window.show_window()
 
     server.newConnection.connect(incoming)
     app.aboutToQuit.connect(
         lambda: window.engine.stop() if window.engine.active else None
     )
-    window.show()
+    if "--startup" in sys.argv:
+        QTimer.singleShot(0, window.launch_at_login)
+    else:
+        window.show()
     return app.exec()
 
 

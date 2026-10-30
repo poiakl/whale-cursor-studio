@@ -73,7 +73,7 @@ def test_capture_alpha_handles_transparent_black_white_and_soft_edges():
     black = bytes([0, 0, 0, 0, 0, 0, 0, 0, 255, 255, 255, 0, 0, 0, 128, 0])
     white = bytes([255, 255, 255, 0, 0, 0, 0, 0, 255, 255, 255, 0, 127, 127, 255, 0])
     image = first_run.composite_capture(black, white, 4, 1)
-    assert list(image.getdata()) == [
+    assert [image.getpixel((x, 0)) for x in range(4)] == [
         (0, 0, 0, 0),
         (0, 0, 0, 255),
         (255, 255, 255, 255),
@@ -118,6 +118,50 @@ def test_bundled_scheme_does_not_overwrite_existing_customization():
     project.save(path)
     first_run.bundled_scheme()
     assert Project.load(path).name == "保留用户改动"
+
+
+def test_file_only_animation_dimensions_and_static_live_colors(tmp_path, monkeypatch):
+    from whale_cursor.codec import encode_cur
+
+    file = tmp_path / "custom.ani"
+    file.write_bytes(
+        encode_ani([Frame(Image.new("RGBA", (256, 256), "blue"))] * 2, (48,))
+    )
+    static = tmp_path / "static.cur"
+    static.write_bytes(encode_cur(Frame(Image.new("RGBA", (256, 256), "blue")), (32,)))
+    monkeypatch.setattr(native, "WINDOWS", True)
+    monkeypatch.setattr(
+        first_run, "cursor_paths", lambda: {"NWPen": file, "Arrow": static}
+    )
+    monkeypatch.setattr(
+        first_run,
+        "capture_cursor",
+        lambda role: (
+            (Image.new("RGBA", (32, 32), "red"), 0, 0) if role == "Arrow" else None
+        ),
+    )
+    project, _ = first_run.read_system_project()
+    assert project.size == 48 and len(project.slots["NWPen"]) == 2
+    assert project.slots["Arrow"][0].image.getpixel((10, 10)) == (255, 0, 0, 255)
+
+
+def test_reset_baseline_follows_scheme_undo(app):
+    from whale_cursor.ui import Window
+
+    original = Project(
+        slots={"Arrow": [Frame(Image.new("RGBA", (256, 256), "red"), 12, 20)]}
+    )
+    window = Window(original)
+    changed = original.clone()
+    changed.slots["Arrow"][0].x = 90
+    window.set_project(changed)
+    window.undo()
+    window.project.slots["Arrow"][0].x = 123
+    window.reset_slot()
+    assert window.frame.x == 12
+    window.close()
+    window.deleteLater()
+    app.processEvents()
 
 
 @pytest.mark.skipif(

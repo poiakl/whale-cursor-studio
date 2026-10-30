@@ -409,6 +409,7 @@ class Window(QMainWindow):
             key: [f.clone() for f in frames]
             for key, frames in self.project.slots.items()
         }
+        self.project._source_slots = self.source_slots
         self.group = "slots"
         self.key = "Arrow"
         self.frame_index = 0
@@ -1977,6 +1978,9 @@ class Window(QMainWindow):
                 key: [f.clone() for f in frames]
                 for key, frames in project.slots.items()
             }
+            project._source_slots = self.source_slots
+        else:
+            self.source_slots = getattr(project, "_source_slots", {})
         self.history.limit = int(project.settings.get("history_limit", 30))
         self.history_limit.blockSignals(True)
         self.history_limit.setValue(self.history.limit)

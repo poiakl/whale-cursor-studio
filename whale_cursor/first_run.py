@@ -1,11 +1,12 @@
 """Read the local cursor theme without installing or changing Windows settings."""
 
 import ctypes
+import struct
 from ctypes import wintypes as W
 from pathlib import Path
 from PIL import Image
 from . import native
-from .codec import Frame, SIZES, decode_cur, decode_ani
+from .codec import Frame, SIZES, decode_cur, decode_ani, chunks
 from .project import Project, SLOTS, user_dir
 
 
@@ -191,7 +192,7 @@ def read_system_project():
         if captured:
             image, x, y = captured
             extent = max(image.size)
-            if frames:
+            if frames and len(frames) > 1:
                 sources[role] = (frames, extent)
             else:
                 square = Image.new("RGBA", (extent, extent))
@@ -207,10 +208,7 @@ def read_system_project():
                     extent,
                 )
         elif frames:
-            # A file-only role (e.g. handwriting) has no standard cursor handle.
-            # CUR dimensions are stored in the directory; ANI normally has a handle.
-            extent = max(data[6] or 256, data[7] or 256) if data[:4] != b"RIFF" else 32
-            sources[role] = (frames, extent)
+            sources[role] = (frames, source_extent(data))
     if not sources:
         raise RuntimeError("未能读取本机指针；未替换为自带图片，也未修改系统设置。")
     extent = max(value[1] for value in sources.values())
@@ -233,6 +231,22 @@ def read_system_project():
             )
         project.slots[role] = output
     return project, warnings
+
+
+def source_extent(data):
+    """Match the decoder's largest CUR entry, including file-only ANI roles."""
+    if data[:4] == b"RIFF":
+        for tag, payload in chunks(data, 12, len(data)):
+            if tag == b"LIST" and payload[:4] == b"fram":
+                for kind, frame in chunks(payload, 4, len(payload)):
+                    if kind == b"icon":
+                        return source_extent(frame)
+        raise ValueError("ANI 缺少图像")
+    count = struct.unpack_from("<H", data, 4)[0]
+    dimensions = [
+        (data[6 + i * 16] or 256, data[7 + i * 16] or 256) for i in range(count)
+    ]
+    return max(max(dimensions, key=lambda pair: pair[0] * pair[1]))
 
 
 def bundled_scheme():

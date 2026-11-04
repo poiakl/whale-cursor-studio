@@ -79,7 +79,7 @@ QFrame#card,QGroupBox {background:white;border:1px solid #E1E8E2;border-radius:1
 QGroupBox {margin-top:15px;padding:18px;}QGroupBox::title {subcontrol-origin:margin;left:14px;padding:0 5px;}
 QPushButton {background:#FFF;border:1px solid #DCE5DE;border-radius:7px;padding:8px 13px;min-height:18px;}
 QPushButton:hover {background:#EAF4EE;border-color:#A2CDBB;}
-QPushButton:pressed {background:#D5EADD;} QPushButton:checked {background:#347D68;color:white;border:2px solid #225A47;}QPushButton:disabled {color:#A7B2AB;background:#F5F6F5;}
+QPushButton:pressed {background:#D5EADD;} QPushButton:checked,QPushButton[menuOpen="true"] {background:#347D68;color:white;border:2px solid #225A47;}QPushButton:disabled {color:#A7B2AB;background:#F5F6F5;}
 QPushButton#primary {background:#347D68;color:white;border:1px solid #347D68;}QPushButton#primary:hover {background:#276C58;}
 QTabWidget::pane {border:0;}QTabBar::tab {padding:11px 23px;border-bottom:2px solid transparent;color:#7B8C83;}
 QTabBar::tab:selected {color:#286C55;border-bottom:2px solid #347D68;font-weight:600;}
@@ -893,9 +893,18 @@ class Window(QMainWindow):
 
     def bind_popup_menu(self, button, menu):
         button.setMenu(menu)
-        button.setCheckable(True)
-        menu.aboutToShow.connect(lambda: button.setChecked(True))
-        menu.aboutToHide.connect(lambda: button.setChecked(False))
+
+        # QPushButton toggles checked again on mouse release after opening a menu.
+        # A menu-owned property stays correct for both mouse and keyboard opening.
+        def sync(opened):
+            button.setProperty("menuOpen", opened)
+            button.style().unpolish(button)
+            button.style().polish(button)
+            button.update()
+
+        sync(False)
+        menu.aboutToShow.connect(lambda: sync(True))
+        menu.aboutToHide.connect(lambda: sync(False))
 
     def sync_editor_tools(self, index):
         for number, button in enumerate(self.editor_tool_buttons):

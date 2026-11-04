@@ -14,8 +14,8 @@ class PromptSection(BaseModel):
     prompt: str
 
 
-def create_server(workspace, editor=None):
-    work = Workspace(workspace, editor)
+def create_server(workspace, editor=None, editor_env=None):
+    work = Workspace(workspace, editor, editor_env)
     server = FastMCP(
         "Whale Cursor Studio",
         instructions=(
@@ -144,5 +144,6 @@ def main():
     cache = work.path(".cache")
     cache.mkdir(exist_ok=True)
     # Embedded image/audio extraction also stays inside the chosen workspace.
+    editor_env = os.environ.copy()
     os.environ["LOCALAPPDATA"] = str(cache)
-    create_server(work.root, args.editor).run(transport="stdio")
+    create_server(work.root, args.editor, editor_env).run(transport="stdio")

@@ -65,7 +65,7 @@ def test_failed_mcp_edits_leave_project_unchanged(tmp_path):
 def test_editor_launch_only_configured_command(tmp_path, monkeypatch):
     editor = tmp_path / "main.py"
     editor.write_text("")
-    work = Workspace(tmp_path / "work", editor)
+    work = Workspace(tmp_path / "work", editor, {"LOCALAPPDATA": "original-user-data"})
     work.create_project("p.whalepack")
     calls = []
     monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: calls.append((a, kw)))
@@ -77,6 +77,8 @@ def test_editor_launch_only_configured_command(tmp_path, monkeypatch):
         str(work.root / "p.whalepack"),
     ]
     assert "shell" not in calls[0][1]
+    assert calls[0][1]["env"]["LOCALAPPDATA"] == "original-user-data"
+    assert calls[0][1]["env"]["PYINSTALLER_RESET_ENVIRONMENT"] == "1"
 
 
 def test_interaction_children_inherit_trigger_specific_motion():

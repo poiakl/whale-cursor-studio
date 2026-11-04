@@ -27,7 +27,9 @@ def apply_open_message(window, message):
     if not isinstance(request, dict) or not isinstance(request.get("open"), str):
         raise ValueError("无效的打开方案请求")
     path = open_argument(["--open", request["open"]])
-    window.set_project(Project.load(path))
+    project = Project.load(path)
+    window.flush_save()
+    window.set_project(project)
     window.show_window()
 
 

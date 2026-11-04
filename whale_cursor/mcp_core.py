@@ -1,6 +1,7 @@
 """Headless editor operations confined to an explicitly chosen AI workspace."""
 
 import io
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -16,10 +17,11 @@ from .prompt_hierarchy import prompt_sections
 
 
 class Workspace:
-    def __init__(self, root, editor=None):
+    def __init__(self, root, editor=None, editor_env=None):
         self.root = Path(root).expanduser().resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self.editor = Path(editor).resolve() if editor else None
+        self.editor_env = dict(os.environ if editor_env is None else editor_env)
 
     def path(self, filename, exists=False):
         path = (self.root / filename).resolve()
@@ -305,11 +307,13 @@ class Workspace:
             if self.editor.suffix.lower() == ".exe"
             else [sys.executable, str(self.editor)]
         )
+        environment = dict(self.editor_env, PYINSTALLER_RESET_ENVIRONMENT="1")
         subprocess.Popen(
             [*command, "--open", str(path)],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             cwd=str(self.editor.parent),
+            env=environment,
         )
         return dict(opened=str(path.relative_to(self.root)))

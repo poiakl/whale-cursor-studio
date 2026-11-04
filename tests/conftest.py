@@ -10,6 +10,13 @@ import pytest
 @pytest.fixture(autouse=True)
 def isolated_user(tmp_path, monkeypatch):
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "user"))
+    yield
+    # processEvents alone does not drain DeferredDelete outside app.exec().
+    # Dispose closed test windows before the next global theme repolishes them.
+    from PySide6.QtCore import QCoreApplication, QEvent
+
+    if QCoreApplication.instance() is not None:
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
 
 
 @pytest.fixture(scope="session")

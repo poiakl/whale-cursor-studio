@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import json
 import math
+from pathlib import Path
+from PIL import Image
 from PySide6.QtCore import Qt, QTimer, QSize
+from PySide6.QtGui import QColor, QPen, QBrush
 from PySide6.QtWidgets import (
     QWidget,
     QVBoxLayout,
@@ -23,6 +26,10 @@ from PySide6.QtWidgets import (
     QTabWidget,
     QDialog,
     QDialogButtonBox,
+    QFrame,
+    QComboBox,
+    QMessageBox,
+    QStyleOptionViewItem,
 )
 from .project import SLOTS, EVENTS, EFFECTS
 from .codec import MAX_FRAMES
@@ -30,6 +37,26 @@ from .conditions import describe
 
 
 class FrameDelegate(QStyledItemDelegate):
+    def paint(self, painter, option, index):
+        option = QStyleOptionViewItem(option)
+        state = index.siblingAtColumn(0).data(Qt.ItemDataRole.CheckStateRole)
+        if state in (
+            Qt.CheckState.Checked,
+            Qt.CheckState.Checked.value,
+            Qt.CheckState.PartiallyChecked,
+            Qt.CheckState.PartiallyChecked.value,
+        ):
+            color = QColor(option.palette.highlight().color())
+            color.setAlpha(38)
+            option.backgroundBrush = QBrush(color)
+        super().paint(painter, option, index)
+        painter.save()
+        color = QColor(option.palette.mid().color())
+        color.setAlpha(80)
+        painter.setPen(QPen(color, 1))
+        painter.drawLine(option.rect.bottomLeft(), option.rect.bottomRight())
+        painter.restore()
+
     def sizeHint(self, option, index):
         return QSize(super().sizeHint(option, index).width(), 20)
 
@@ -38,7 +65,9 @@ class FrameDelegate(QStyledItemDelegate):
             return None
         editor = QSpinBox(parent)
         editor.setRange(1, MAX_FRAMES)
-        editor.setStyleSheet("QSpinBox {padding:1px;min-height:16px;}")
+        editor.setStyleSheet(
+            "QSpinBox {padding:1px;min-height:16px;} QSpinBox::up-button,QSpinBox::down-button {height:9px;}"
+        )
         editor.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         editor.installEventFilter(self)
         return editor
@@ -51,7 +80,8 @@ class FrameDelegate(QStyledItemDelegate):
         return super().eventFilter(obj, event)
 
     def setEditorData(self, editor, index):
-        editor.setValue(int(index.data()))
+        value = str(index.data())
+        editor.setValue(int(value) if value.isdigit() else 8)
 
     def setModelData(self, editor, model, index):
         model.setData(index, str(editor.value()))
@@ -82,8 +112,75 @@ def entries(project):
         )
 
 
+ROLE_PROMPTS = {
+    "Arrow": "正常选择：轻微呼吸或眨眼，指向位置明确，锚点稳定。",
+    "Help": "帮助选择：好奇、询问或思考的小动作，体现帮助含义。",
+    "AppStarting": "后台运行：保持可操作姿态，配合轻微等待动作，区别于完全忙碌。",
+    "Wait": "忙碌等待：连贯的循环等待动作，节奏均匀，首尾衔接。",
+    "Crosshair": "精确选择：围绕固定中心做克制的小动作，精确定位中心不漂移。",
+    "IBeam": "文本选择：构图纤细、竖向，文本插入锚点清晰，不遮住阅读区域。",
+    "NWPen": "手写：做书写或持笔动作，笔尖始终对齐热点。",
+    "No": "不可用：明确的停止或拒绝姿态，动作简洁，不依赖文字。",
+    "SizeNS": "垂直调整：上下方向的对称伸缩动作，中心锚点固定。",
+    "SizeWE": "水平调整：左右方向的对称伸缩动作，中心锚点固定。",
+    "SizeNWSE": "对角调整：体现左上到右下方向，沿该对角线小幅伸展。",
+    "SizeNESW": "对角调整：体现右上到左下方向，沿该对角线小幅伸展。",
+    "SizeAll": "移动：四向搬动或展开姿态，体现可移动含义，中心稳定。",
+    "UpArrow": "候选选择：保持明确朝上的指向性，动作轻巧。",
+    "Hand": "链接选择：轻触或伸手示意可点击，指尖对齐热点。",
+    "Pin": "位置选择：定位或标记地点的动作，定位尖端对齐热点。",
+    "Person": "人员选择：友好的招呼或人物识别姿态，轮廓清晰。",
+}
+TRIGGER_PROMPTS = {
+    "click": "点击瞬间轻压再回弹，完整播放一次。",
+    "idle": "停留时自然呼吸、眨眼或轻微摆动，循环平稳。",
+    "move": "移动时呈现轻微前进姿态，可无缝循环。",
+    "left": "向左移动时朝左轻倾，动作沿左方向，可无缝循环。",
+    "right": "向右移动时朝右轻倾，动作沿右方向，可无缝循环。",
+    "up": "向上移动时向上轻抬或伸展，可无缝循环。",
+    "down": "向下移动时向下轻倾或收拢，可无缝循环。",
+    "left_click": "左键按下时做一次轻触压下及回弹动作。",
+    "right_click": "右键按下时做一次侧向示意或轻敲，区别于左键。",
+    "middle_click": "中键按下时做一次居中的按压与回弹动作。",
+    "double_click": "连续两次短促按压与回弹，双击节奏清楚。",
+    "drag": "按住拖动时做抓握、牵引或用力姿态，循环时锚点稳定。",
+    "release": "松开时由紧绷放松，轻微回弹后自然停稳，播放一次。",
+    "hold": "长按时保持压住或蓄力姿态，以微小动作循环，不反复松开。",
+    "move_start": "从静止过渡到运动，短促起步动作，播放一次。",
+    "move_stop": "从运动减速停稳，小幅缓冲回正，播放一次。",
+    "role_change": "切换指针用途时做一次简短过渡，结尾匹配新用途姿态。",
+}
+
+
+def default_instruction(key, role=None, title=""):
+    reference = "匹配参考图中的角色、服装、配色、材质与画风；不改角色设计。"
+    if key.startswith("effects."):
+        action = {
+            "click": "点击装饰：从出现、扩散到完全消散，只播放一次；末帧透明，不重新出现。",
+            "trail": "拖尾装饰：柔和的小粒子或轨迹，从显现到淡出，边缘透明，不画入鼠标位移。",
+            "companion": "跟随角色：完整身体或参考图对应主体，自然呼吸眨眼，循环连贯，中心稳定。",
+        }[key.split(".")[-1]]
+    elif key.startswith("events."):
+        action = ROLE_PROMPTS.get(role, "") + TRIGGER_PROMPTS[key.split(".")[-1]]
+    elif key.startswith("animations."):
+        action = "根据条件「" + title + "」绘制相应动作，条件持续时稳定保持，动作连贯。"
+    else:
+        action = ROLE_PROMPTS.get(
+            role or key.split(".")[-1], "保持对应指针的用途清晰。"
+        )
+    return action + reference + "主体大小和热点锚点全程一致，完整入格，背景真透明。"
+
+
 def make_brief(
-    project, selected, size, columns, style, extra="", item_instructions=None
+    project,
+    selected,
+    size,
+    columns,
+    style,
+    extra="",
+    item_instructions=None,
+    group_instructions=None,
+    character_name=None,
 ):
     items = []
     for key, path, title, frames, role in entries(project):
@@ -116,7 +213,22 @@ def make_brief(
             dict(
                 id=key,
                 purpose=" / ".join((*path, title)),
-                extra_prompt=(item_instructions or {}).get(key, "").strip(),
+                extra_prompt="\n".join(
+                    filter(
+                        None,
+                        [
+                            *(
+                                (group_instructions or {})
+                                .get("/".join(path[:depth]), "")
+                                .strip()
+                                for depth in range(1, len(path) + 1)
+                            ),
+                            (item_instructions or {})
+                            .get(key, default_instruction(key, role, title))
+                            .strip(),
+                        ],
+                    )
+                ),
                 frame_count=count,
                 cell_px=[size, size],
                 sheet_grid=[cols, rows],
@@ -171,7 +283,7 @@ def make_brief(
     if not items:
         return "请先在左侧勾选需要生成的内容。"
     request = dict(
-        project=project.name,
+        project=character_name or project.name,
         style=style.strip() or "保持同一角色、配色和画风",
         coordinate_origin="每个单帧左上角；x 向右，y 向下；单位像素",
         user_instructions=extra.strip(),
@@ -221,20 +333,21 @@ class PromptPage(QWidget):
         self.columns = QSpinBox()
         self.columns.setRange(1, 16)
         controls.addWidget(self.columns)
+        self.character_button = QPushButton("角色配置 ▾")
+        self.character_button.setCheckable(True)
+        controls.addWidget(self.character_button)
         controls.addStretch()
         self.copy = QPushButton("一键复制")
         controls.addWidget(self.copy)
         layout.addLayout(controls)
         self.style = QLineEdit()
-        self.style.setPlaceholderText("画风、角色、配色或其他生图要求…")
-        style_row = QHBoxLayout()
-        style_row.addWidget(self.style, 1)
-        self.extra_button = QPushButton("共享指令…")
-        self.extra_button.clicked.connect(self.edit_extra)
-        style_row.addWidget(self.extra_button)
-        layout.addLayout(style_row)
-        self.extra = QPlainTextEdit(self)
-        self.extra.hide()
+        self.style.setPlaceholderText("画风、配色、材质…")
+        self.extra = QPlainTextEdit()
+        self.extra.setPlaceholderText("共享指令与额外条例，适用于全部勾选项…")
+        self.character_name = QLineEdit()
+        self.reference_paths = []
+        self.groups = {}
+        self.group_instructions = {}
         split = QSplitter()
         self.tree = QTreeWidget()
         self.tree.setHeaderLabels(["生成内容", "帧数", "额外提示词"])
@@ -269,12 +382,14 @@ class PromptPage(QWidget):
         split.setStretchFactor(1, 2)
         split.setSizes([540, 420])
         layout.addWidget(split, 1)
-        layout.addWidget(QLabel("双击帧数或额外提示词编辑；共享指令用于全部勾选项。"))
+        self.build_character_panel(layout)
+        self.character_button.toggled.connect(self.character_panel.setVisible)
         self.timer = QTimer(self)
         self.timer.setSingleShot(True)
         self.timer.setInterval(150)
         self.timer.timeout.connect(self.regenerate)
         self.tree.itemChanged.connect(self.edited)
+        self.character_name.textChanged.connect(self.edited)
         self.style.textChanged.connect(self.edited)
         self.extra.textChanged.connect(self.extra_changed)
         self.size.valueChanged.connect(self.edited)
@@ -300,6 +415,10 @@ class PromptPage(QWidget):
             selected = config.get("selected", {"slots.Arrow": 1})
             counts = config.get("counts", {})
             self.item_instructions = dict(config.get("item_instructions", {}))
+            self.group_instructions = dict(config.get("group_instructions", {}))
+            self.character_name.setText(config.get("character_name", project.name))
+            self.reference_paths = list(config.get("references", []))
+            self.restore_character_references()
             self.size.setValue(config.get("size", 256))
             self.columns.setValue(config.get("columns", 4))
             self.style.setText(config.get("style", ""))
@@ -307,16 +426,31 @@ class PromptPage(QWidget):
             self.tree.clear()
             self.leaves.clear()
             groups = {}
+            self.groups = groups
             for key, path, title, frames, role in entries(project):
                 parent = None
                 for depth in range(1, len(path) + 1):
                     prefix = path[:depth]
                     if prefix not in groups:
-                        group = QTreeWidgetItem([prefix[-1]])
+                        group_key = "/".join(prefix)
+                        prefix_text = self.group_instructions.get(group_key, "")
+                        group = QTreeWidgetItem(
+                            [prefix[-1], "—", prefix_text.replace("\n", " / ")]
+                        )
+                        for column in (1, 2):
+                            group.setData(
+                                column, Qt.ItemDataRole.UserRole, "@group:" + group_key
+                            )
+                        group.setToolTip(1, "设置本组所有子项的帧数，不改变勾选状态")
+                        group.setToolTip(
+                            2,
+                            prefix_text or "本组子项的公用前缀；保留各条目自己的提示词",
+                        )
                         group.setFlags(
                             group.flags()
                             | Qt.ItemFlag.ItemIsAutoTristate
                             | Qt.ItemFlag.ItemIsUserCheckable
+                            | Qt.ItemFlag.ItemIsEditable
                         )
                         group.setCheckState(0, Qt.CheckState.Unchecked)
                         (
@@ -332,7 +466,9 @@ class PromptPage(QWidget):
                         key, len(frames) or (1 if key.startswith("slots.") else 8)
                     ),
                 )
-                instruction = self.item_instructions.get(key, "")
+                instruction = self.item_instructions.setdefault(
+                    key, default_instruction(key, role, title)
+                )
                 item = QTreeWidgetItem(
                     [title, str(count), instruction.replace("\n", " / ")]
                 )
@@ -360,11 +496,24 @@ class PromptPage(QWidget):
         self.regenerate(save=False)
 
     def edited(self, *args):
-        if not self.loading:
-            self.timer.start()
+        if self.loading:
+            return
+        if len(args) == 2 and isinstance(args[0], QTreeWidgetItem):
+            item, column = args
+            key = item.data(column, Qt.ItemDataRole.UserRole)
+            if (
+                column == 1
+                and key
+                and key.startswith("@group:")
+                and item.text(1).isdigit()
+            ):
+                self.set_group_count(key[7:], int(item.text(1)))
+        self.timer.start()
 
     def regenerate(self, save=True):
         self.timer.stop()
+        self.refresh_group_counts()
+        self.sync_row_backgrounds()
         selected = {
             key: int(item.text(1))
             for key, item in self.leaves.items()
@@ -379,6 +528,8 @@ class PromptPage(QWidget):
                 self.style.text(),
                 self.extra.toPlainText(),
                 self.item_instructions,
+                self.group_instructions,
+                self.character_name.text().strip(),
             )
         )
         self.copy.setEnabled(bool(selected))
@@ -391,6 +542,9 @@ class PromptPage(QWidget):
                 style=self.style.text(),
                 extra=self.extra.toPlainText(),
                 item_instructions=dict(self.item_instructions),
+                group_instructions=dict(self.group_instructions),
+                character_name=self.character_name.text().strip(),
+                references=list(self.reference_paths),
             )
             self.changed()
 
@@ -400,38 +554,10 @@ class PromptPage(QWidget):
         QApplication.clipboard().setText(self.output.toPlainText())
 
     def extra_changed(self):
-        self.extra_button.setText(
-            "共享指令 ✓" if self.extra.toPlainText().strip() else "共享指令…"
-        )
-        self.extra_button.setToolTip(
-            self.extra.toPlainText() or "具体动作、构图、表情、必须保留或禁止的内容"
-        )
         self.edited()
 
     def edit_extra(self):
-        dialog = QDialog(self)
-        dialog.setWindowTitle("AI 生图 · 额外指令")
-        dialog.resize(600, 420)
-        layout = QVBoxLayout(dialog)
-        layout.addWidget(
-            QLabel("追加到复制文本和每个 API 请求；用途、帧数和热点数据仍会保留。")
-        )
-        editor = QPlainTextEdit()
-        editor.setPlaceholderText(
-            "例如：不要箭头；角色向右弹跳三次；保留蓝色头饰；最后一次眨眼。"
-        )
-        editor.setPlainText(self.extra.toPlainText())
-        layout.addWidget(editor, 1)
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Save
-            | QDialogButtonBox.StandardButton.Cancel
-        )
-        buttons.accepted.connect(dialog.accept)
-        buttons.rejected.connect(dialog.reject)
-        layout.addWidget(buttons)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            self.extra.setPlainText(editor.toPlainText())
-            self.regenerate()
+        self.character_button.setChecked(True)
 
     def set_item_instruction(self, key, text):
         text = text.strip()
@@ -456,7 +582,11 @@ class PromptPage(QWidget):
         editor.setPlaceholderText(
             "仅用于这个条目，例如：向右弹跳三次，最后眨眼；不要箭头。"
         )
-        editor.setPlainText(self.item_instructions.get(key, ""))
+        editor.setPlainText(
+            self.group_instructions.get(key[7:], "")
+            if key.startswith("@group:")
+            else self.item_instructions.get(key, "")
+        )
         layout.addWidget(editor, 1)
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Save
@@ -466,7 +596,10 @@ class PromptPage(QWidget):
         buttons.rejected.connect(dialog.reject)
         layout.addWidget(buttons)
         if dialog.exec() == QDialog.DialogCode.Accepted:
-            self.set_item_instruction(key, editor.toPlainText())
+            if key.startswith("@group:"):
+                self.set_group_instruction(key[7:], editor.toPlainText())
+            else:
+                self.set_item_instruction(key, editor.toPlainText())
 
     def generation_tasks(self):
         self.timer.stop()
@@ -483,6 +616,8 @@ class PromptPage(QWidget):
                 self.style.text(),
                 self.extra.toPlainText(),
                 self.item_instructions,
+                self.group_instructions,
+                self.character_name.text().strip(),
             )
             spec = json.loads(prompt[prompt.index("{") :])["items"][0]
             tasks.append(
@@ -493,3 +628,178 @@ class PromptPage(QWidget):
                 )
             )
         return tasks
+
+    def build_character_panel(self, layout):
+        self.character_panel = QFrame()
+        self.character_panel.setObjectName("card")
+        outer = QVBoxLayout(self.character_panel)
+        top = QHBoxLayout()
+        top.addWidget(QLabel("项目名"))
+        self.character_name.setPlaceholderText("例如：鲸鱼娘 · 像素风")
+        top.addWidget(self.character_name, 1)
+        self.character_profiles = QComboBox()
+        self.character_profiles.setMinimumWidth(180)
+        top.addWidget(self.character_profiles)
+        self.save_character = QPushButton("保存角色")
+        self.save_character.clicked.connect(self.save_character_profile)
+        top.addWidget(self.save_character)
+        outer.addLayout(top)
+        body = QHBoxLayout()
+        fields = QVBoxLayout()
+        fields.addWidget(self.style)
+        self.extra.setFixedHeight(80)
+        fields.addWidget(self.extra)
+        body.addLayout(fields, 3)
+        if self.ai is not None:
+            self.ai.sections.setTabText(0, "接口")
+            self.ai.reference_controls.setMaximumHeight(132)
+            self.ai.reference_list.setMinimumHeight(60)
+            body.addWidget(self.ai.reference_controls, 2)
+            self.ai.references_changed.connect(self.character_references_changed)
+        outer.addLayout(body)
+        layout.insertWidget(1, self.character_panel)
+        self.character_panel.hide()
+        self.refresh_character_profiles()
+        self.character_profiles.activated.connect(self.load_character_profile)
+
+    def refresh_character_profiles(self, selected=None):
+        from .characters import profiles
+        import zipfile
+
+        self.character_profiles.blockSignals(True)
+        self.character_profiles.clear()
+        self.character_profiles.addItem("载入已存角色…", None)
+        for path in profiles():
+            try:
+                with zipfile.ZipFile(path) as archive:
+                    name = json.loads(archive.read("project.json"))["name"]
+                self.character_profiles.addItem(name, str(path))
+                if selected and str(path) == str(selected):
+                    self.character_profiles.setCurrentIndex(
+                        self.character_profiles.count() - 1
+                    )
+            except (OSError, ValueError, KeyError, zipfile.BadZipFile):
+                continue
+        self.character_profiles.blockSignals(False)
+
+    def character_references_changed(self):
+        if self.loading or self.ai is None:
+            return
+        from .characters import cache_reference
+
+        self.reference_paths = [cache_reference(raw) for raw in self.ai.references]
+        self.edited()
+
+    def restore_character_references(self):
+        if self.ai is None:
+            return
+        self.ai.references.clear()
+        self.ai.reference_list.clear()
+        valid = []
+        for filename in self.reference_paths[:8]:
+            try:
+                with Image.open(filename) as image:
+                    self.ai.append_reference(image, Path(filename).name)
+                valid.append(filename)
+            except (OSError, ValueError):
+                continue
+        self.reference_paths = valid
+
+    def save_character_profile(self):
+        from .characters import save_profile
+
+        try:
+            self.regenerate()
+            path = save_profile(
+                self.character_name.text(), self.project_getter().settings["ai_prompt"]
+            )
+            self.refresh_character_profiles(path)
+            self.save_character.setToolTip(
+                "角色、参考图、共享指令、分组前缀、选择、帧数和尺寸已保存"
+            )
+        except (OSError, ValueError) as error:
+            QMessageBox.warning(self, "保存角色", str(error))
+
+    def load_character_profile(self, index):
+        from .characters import load_profile
+
+        path = self.character_profiles.itemData(index)
+        if not path:
+            return
+        try:
+            name, config = load_profile(path)
+            config["character_name"] = name
+            self.project_getter().settings["ai_prompt"] = config
+            self.reload()
+            self.regenerate()
+            self.refresh_character_profiles(path)
+        except (OSError, ValueError, KeyError) as error:
+            QMessageBox.warning(self, "载入角色", str(error))
+
+    def group_leaves(self, group):
+        result = []
+        for index in range(group.childCount()):
+            child = group.child(index)
+            if child.childCount():
+                result.extend(self.group_leaves(child))
+            else:
+                result.append(child)
+        return result
+
+    def set_group_count(self, key, count):
+        count = max(1, min(MAX_FRAMES, count))
+        group = next(
+            (item for path, item in self.groups.items() if "/".join(path) == key), None
+        )
+        if group is None:
+            return
+        was_loading = self.loading
+        self.loading = True
+        try:
+            for leaf in self.group_leaves(group):
+                leaf.setText(1, str(count))
+        finally:
+            self.loading = was_loading
+        self.timer.start()
+
+    def refresh_group_counts(self):
+        was_loading = self.loading
+        self.loading = True
+        try:
+            for item in self.groups.values():
+                values = {leaf.text(1) for leaf in self.group_leaves(item)}
+                item.setText(1, next(iter(values)) if len(values) == 1 else "—")
+        finally:
+            self.loading = was_loading
+
+    def set_group_instruction(self, key, text):
+        text = text.strip()
+        if text:
+            self.group_instructions[key] = text
+        else:
+            self.group_instructions.pop(key, None)
+        item = next(
+            (item for path, item in self.groups.items() if "/".join(path) == key), None
+        )
+        if item:
+            item.setText(2, text.replace("\n", " / "))
+            item.setToolTip(2, text)
+        self.regenerate()
+
+    def sync_row_backgrounds(self):
+        was_loading = self.loading
+        self.loading = True
+        try:
+            dark = self.tree.palette().base().color().lightness() < 128
+            enabled = QBrush(QColor("#294D41" if dark else "#E1F0E8"))
+            for item in [*self.leaves.values(), *self.groups.values()]:
+                brush = (
+                    enabled
+                    if item.checkState(0) != Qt.CheckState.Unchecked
+                    else QBrush()
+                )
+                for column in range(3):
+                    if item.background(column) != brush:
+                        item.setBackground(column, brush)
+        finally:
+            self.loading = was_loading

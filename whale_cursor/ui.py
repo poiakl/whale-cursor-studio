@@ -52,6 +52,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QGridLayout,
     QLayout,
+    QStyle,
     QLineEdit,
     QKeySequenceEdit,
     QPlainTextEdit,
@@ -60,7 +61,7 @@ from PySide6.QtWidgets import (
     QColorDialog,
 )
 from .codec import import_images, split_sheet, transform, SIZES
-from .project import Project, SLOTS, EVENTS, EFFECTS, user_dir, event_key
+from .project import Project, SLOTS, EVENTS, EFFECTS, user_dir, event_key, assets_dir
 from .runtime import Engine, Overlay, pixmap
 from .fx import MOTIONS as FX_MOTIONS, EXAMPLE, parse_keyframes
 from . import native
@@ -94,6 +95,12 @@ QCheckBox {spacing:8px;}QCheckBox::indicator {width:16px;height:16px;}
 QScrollArea {background:transparent;border:0;}QStatusBar {background:#EAF1EC;color:#61786A;}
 QToolTip {background:#24413D;color:white;border:0;padding:6px;}
 """
+STYLE += f'''
+QSpinBox::up-button,QDoubleSpinBox::up-button {{subcontrol-origin:border;subcontrol-position:top right;width:18px;height:16px;border-left:1px solid #DCE5DE;}}
+QSpinBox::down-button,QDoubleSpinBox::down-button {{subcontrol-origin:border;subcontrol-position:bottom right;width:18px;height:16px;border-left:1px solid #DCE5DE;}}
+QSpinBox::up-arrow,QDoubleSpinBox::up-arrow {{image:url("{(assets_dir() / "spin-up.svg").as_posix()}");width:10px;height:7px;}}
+QSpinBox::down-arrow,QDoubleSpinBox::down-arrow {{image:url("{(assets_dir() / "spin-down.svg").as_posix()}");width:10px;height:7px;}}
+'''
 FILTER = (
     "图片与指针 (*.png *.gif *.webp *.bmp *.jpg *.jpeg *.cur *.ani *.ico);;所有文件 (*)"
 )
@@ -137,13 +144,25 @@ class ChoiceBox(NoWheel, QComboBox):
     pass
 
 
+_pending_saves = set()
+
+
+def wait_for_saves():
+    for worker in tuple(_pending_saves):
+        worker.wait()
+
+
 class SaveWorker(QThread):
     failed = Signal(str)
 
     def __init__(self, project, path, parent):
-        super().__init__(parent)
+        # An editor can disappear while a background save is encoding PNGs.
+        # Keep the worker alive independently until its atomic save is complete.
+        super().__init__()
         self.project = snapshot(project)
         self.path = path
+        _pending_saves.add(self)
+        self.finished.connect(lambda: _pending_saves.discard(self))
 
     def run(self):
         try:
@@ -410,6 +429,7 @@ class Window(QMainWindow):
             for key, frames in self.project.slots.items()
         }
         self.project._source_slots = self.source_slots
+        self.ensure_import_origins()
         self.group = "slots"
         self.key = "Arrow"
         self.frame_index = 0
@@ -426,6 +446,7 @@ class Window(QMainWindow):
         self.playing = False
 
         self.project.migrate_events()
+        self.ensure_import_origins()
         self.history.limit = max(
             1, min(200, int(self.project.settings.get("history_limit", 30)))
         )
@@ -492,10 +513,11 @@ class Window(QMainWindow):
         if self.save_worker is not None:
             self.save_worker.deleteLater()
         self.save_worker = SaveWorker(self.project, self.autosave_path, self)
-        self.save_worker.failed.connect(
-            lambda message: self.statusBar().showMessage("自动保存失败：" + message)
-        )
+        self.save_worker.failed.connect(self.autosave_failed)
         self.save_worker.start()
+
+    def autosave_failed(self, message):
+        self.statusBar().showMessage("自动保存失败：" + message)
 
     def flush_save(self):
         self.save_timer.stop()
@@ -510,6 +532,7 @@ class Window(QMainWindow):
         self.update_history()
 
     def undo(self):
+        self.finish_image_adjustment()
         self.stop_play()
         record = self.history.undo(self.project, self.selection())
         if record:
@@ -607,31 +630,15 @@ class Window(QMainWindow):
         self.edit_title = label("正常选择", "title")
         bar.addWidget(self.edit_title)
         bar.addStretch()
-        bar.addWidget(
-            self.button("导入图片 / 动画", lambda: self.import_files(False), True)
-        )
-        bar.addWidget(self.button("追加帧", lambda: self.import_files(True)))
-        more = self.button("更多", lambda: None)
-        more.setMenu(self.import_menu())
-        bar.addWidget(more)
+        imports = self.button("导入 ▾", lambda: None, True)
+        imports.setMenu(self.import_menu())
+        bar.addWidget(imports)
+        exports = self.button("导出 ▾", lambda: None)
+        exports.setMenu(self.export_menu())
+        bar.addWidget(exports)
+        bar.addWidget(self.button("还原", self.reset_slot))
+        bar.addWidget(self.button("仅安装", lambda: self.install(True)))
         main.addLayout(bar)
-        history_bar = QHBoxLayout()
-        frame_ops = self.button("帧操作", lambda: None)
-        frame_ops.setMenu(self.frame_menu())
-        history_bar.addWidget(frame_ops)
-        self.undo_button = self.button("撤销", self.undo)
-        self.redo_button = self.button("重做", self.redo)
-        history_bar.addWidget(self.undo_button)
-        history_bar.addWidget(self.redo_button)
-        self.history_label = label("编辑历史 0 / 30", "muted")
-        self.history_label.hide()
-        history_bar.addStretch()
-        history_bar.addWidget(self.button("居中", lambda: self.set_hot(128, 128)))
-        history_bar.addWidget(self.button("应用全帧", self.hot_all))
-        history_bar.addWidget(self.button("还原", self.reset_slot))
-        history_bar.addWidget(self.button("仅安装", lambda: self.install(True)))
-        main.addLayout(history_bar)
-        self.update_history()
         work = QHBoxLayout()
         main.addLayout(work, 1)
         canvas_card, cc = card()
@@ -646,66 +653,37 @@ class Window(QMainWindow):
         cc.addWidget(self.canvas, 1)
         self.canvas.setToolTip("左键设置热点 · 中键拖动画布 · 滚轮缩放 · 方向键微调")
         work.addWidget(canvas_card, 1)
-        props, prop_outer = card()
-        props.setFixedWidth(272)
-        work.addWidget(props)
-        prop_tabs = QTabWidget()
-        prop_tabs.setStyleSheet("QTabBar::tab {padding:6px 12px;}")
-        prop_outer.addWidget(prop_tabs)
+        from .editor_widgets import EditorDrawer
+
+        self.editor_drawer = EditorDrawer(self, canvas_card)
+        self.inspector_tabs = self.editor_drawer.pages
+        image_page = QWidget()
         settings_page = QWidget()
         preview_page = QWidget()
+        self.inspector_tabs.addWidget(image_page)
+        self.inspector_tabs.addWidget(settings_page)
+        self.inspector_tabs.addWidget(preview_page)
+        self.build_image_controls(image_page)
         prop = QVBoxLayout(settings_page)
         pv = QVBoxLayout(preview_page)
-        for inner_layout in (prop, pv):
-            inner_layout.setContentsMargins(0, 6, 0, 0)
-            inner_layout.setSpacing(8)
-        prop_tabs.addTab(settings_page, "参数")
-        prop_tabs.addTab(preview_page, "试用")
-        self.inspector_tabs = prop_tabs
-        hotspot_row = QHBoxLayout()
-        hotspot_row.addWidget(label("点击热点"))
-        hotspot_row.addStretch()
-        hotspot_import = self.button("导入热点…", self.import_hotspots)
-        hotspot_import.setStyleSheet("padding:3px 7px;")
-        hotspot_row.addWidget(hotspot_import)
-        prop.addLayout(hotspot_row)
+        for inner in (prop, pv):
+            inner.setContentsMargins(0, 0, 0, 0)
+            inner.setSpacing(10)
         grid = QGridLayout()
-        grid.setHorizontalSpacing(5)
-        grid.setVerticalSpacing(8)
-        self.hot_x = NumberBox()
-        self.hot_y = NumberBox()
-        for b in (self.hot_x, self.hot_y):
-            b.setRange(0, 255)
-            b.setKeyboardTracking(False)
-            b.setFixedSize(78, 34)
-            b.valueChanged.connect(self.hot_fields)
+        self.hot_x, self.hot_y = NumberBox(), NumberBox()
+        for box in (self.hot_x, self.hot_y):
+            box.setRange(0, 255)
+            box.setFixedWidth(96)
+            box.valueChanged.connect(self.hot_fields)
         grid.addWidget(label("x"), 0, 0)
         grid.addWidget(self.hot_x, 0, 1)
         grid.addWidget(label("y"), 0, 2)
         grid.addWidget(self.hot_y, 0, 3)
-        self.size_combo = ChoiceBox()
-        self.size_combo.addItems([str(v) for v in SIZES])
-        self.size_combo.setCurrentText(str(self.project.size))
-        self.size_combo.setFixedSize(78, 34)
-        self.size_combo.setToolTip(
-            "实际像素尺寸；CUR / ANI 导出与桌面互动使用同一尺寸，屏幕缩放只换算一次。"
-        )
-        self.size_combo.currentTextChanged.connect(self.size_changed)
-        self.duration = NumberBox()
-        self.duration.setRange(17, 60000)
-        self.duration.setKeyboardTracking(False)
-        self.duration.setFixedSize(78, 34)
-        self.duration.setToolTip("毫秒")
-        self.duration.valueChanged.connect(self.duration_changed)
-        grid.addWidget(label("尺寸"), 1, 0)
-        grid.addWidget(self.size_combo, 1, 1)
-        grid.addWidget(label("停留"), 1, 2)
-        grid.addWidget(self.duration, 1, 3)
         prop.addLayout(grid)
-        self.pixel = QCheckBox("像素缩放")
-        self.pixel.setChecked(self.project.pixel)
-        self.pixel.toggled.connect(self.pixel_changed)
-        prop.addWidget(self.pixel)
+        row = QHBoxLayout()
+        row.addWidget(self.button("居中", lambda: self.set_hot(128, 128)))
+        row.addWidget(self.button("应用全帧", self.hot_all))
+        prop.addLayout(row)
         prop.addStretch()
         self.actual = QLabel()
         self.actual.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -714,19 +692,62 @@ class Window(QMainWindow):
         self.preview = Preview()
         pv.addWidget(self.preview)
         pv.addStretch()
+        rail = QVBoxLayout()
+        for index, text in enumerate(("◧\n图像", "⌖\n热点", "◎\n试用")):
+            button = self.button(text, lambda i=index: self.open_editor_tool(i))
+            button.setFixedWidth(52)
+            button.setToolTip(
+                ("实时图像调整与输出尺寸", "点击热点与全帧对齐", "实际尺寸与指针试用")[
+                    index
+                ]
+            )
+            rail.addWidget(button)
+        rail.addStretch()
+        work.addLayout(rail)
+        self.editor_drawer.hidden_callback = self.finish_image_adjustment
+        self.tabs.currentChanged.connect(lambda _: self.editor_drawer.hide())
         frame_card, fc = card()
         fc.setContentsMargins(12, 8, 12, 8)
         fc.setSpacing(6)
         main.addWidget(frame_card)
         frame_top = QHBoxLayout()
-        self.play = self.button("▶ 播放", self.toggle_play)
+        self.play = self.transport_button(
+            "▶", "播放 / 暂停", self.toggle_play, QStyle.StandardPixmap.SP_MediaPlay
+        )
+        for symbol, tip, fn, icon in [
+            (
+                "⏮",
+                "第一帧",
+                lambda: self.step(-self.frame_index),
+                QStyle.StandardPixmap.SP_MediaSkipBackward,
+            ),
+            ("◀", "上一帧", lambda: self.step(-1), QStyle.StandardPixmap.SP_ArrowLeft),
+        ]:
+            frame_top.addWidget(self.transport_button(symbol, tip, fn, icon))
         frame_top.addWidget(self.play)
-        frame_top.addWidget(self.button("上一帧", lambda: self.step(-1)))
-        frame_top.addWidget(self.button("下一帧", lambda: self.step(1)))
-        self.frame_info = label("1 帧", "muted")
-        frame_top.addWidget(self.frame_info)
-        frame_top.addStretch()
-        frame_top.addWidget(self.button("清空", self.clear_slot))
+        frame_top.addWidget(
+            self.transport_button(
+                "▶", "下一帧", lambda: self.step(1), QStyle.StandardPixmap.SP_ArrowRight
+            )
+        )
+        frame_top.addWidget(
+            self.transport_button(
+                "⏭",
+                "最后一帧",
+                lambda: self.step(len(self.frames) - 1 - self.frame_index),
+                QStyle.StandardPixmap.SP_MediaSkipForward,
+            )
+        )
+        self.frame_info = label("", "muted")
+        frame_top.addWidget(self.frame_info, 1)
+        for symbol, tip, fn in [
+            ("⇄", "反转帧顺序", self.reverse_frames),
+            ("↔", "生成往返循环", self.pingpong),
+            ("◷", "统一帧时长", self.uniform_duration),
+            ("×½", "整体调速", self.speed_dialog),
+            ("⌫", "清空当前帧序列", self.clear_slot),
+        ]:
+            frame_top.addWidget(self.transport_button(symbol, tip, fn))
         fc.addLayout(frame_top)
         self.frame_list = FrameList()
         self.frame_list.setSelectionMode(
@@ -744,41 +765,196 @@ class Window(QMainWindow):
         fc.addWidget(self.frame_list)
         self.install_frame_shortcuts()
 
+    def transport_button(self, text, tooltip, fn, icon=None):
+        button = self.button("" if icon else text, fn)
+        if icon:
+            button.setIcon(self.style().standardIcon(icon))
+        button.setToolTip(tooltip)
+        button.setAccessibleName(tooltip)
+        button.setFixedSize(34, 32)
+        button.setStyleSheet("padding:2px;")
+        return button
+
     def import_menu(self):
         menu = QMenu(self)
         for text, fn in [
-            ("批量匹配", self.batch_import),
-            ("精灵图切帧", self.import_sheet),
-            ("导入热点 JSON…", self.import_hotspots),
-            ("图像调整", self.image_tools),
-            ("导出当前 CUR / ANI", lambda: self.export(True)),
-            ("导出整套 CUR / ANI", lambda: self.export(False)),
-            ("检查方案", self.check_project),
-            ("撤销最近修改", self.undo),
+            ("图片 / 动画…", lambda: self.import_files(False)),
+            ("追加帧…", lambda: self.import_files(True)),
+            ("批量匹配…", self.batch_import),
+            ("精灵图切帧…", self.import_sheet),
+            ("热点 JSON…", self.import_hotspots),
+            ("完整方案…", self.import_scheme),
         ]:
             menu.addAction(text, lambda checked=False, f=fn: self.guard(f))
         return menu
 
-    def frame_menu(self):
+    def export_menu(self):
         menu = QMenu(self)
         for text, fn in [
-            ("复制帧", self.copy_frames),
-            ("粘贴帧", self.paste_frames),
-            ("删除帧", self.delete_frame),
-            ("复制并插入", self.duplicate_frame),
-            ("向前移动", lambda: self.move_frame(-1)),
-            ("向后移动", lambda: self.move_frame(1)),
-            ("反转顺序", self.reverse_frames),
-            ("生成往返循环", self.pingpong),
-            ("统一帧时长", self.uniform_duration),
-            ("整体调速", self.speed_dialog),
+            ("当前 CUR / ANI…", lambda: self.export(True)),
+            ("整套 CUR / ANI…", lambda: self.export(False)),
+            ("完整方案…", self.export_scheme),
+            ("检查方案", self.check_project),
         ]:
             menu.addAction(text, lambda checked=False, f=fn: self.guard(f))
         return menu
+
+    def open_editor_tool(self, index):
+        if self.inspector_tabs.currentIndex() == 0 and index != 0:
+            self.finish_image_adjustment()
+        self.editor_drawer.reveal(index)
+
+    def build_image_controls(self, page):
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        row = QHBoxLayout()
+        self.size_combo = ChoiceBox()
+        self.size_combo.addItems([str(v) for v in SIZES])
+        self.size_combo.setCurrentText(str(self.project.size))
+        self.size_combo.currentTextChanged.connect(self.size_changed)
+        row.addWidget(label("尺寸"))
+        self.size_combo.setFixedSize(64, 34)
+        row.addWidget(self.size_combo)
+        row.addWidget(label("停留 ms"))
+        self.duration = NumberBox()
+        self.duration.setRange(17, 60000)
+        self.duration.setFixedSize(102, 34)
+        self.duration.valueChanged.connect(self.duration_changed)
+        row.addWidget(self.duration)
+        layout.addLayout(row)
+        self.pixel = QCheckBox("像素缩放")
+        self.pixel.setChecked(self.project.pixel)
+        self.pixel.toggled.connect(self.pixel_changed)
+        layout.addWidget(self.pixel)
+        self.image_all = QCheckBox("调整当前用途全部帧")
+        self.image_all.setChecked(True)
+        layout.addWidget(self.image_all)
+        row = QHBoxLayout()
+        for symbol, tip, op in (
+            ("↔", "水平镜像", "flip_h"),
+            ("↕", "垂直镜像", "flip_v"),
+            ("↻", "顺时针旋转 90°", "rotate"),
+        ):
+            row.addWidget(
+                self.transport_button(
+                    symbol, tip, lambda name=op: self.apply_image_operation(name)
+                )
+            )
+        layout.addLayout(row)
+        grid = QGridLayout()
+        self.image_fields = {}
+        for i, (key, title, low, high, value) in enumerate(
+            [
+                ("scale", "缩放", 0.1, 4, 1),
+                ("dx", "偏移 x", -255, 255, 0),
+                ("dy", "偏移 y", -255, 255, 0),
+                ("left", "裁剪左", 0, 255, 0),
+                ("top", "裁剪上", 0, 255, 0),
+                ("right", "裁剪右", 1, 256, 256),
+                ("bottom", "裁剪下", 1, 256, 256),
+            ]
+        ):
+            box = DecimalBox() if key == "scale" else NumberBox()
+            box.setRange(low, high)
+            if key == "scale":
+                box.setSingleStep(0.05)
+            box.setValue(value)
+            self.image_fields[key] = box
+            grid.addWidget(label(title), i, 0)
+            grid.addWidget(box, i, 1)
+            box.valueChanged.connect(self.queue_image_adjustment)
+        layout.addLayout(grid)
+        self.image_all.toggled.connect(self.queue_image_adjustment)
+        self.image_error = label("", "muted")
+        layout.addWidget(self.image_error)
+        layout.addStretch()
+        self.image_timer = QTimer(self)
+        self.image_timer.setSingleShot(True)
+        self.image_timer.setInterval(35)
+        self.image_timer.timeout.connect(self.apply_image_adjustment)
+        self._image_source = None
+
+    def queue_image_adjustment(self, *args):
+        if not self.syncing:
+            self.image_timer.start()
+
+    def finish_image_adjustment(self):
+        if not hasattr(self, "image_timer"):
+            return
+        if self.image_timer.isActive():
+            self.image_timer.stop()
+            self.apply_image_adjustment()
+        self._image_source = None
+        for key, box in self.image_fields.items():
+            box.blockSignals(True)
+            box.setValue(
+                1 if key == "scale" else 256 if key in ("right", "bottom") else 0
+            )
+            box.blockSignals(False)
+        self.image_error.clear()
+
+    def apply_image_adjustment(self):
+        if not self.frames:
+            return
+        source = self._image_source or [f.clone() for f in self.frames]
+        values = {key: box.value() for key, box in self.image_fields.items()}
+        if self._image_source is None and all(
+            values[k] == (1 if k == "scale" else 256 if k in ("right", "bottom") else 0)
+            for k in values
+        ):
+            return
+        targets = (
+            set(range(len(source)))
+            if self.image_all.isChecked()
+            else {self.frame_index}
+        )
+        staged = [f.clone() for f in source]
+        try:
+            for index in targets:
+                frame = staged[index]
+                if values["scale"] != 1:
+                    frame = transform(
+                        frame, "scale", factor=values["scale"], pixel=self.project.pixel
+                    )
+                if values["dx"] or values["dy"]:
+                    frame = transform(frame, "offset", dx=values["dx"], dy=values["dy"])
+                box = tuple(values[key] for key in ("left", "top", "right", "bottom"))
+                if box != (0, 0, 256, 256):
+                    frame = transform(frame, "crop", box=box, pixel=self.project.pixel)
+                staged[index] = frame
+        except ValueError as error:
+            self.image_error.setText(str(error))
+            return
+        if self._image_source is None:
+            self.stop_play()
+            self.remember("实时图像调整")
+            self._image_source = source
+        getattr(self.project, self.group)[self.storage_key] = staged
+        self.image_error.clear()
+        self.rebuild_frames()
+        self.touch()
+
+    def apply_image_operation(self, operation):
+        self.finish_image_adjustment()
+        if not self.frames:
+            return
+        targets = (
+            range(len(self.frames))
+            if self.image_all.isChecked()
+            else [self.frame_index]
+        )
+        staged = {i: transform(self.frames[i], operation) for i in targets}
+        self.stop_play()
+        self.remember("图像变换")
+        for index, frame in staged.items():
+            self.frames[index] = frame
+        self.rebuild_frames()
+        self.touch()
 
     def change_group(self, index):
         if self.syncing:
             return
+        self.finish_image_adjustment()
         self.stop_play()
         self.group = ("slots", "events", "effects", "animations")[index]
         self.key = "click" if self.group == "effects" else "Arrow"
@@ -815,6 +991,7 @@ class Window(QMainWindow):
     def select_slot(self, row):
         if self.syncing or row < 0:
             return
+        self.finish_image_adjustment()
         self.stop_play()
         self.key = self.slot_list.item(row).data(Qt.ItemDataRole.UserRole)
         self.frame_index = 0
@@ -836,10 +1013,13 @@ class Window(QMainWindow):
     def select_frame(self, row):
         if self.syncing or row < 0:
             return
+        if row != self.frame_index:
+            self.finish_image_adjustment()
         self.frame_index = row
         self.refresh()
 
     def reorder_frames(self, source, boundary):
+        self.finish_image_adjustment()
         if (
             self.syncing
             or not 0 <= source < len(self.frames)
@@ -913,6 +1093,7 @@ class Window(QMainWindow):
         self.syncing = False
 
     def set_hot(self, x, y):
+        self.finish_image_adjustment()
         if not self.frame or (x, y) == (self.frame.x, self.frame.y):
             return
         if not self._hot_gesture:
@@ -930,6 +1111,7 @@ class Window(QMainWindow):
             self.set_hot(self.hot_x.value(), self.hot_y.value())
 
     def hot_all(self):
+        self.finish_image_adjustment()
         if not self.frame:
             return
         self.remember()
@@ -977,6 +1159,7 @@ class Window(QMainWindow):
             self.load_files(files, append)
 
     def load_files(self, files, append=False):
+        self.finish_image_adjustment()
         if self.group == "animations" and self.key == "__empty":
             raise ValueError("请先在互动页添加动画规则")
         result = []
@@ -991,6 +1174,7 @@ class Window(QMainWindow):
         getattr(self.project, self.group)[self.storage_key] = (
             self.frames + result if append else result
         )
+        self.capture_import()
         self.frame_index = 0
         self.rebuild_slots()
         self.touch()
@@ -1041,8 +1225,21 @@ class Window(QMainWindow):
         for b in (cols, rows):
             b.setRange(1, 512)
         count.setRange(1, 512)
-        cols.setValue(8)
-        count.setValue(8)
+        from . import preferences
+
+        last = preferences.load().get(
+            "sheet_cut", {"columns": 8, "rows": 1, "count": 8}
+        )
+        cols.setValue(last["columns"])
+        rows.setValue(last["rows"])
+        count.setMaximum(min(512, cols.value() * rows.value()))
+        count.setValue(last["count"])
+
+        def capacity_changed():
+            count.setMaximum(min(512, cols.value() * rows.value()))
+
+        cols.valueChanged.connect(capacity_changed)
+        rows.valueChanged.connect(capacity_changed)
         form.addRow("列数", cols)
         form.addRow("行数", rows)
         form.addRow("读取帧数", count)
@@ -1057,24 +1254,52 @@ class Window(QMainWindow):
                 frames = split_sheet(
                     image, cols.value(), rows.value(), count.value(), self.project.pixel
                 )
+            self.finish_image_adjustment()
+            self.stop_play()
             self.remember()
             getattr(self.project, self.group)[self.storage_key] = frames
+            self.capture_import()
+            settings = preferences.load()
+            settings["sheet_cut"] = dict(
+                columns=cols.value(), rows=rows.value(), count=count.value()
+            )
+            preferences.save(settings)
+            self.preferences.update(settings)
             self.frame_index = 0
             self.rebuild_slots()
             self.touch()
 
+    def ensure_import_origins(self):
+        for group in ("slots", "events", "effects", "animations"):
+            for key, frames in getattr(self.project, group).items():
+                self.project.originals.setdefault(
+                    group + "." + key, [f.clone() for f in frames]
+                )
+
+    def capture_import(self, group=None, key=None):
+        group, key = group or self.group, key or self.storage_key
+        self.project.originals[group + "." + key] = [
+            f.clone() for f in getattr(self.project, group).get(key, [])
+        ]
+
     def reset_slot(self):
-        self.remember()
-        if self.group == "slots":
-            self.project.slots[self.key] = [
-                f.clone() for f in self.source_slots.get(self.key, [])
-            ]
-        else:
-            getattr(self.project, self.group).pop(self.storage_key, None)
+        self.finish_image_adjustment()
+        self.stop_play()
+        self.remember("还原导入状态")
+        original = self.project.originals.get(self.group + "." + self.storage_key)
+        if original is None:
+            original = (
+                self.source_slots.get(self.key, []) if self.group == "slots" else []
+            )
+        getattr(self.project, self.group)[self.storage_key] = [
+            f.clone() for f in original
+        ]
+        self.frame_index = 0
         self.rebuild_slots()
         self.touch()
 
     def duplicate_frame(self):
+        self.finish_image_adjustment()
         if not self.frame:
             return
         if len(self.frames) >= 512:
@@ -1086,6 +1311,7 @@ class Window(QMainWindow):
         self.touch()
 
     def delete_frame(self):
+        self.finish_image_adjustment()
         indices = self.selected_frame_indices()
         if not indices:
             return
@@ -1098,6 +1324,7 @@ class Window(QMainWindow):
         self.touch()
 
     def move_frame(self, delta):
+        self.finish_image_adjustment()
         j = self.frame_index + delta
         if not 0 <= j < len(self.frames):
             return
@@ -1111,12 +1338,14 @@ class Window(QMainWindow):
         self.touch()
 
     def reverse_frames(self):
+        self.finish_image_adjustment()
         self.remember()
         self.frames.reverse()
         self.rebuild_frames()
         self.touch()
 
     def pingpong(self):
+        self.finish_image_adjustment()
         if len(self.frames) < 3:
             return
         if 2 * len(self.frames) - 2 > 512:
@@ -1127,6 +1356,7 @@ class Window(QMainWindow):
         self.touch()
 
     def uniform_duration(self):
+        self.finish_image_adjustment()
         if not self.frame:
             return
         value, ok = QInputDialog.getInt(
@@ -1140,6 +1370,7 @@ class Window(QMainWindow):
             self.touch()
 
     def speed_dialog(self):
+        self.finish_image_adjustment()
         rate, ok = QInputDialog.getDouble(
             self, "整体调速", "速度倍数（2 表示两倍速）", 1, 0.1, 10, 2
         )
@@ -1151,17 +1382,23 @@ class Window(QMainWindow):
             self.touch()
 
     def toggle_play(self):
+        self.finish_image_adjustment()
         if self.playing:
             self.stop_play()
         elif self.frames:
             self.playing = True
-            self.play.setText("Ⅱ 暂停")
+            self.play.setIcon(
+                self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPause)
+            )
             self.preview_timer.start(self.frame.duration)
 
     def stop_play(self):
         self.playing = False
         self.preview_timer.stop()
-        self.play.setText("▶ 播放") if hasattr(self, "play") else None
+        if hasattr(self, "play"):
+            self.play.setIcon(
+                self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay)
+            )
 
     def next_frame(self):
         if self.playing and self.frames:
@@ -1171,6 +1408,7 @@ class Window(QMainWindow):
             self.preview_timer.start(self.frame.duration)
 
     def step(self, n):
+        self.finish_image_adjustment()
         self.stop_play()
         if self.frames:
             self.frame_index = (self.frame_index + n) % len(self.frames)
@@ -1178,86 +1416,7 @@ class Window(QMainWindow):
             self.refresh()
 
     def image_tools(self):
-        if not self.frame:
-            return
-        dlg = QDialog(self)
-        dlg.setWindowTitle("图像调整")
-        form = QFormLayout(dlg)
-        op = ChoiceBox()
-        op.addItems(
-            [
-                "水平镜像",
-                "垂直镜像",
-                "顺时针旋转 90°",
-                "偏移 / 增加留白",
-                "缩放图像",
-                "裁剪区域",
-            ]
-        )
-        form.addRow("操作", op)
-        all_frames = QCheckBox("应用到当前用途的所有帧")
-        all_frames.setChecked(True)
-        form.addRow(all_frames)
-        dx = NumberBox()
-        dy = NumberBox()
-        dx.setRange(-255, 255)
-        dy.setRange(-255, 255)
-        form.addRow("水平偏移", dx)
-        form.addRow("垂直偏移", dy)
-        scale = DecimalBox()
-        scale.setRange(0.1, 4)
-        scale.setSingleStep(0.1)
-        scale.setValue(1)
-        form.addRow("缩放比例", scale)
-        crop = []
-        for name, value in [
-            ("裁剪左", 0),
-            ("裁剪上", 0),
-            ("裁剪右", 256),
-            ("裁剪下", 256),
-        ]:
-            b = NumberBox()
-            b.setRange(0, 256)
-            b.setValue(value)
-            crop.append(b)
-            form.addRow(name, b)
-        note = label(
-            "热点随图像一起变换。偏移或裁剪前，请先确认点击位置；移出画布的图像内容会被裁掉。",
-            "muted",
-        )
-        form.addRow(note)
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
-        )
-        buttons.accepted.connect(dlg.accept)
-        buttons.rejected.connect(dlg.reject)
-        form.addRow(buttons)
-        if dlg.exec():
-            name = ["flip_h", "flip_v", "rotate", "offset", "scale", "crop"][
-                op.currentIndex()
-            ]
-            targets = (
-                list(range(len(self.frames)))
-                if all_frames.isChecked()
-                else [self.frame_index]
-            )
-            staged = {
-                i: transform(
-                    self.frames[i],
-                    name,
-                    dx=dx.value(),
-                    dy=dy.value(),
-                    factor=scale.value(),
-                    box=tuple(v.value() for v in crop),
-                    pixel=self.project.pixel,
-                )
-                for i in targets
-            }
-            self.remember()
-            for i, f in staged.items():
-                self.frames[i] = f
-            self.rebuild_frames()
-            self.touch()
+        self.open_editor_tool(0)
 
     def build_interactions(self):
         page = QWidget()
@@ -1620,6 +1779,7 @@ class Window(QMainWindow):
         )
 
     def edit_event(self, role, trigger=None):
+        self.finish_image_adjustment()
         if (
             role in SLOTS
             and role != "Arrow"
@@ -1736,6 +1896,7 @@ class Window(QMainWindow):
         self.refresh_events()
 
     def edit_effect(self, key):
+        self.finish_image_adjustment()
         self.stop_play()
         self.group_box.setCurrentIndex(2)
         self.key = key
@@ -1875,6 +2036,7 @@ class Window(QMainWindow):
             self.scheme_list.addItem(item)
 
     def save_scheme(self):
+        self.finish_image_adjustment()
         dlg = QDialog(self)
         dlg.setWindowTitle("保存完整方案")
         dlg.resize(540, 300)
@@ -1938,6 +2100,7 @@ class Window(QMainWindow):
             self.refresh_schemes()
 
     def export_scheme(self):
+        self.finish_image_adjustment()
         path, _ = QFileDialog.getSaveFileName(
             self,
             "导出完整方案",
@@ -1966,6 +2129,7 @@ class Window(QMainWindow):
             self.refresh_schemes()
 
     def set_project(self, project):
+        self.finish_image_adjustment()
         if not self._history_loading:
             self.remember("切换方案")
         project.migrate_events()
@@ -1973,6 +2137,7 @@ class Window(QMainWindow):
             self.toggle_engine()
         self.stop_play()
         self.project = project
+        self.ensure_import_origins()
         if not self._history_loading:
             self.source_slots = {
                 key: [f.clone() for f in frames]
@@ -2185,7 +2350,7 @@ class Window(QMainWindow):
         a.addWidget(label("关于", "title"))
         a.addWidget(
             label(
-                "鲸鱼娘指针工坊 3.0\n原生 CUR / ANI 安装无需常驻；桌面互动在托盘运行，可随时停止。\n方案与素材保存在当前用户目录；仅点击 AI 发送时上传参考图和提示词，不上传鼠标操作。\n支持 Windows 10 / 11。游戏、远程桌面和部分自绘指针应用可能使用自己的指针。"
+                "鲸鱼娘指针工坊 3.1\n原生 CUR / ANI 安装无需常驻；桌面互动在托盘运行，可随时停止。\n方案与素材保存在当前用户目录；仅点击 AI 发送时上传参考图和提示词，不上传鼠标操作。\n支持 Windows 10 / 11。游戏、远程桌面和部分自绘指针应用可能使用自己的指针。"
             )
         )
         a.addWidget(
@@ -2273,6 +2438,7 @@ class Window(QMainWindow):
         InspectionDialog(rows, self).exec()
 
     def install(self, only):
+        self.finish_image_adjustment()
         if only and self.group != "slots":
             raise ValueError("互动动作请在桌面互动中开启，不能作为单独系统用途安装")
         if self.engine.active:
@@ -2290,6 +2456,7 @@ class Window(QMainWindow):
         self.statusBar().showMessage("已恢复安装前方案，编辑内容仍保留")
 
     def export(self, only):
+        self.finish_image_adjustment()
         folder = QFileDialog.getExistingDirectory(
             self, "选择导出目录（会新建一个文件夹）"
         )
@@ -2355,6 +2522,8 @@ class Window(QMainWindow):
         self.guard(quit_now)
 
     def closeEvent(self, event):
+        self.editor_drawer.hide()
+        self.finish_image_adjustment()
         if self.engine.active and QSystemTrayIcon.isSystemTrayAvailable():
             self.hide()
             event.ignore()
@@ -2382,12 +2551,10 @@ class Window(QMainWindow):
         return (self.group, self.key, self.frame_index, self.trigger)
 
     def update_history(self):
-        if hasattr(self, "undo_button"):
-            self.undo_button.setEnabled(bool(self.history.past))
-            self.redo_button.setEnabled(bool(self.history.future))
-            self.history_label.setText("")
+        pass
 
     def redo(self):
+        self.finish_image_adjustment()
         self.stop_play()
         record = self.history.redo(self.project, self.selection())
         if record:
@@ -2432,12 +2599,14 @@ class Window(QMainWindow):
         self.history.break_group()
 
     def apply_matching(self, mapping):
+        self.finish_image_adjustment()
         if not mapping:
             return
         self.remember("批量匹配")
         for role, frames in mapping.items():
             target = role if self.group == "slots" else event_key(role, self.trigger)
             getattr(self.project, self.group)[target] = [f.clone() for f in frames]
+            self.capture_import(self.group, target)
         self.frame_index = 0
         self.rebuild_slots()
         self.touch()
@@ -2458,6 +2627,7 @@ class Window(QMainWindow):
         menu.exec(self.slot_list.viewport().mapToGlobal(pos))
 
     def clear_slot(self):
+        self.finish_image_adjustment()
         if not self.frames:
             return
         self.stop_play()
@@ -2501,6 +2671,7 @@ class Window(QMainWindow):
         self.statusBar().showMessage("已复制")
 
     def paste_frames(self):
+        self.finish_image_adjustment()
         mime = QApplication.clipboard().mimeData()
         if not mime or not mime.hasFormat("application/x-whale-frames"):
             return
@@ -2564,6 +2735,7 @@ class Window(QMainWindow):
         return SLOTS
 
     def clear_list(self):
+        self.finish_image_adjustment()
         group = getattr(self.project, self.group)
         keys = (
             list(self.role_names)
@@ -2859,6 +3031,7 @@ class Window(QMainWindow):
             )
 
     def edit_condition_animation(self):
+        self.finish_image_adjustment()
         rule = self.selected_condition()
         if not rule:
             return
@@ -2907,6 +3080,7 @@ class Window(QMainWindow):
         self.refresh_conditions()
 
     def clear_non_system(self):
+        self.finish_image_adjustment()
         groups = ("events", "effects", "animations")
         if not any(any(getattr(self.project, g).values()) for g in groups):
             return
@@ -3009,6 +3183,7 @@ class Window(QMainWindow):
         dialog.exec()
 
     def apply_ai_frames(self, project, target, frames):
+        self.finish_image_adjustment()
         if project is not self.project:
             raise ValueError("当前方案已改变，未覆盖。")
         group, key = target.split(".", 1)
@@ -3023,6 +3198,7 @@ class Window(QMainWindow):
             self.toggle_engine()
         self.remember("应用 AI 生图")
         getattr(self.project, group)[key] = frames
+        self.capture_import(group, key)
         self.frame_index = 0
         self.rebuild_slots()
         self.refresh_interaction_views()
@@ -3081,6 +3257,7 @@ class Window(QMainWindow):
             self.apply_hotspot_changes(changes, timing.isChecked())
 
     def apply_hotspot_changes(self, changes, timing=False):
+        self.finish_image_adjustment()
         self.stop_play()
         if self.engine.active:
             self.toggle_engine()
@@ -3090,5 +3267,14 @@ class Window(QMainWindow):
             frame.x, frame.y = change.x, change.y
             if timing and change.duration is not None:
                 frame.duration = change.duration
+            target = change.group + "." + change.key
+            baseline = self.project.originals.setdefault(
+                target,
+                [f.clone() for f in getattr(self.project, change.group)[change.key]],
+            )
+            if change.frame < len(baseline):
+                baseline[change.frame].x, baseline[change.frame].y = change.x, change.y
+                if timing and change.duration is not None:
+                    baseline[change.frame].duration = change.duration
         self.refresh()
         self.touch()

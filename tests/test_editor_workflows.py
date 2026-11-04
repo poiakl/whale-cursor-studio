@@ -119,13 +119,14 @@ def test_batch_interactions_match_selected_trigger(window):
 def test_small_inspector_controls_do_not_overlap(window, app):
     window.resize(1000, 680)
     app.processEvents()
-    # Compare control positions in one common coordinate system, including scrolled content.
-    for first, second in (
-        (window.hot_x, window.hot_y),
-        (window.size_combo, window.duration),
+    for index, first, second in (
+        (1, window.hot_x, window.hot_y),
+        (0, window.size_combo, window.duration),
     ):
-        a = first.mapTo(window, QPoint(0, 0))
-        b = second.mapTo(window, QPoint(0, 0))
+        window.open_editor_tool(index)
+        app.processEvents()
+        a = first.mapTo(window.editor_drawer, QPoint(0, 0))
+        b = second.mapTo(window.editor_drawer, QPoint(0, 0))
         assert a.x() + first.width() <= b.x()
         assert a.y() == b.y()
         assert first.isVisible() and second.isVisible()

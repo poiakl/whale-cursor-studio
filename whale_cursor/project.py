@@ -132,6 +132,7 @@ class Project:
     events: dict[str, list[Frame]] = field(default_factory=dict)
     effects: dict[str, list[Frame]] = field(default_factory=dict)
     animations: dict[str, list[Frame]] = field(default_factory=dict)
+    originals: dict[str, list[Frame]] = field(default_factory=dict)
     settings: dict = field(
         default_factory=lambda: {
             "click_effect": "ripple",
@@ -183,7 +184,7 @@ class Project:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         manifest = {
-            "version": 5,
+            "version": 6,
             "name": self.name,
             "size": self.size,
             "pixel": self.pixel,
@@ -193,11 +194,12 @@ class Project:
             "events": {},
             "effects": {},
             "animations": {},
+            "originals": {},
         }
         temp = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
         try:
             with zipfile.ZipFile(temp, "w", zipfile.ZIP_STORED) as z:
-                for group in ("slots", "events", "effects", "animations"):
+                for group in ("slots", "events", "effects", "animations", "originals"):
                     for key, frames in getattr(self, group).items():
                         records = []
                         if not 0 <= len(frames) <= MAX_FRAMES:
@@ -237,6 +239,9 @@ class Project:
                         embedded[trigger].append("@" + target)
                 settings["sounds"] = embedded
                 settings["sound"] = ""
+                from .characters import embed_references
+
+                embed_references(z, settings)
                 manifest["settings"] = settings
                 z.writestr("project.json", json.dumps(manifest, ensure_ascii=False))
             os.replace(temp, path)
@@ -251,7 +256,7 @@ class Project:
             if z.getinfo("project.json").file_size > 2 * 1024 * 1024:
                 raise ValueError("方案索引过大")
             m = json.loads(z.read("project.json"))
-            if m.get("version") not in (2, 3, 4, 5) or m.get("size") not in SIZES:
+            if m.get("version") not in (2, 3, 4, 5, 6) or m.get("size") not in SIZES:
                 raise ValueError("不支持的方案版本 / 尺寸")
             p = cls()
             p.name = str(m.get("name", "未命名"))[:120]
@@ -291,6 +296,7 @@ class Project:
                 ("events", EVENTS),
                 ("effects", EFFECTS),
                 ("animations", set(m.get("animations", {}))),
+                ("originals", set(m.get("originals", {}))),
             ):
                 for key, records in m.get(group, {}).items():
                     if group == "events":
@@ -303,6 +309,16 @@ class Project:
                         if key not in allowed:
                             continue
                         target = key
+                        if group == "originals":
+                            origin_group, _, origin_key = key.partition(".")
+                            if (
+                                origin_group
+                                not in ("slots", "events", "effects", "animations")
+                                or not origin_key
+                                or len(key) > 150
+                                or not all(c.isalnum() or c in "_.-" for c in key)
+                            ):
+                                raise ValueError("导入原始素材标识无效")
                         if group == "animations" and (
                             len(key) > 100
                             or not key
@@ -350,6 +366,9 @@ class Project:
                         target = dest / (hashlib.sha256(audio).hexdigest() + ".wav")
                         target.write_bytes(audio)
                         files[i] = str(target)
+            from .characters import restore_references
+
+            restore_references(z, p.settings)
             return p
 
     def export(self, folder, only=None):

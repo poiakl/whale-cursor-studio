@@ -7,7 +7,7 @@ import uuid
 import shutil
 from pathlib import Path
 from PIL import Image
-from PySide6.QtCore import Qt, QSize
+from PySide6.QtCore import Qt, QSize, Signal
 from PySide6.QtGui import QIcon, QPainter, QColor
 from PySide6.QtWidgets import (
     QWidget,
@@ -62,6 +62,8 @@ class ImagePreview(QLabel):
 
 
 class GenerationPanel(QWidget):
+    references_changed = Signal()
+
     def __init__(
         self, project_getter, task_getter, apply_frames, frame_getter, parent=None
     ):
@@ -92,6 +94,9 @@ class GenerationPanel(QWidget):
         row.addWidget(self.destination, 1)
         reference_layout.addLayout(row)
         self.update_destination()
+        self.reference_controls = QWidget()
+        reference_controls_layout = QVBoxLayout(self.reference_controls)
+        reference_controls_layout.setContentsMargins(0, 0, 0, 0)
         row = QHBoxLayout()
         self.add_reference = QPushButton("添加参考图…")
         self.add_reference.clicked.connect(self.choose_references)
@@ -102,7 +107,7 @@ class GenerationPanel(QWidget):
         self.remove_reference = QPushButton("移除")
         self.remove_reference.clicked.connect(self.remove_references)
         row.addWidget(self.remove_reference)
-        reference_layout.addLayout(row)
+        reference_controls_layout.addLayout(row)
         self.reference_list = QListWidget()
         self.reference_list.setViewMode(QListWidget.ViewMode.IconMode)
         self.reference_list.setIconSize(QSize(56, 56))
@@ -110,7 +115,8 @@ class GenerationPanel(QWidget):
         self.reference_list.setSelectionMode(
             QAbstractItemView.SelectionMode.ExtendedSelection
         )
-        reference_layout.addWidget(self.reference_list, 1)
+        reference_controls_layout.addWidget(self.reference_list, 1)
+        reference_layout.addWidget(self.reference_controls, 1)
         row = QHBoxLayout()
         self.send = QPushButton("发送选中项给 AI")
         self.send.setObjectName("primary")
@@ -223,6 +229,7 @@ class GenerationPanel(QWidget):
             raise ValueError("参考图合计不能超过 32 MB。")
         self.references.append(raw)
         self.reference_list.addItem(QListWidgetItem(QIcon(pixmap(image)), name))
+        self.references_changed.emit()
 
     def choose_references(self):
         paths, _ = QFileDialog.getOpenFileNames(
@@ -254,6 +261,7 @@ class GenerationPanel(QWidget):
         ):
             self.reference_list.takeItem(index)
             del self.references[index]
+        self.references_changed.emit()
 
     def generate(self):
         if self.queue is not None:

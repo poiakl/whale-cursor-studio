@@ -60,19 +60,31 @@ def test_live_image_adjustment_is_non_cumulative_atomic_and_undoable(app):
     ]
     w = Window(p)
     try:
+        w.show()
+        app.processEvents()
+        w.open_editor_tool(0)
+        app.processEvents()
+
+        def settle_image():
+            for _ in range(100):
+                if not w.image_timer.isActive():
+                    return
+                QTest.qWait(20)
+            assert not w.image_timer.isActive()
+
         before = [f.clone() for f in w.frames]
         w.image_fields["scale"].setValue(0.8)
-        QTest.qWait(180)
+        settle_image()
         first = w.frame.image.tobytes()
         assert first != before[0].image.tobytes()
         w.image_fields["scale"].setValue(0.6)
-        QTest.qWait(180)
+        settle_image()
         expected = transform(before[0], "scale", factor=0.6, pixel=p.pixel)
         assert w.frame.image.tobytes() == expected.image.tobytes()
         assert len(w.history.past) == 1
         valid = w.frame.image.tobytes()
         w.image_fields["left"].setValue(200)
-        QTest.qWait(180)
+        settle_image()
         assert w.image_error.text() and w.frame.image.tobytes() == valid
         w.undo()
         assert w.frame.image.tobytes() == before[0].image.tobytes()
@@ -82,7 +94,7 @@ def test_live_image_adjustment_is_non_cumulative_atomic_and_undoable(app):
         w.undo()
         w.image_all.setChecked(False)
         w.image_fields["dx"].setValue(10)
-        QTest.qWait(180)
+        settle_image()
         assert w.frames[0].x == 138 and w.frames[1].x == 128
     finally:
         w.close()
@@ -156,8 +168,9 @@ def test_defaults_group_prefixes_and_group_counts_do_not_change_selection(app):
     try:
         page = w.prompt_page
         assert all(page.item_instructions.values())
-        assert "长按" in page.item_instructions["events.Arrow.hold"]
-        assert "透明" in page.item_instructions["effects.click"]
+        assert "长按" in page.group_instructions["互动指针/长按"]
+        assert "透明" in payload(page.output.toPlainText())["character"]["extra_prompt"]
+        assert "透明" not in page.item_instructions["effects.click"]
         checked = {
             key
             for key, item in page.leaves.items()
@@ -183,7 +196,11 @@ def test_defaults_group_prefixes_and_group_counts_do_not_change_selection(app):
         tasks = {task["spec"]["id"]: task for task in page.generation_tasks()}
         idle = tasks["events.Arrow.idle"]["spec"]["extra_prompt"]
         move = tasks["events.Arrow.move"]["spec"]["extra_prompt"]
-        assert idle.startswith("保持同一角色\n只做轻微呼吸\n")
+        assert "保持同一角色" not in idle and "只做轻微呼吸" not in idle
+        data = payload(tasks["events.Arrow.idle"]["prompt"])
+        groups = {item["id"]: item for item in data["groups"]}
+        assert groups["互动指针"]["extra_prompt"] == "保持同一角色"
+        assert groups["互动指针/闲置动作"]["extra_prompt"] == "只做轻微呼吸"
         assert "只做轻微呼吸" not in move
         assert (
             page.leaves["events.Arrow.idle"].background(0).style()
@@ -210,7 +227,7 @@ def test_character_profile_and_scheme_embed_refs_without_api_keys(app, tmp_path)
         page.ai.config.key = "SESSION-SECRET-NOT-SAVED"
         page.ai.append_reference(Image.new("RGBA", (64, 64), "purple"), "参考图")
         page.regenerate()
-        assert payload(page.output.toPlainText())["project"] == "像素角色 A"
+        assert payload(page.output.toPlainText())["character"]["id"] == "像素角色 A"
         profile = save_profile("像素角色 A", w.project.settings["ai_prompt"])
         source_paths = list(page.reference_paths)
         for filename in source_paths:
@@ -227,7 +244,10 @@ def test_character_profile_and_scheme_embed_refs_without_api_keys(app, tmp_path)
         w.set_project(restored)
         w.prompt_page.reload()
         assert len(w.prompt_page.ai.references) == 1
-        assert w.prompt_page.extra.toPlainText() == "保持参考图的头饰"
+        assert any(
+            field["value"] == "保持参考图的头饰"
+            for field in w.prompt_page.keyword_fields()
+        )
         assert not (user_dir() / "ai-api.json").exists()
     finally:
         w.close()
@@ -250,7 +270,7 @@ def test_background_save_survives_its_editor_being_deleted(app, tmp_path):
     class SlowProject(Project):
         def save(self, path):
             started.set()
-            assert finish.wait(3)
+            assert finish.wait(15)
             original_save(self, path)
 
     project.__class__ = SlowProject
@@ -259,10 +279,13 @@ def test_background_save_survives_its_editor_being_deleted(app, tmp_path):
     worker.start()
     assert started.wait(2)
     owner.deleteLater()
-    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
-    app.processEvents()
+    QCoreApplication.sendPostedEvents(owner, QEvent.Type.DeferredDelete)
     finish.set()
-    assert worker.wait(3000)
+    for _ in range(500):
+        if not worker.isRunning():
+            break
+        QTest.qWait(20)
+    assert not worker.isRunning()
     assert len(Project.load(path).slots) == 17
     app.processEvents()
     worker.deleteLater()

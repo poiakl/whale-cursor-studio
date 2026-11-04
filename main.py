@@ -40,6 +40,14 @@ def main():
         if window.project.name != "本机原有指针":
             raise RuntimeError("首次打开未读取本机指针")
         window.prompt_page.character_button.setChecked(True)
+        window.prompt_page.add_keyword("portable_probe", "reference-only")
+        import json
+
+        tasks = window.prompt_page.generation_tasks()
+        payload = tasks[0]["prompt"]
+        brief = json.loads(payload[payload.index("{") :])
+        if brief["character"].get("portable_probe") != "reference-only":
+            raise RuntimeError("自定义关键字未写入生图提示词")
         app.processEvents()
         window.close()
         app.processEvents()

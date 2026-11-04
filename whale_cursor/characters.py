@@ -22,8 +22,7 @@ def cache_reference(raw):
     return str(path)
 
 
-def embed_references(archive, settings):
-    config = settings.get("ai_prompt", {})
+def _embed_config(archive, config):
     paths = config.get("references", [])
     if not isinstance(paths, list) or len(paths) > 8:
         raise ValueError("参考图列表无效")
@@ -44,8 +43,7 @@ def embed_references(archive, settings):
         config["references"] = embedded
 
 
-def restore_references(archive, settings):
-    config = settings.get("ai_prompt", {})
+def _restore_config(archive, config):
     paths = config.get("references", [])
     if not isinstance(paths, list) or len(paths) > 8:
         raise ValueError("参考图列表无效")
@@ -64,6 +62,25 @@ def restore_references(archive, settings):
         elif Path(filename).is_file():
             result.append(filename)
     config["references"] = result
+
+
+def reference_configs(settings):
+    yield settings.get("ai_prompt", {})
+    metadata = settings.get("animation_ai_metadata", {})
+    if isinstance(metadata, dict):
+        for config in metadata.values():
+            if isinstance(config, dict):
+                yield config
+
+
+def embed_references(archive, settings):
+    for config in reference_configs(settings):
+        _embed_config(archive, config)
+
+
+def restore_references(archive, settings):
+    for config in reference_configs(settings):
+        _restore_config(archive, config)
 
 
 def profiles():

@@ -133,6 +133,7 @@ class Project:
     effects: dict[str, list[Frame]] = field(default_factory=dict)
     animations: dict[str, list[Frame]] = field(default_factory=dict)
     originals: dict[str, list[Frame]] = field(default_factory=dict)
+    sequence_sources: dict[str, list[Frame]] = field(default_factory=dict)
     settings: dict = field(
         default_factory=lambda: {
             "click_effect": "ripple",
@@ -184,7 +185,7 @@ class Project:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         manifest = {
-            "version": 6,
+            "version": 7,
             "name": self.name,
             "size": self.size,
             "pixel": self.pixel,
@@ -195,11 +196,19 @@ class Project:
             "effects": {},
             "animations": {},
             "originals": {},
+            "sequence_sources": {},
         }
         temp = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
         try:
             with zipfile.ZipFile(temp, "w", zipfile.ZIP_STORED) as z:
-                for group in ("slots", "events", "effects", "animations", "originals"):
+                for group in (
+                    "slots",
+                    "events",
+                    "effects",
+                    "animations",
+                    "originals",
+                    "sequence_sources",
+                ):
                     for key, frames in getattr(self, group).items():
                         records = []
                         if not 0 <= len(frames) <= MAX_FRAMES:
@@ -256,7 +265,7 @@ class Project:
             if z.getinfo("project.json").file_size > 2 * 1024 * 1024:
                 raise ValueError("方案索引过大")
             m = json.loads(z.read("project.json"))
-            if m.get("version") not in (2, 3, 4, 5, 6) or m.get("size") not in SIZES:
+            if m.get("version") not in (2, 3, 4, 5, 6, 7) or m.get("size") not in SIZES:
                 raise ValueError("不支持的方案版本 / 尺寸")
             p = cls()
             p.name = str(m.get("name", "未命名"))[:120]
@@ -297,6 +306,7 @@ class Project:
                 ("effects", EFFECTS),
                 ("animations", set(m.get("animations", {}))),
                 ("originals", set(m.get("originals", {}))),
+                ("sequence_sources", set(m.get("sequence_sources", {}))),
             ):
                 for key, records in m.get(group, {}).items():
                     if group == "events":
@@ -309,7 +319,7 @@ class Project:
                         if key not in allowed:
                             continue
                         target = key
-                        if group == "originals":
+                        if group in ("originals", "sequence_sources"):
                             origin_group, _, origin_key = key.partition(".")
                             if (
                                 origin_group

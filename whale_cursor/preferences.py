@@ -45,6 +45,19 @@ def load():
             result["background"] = QColor(background).name()
         if isinstance(data.get("startup_interaction"), bool):
             result["startup_interaction"] = data["startup_interaction"]
+        if data.get("last_io_action") in (
+            "images",
+            "append",
+            "match",
+            "sheet",
+            "hotspots",
+            "animation_in",
+            "cursor_out",
+            "cursors_out",
+            "animation_out",
+            "inspect",
+        ):
+            result["last_io_action"] = data["last_io_action"]
         cut = data.get("sheet_cut")
         if isinstance(cut, dict) and all(
             type(cut.get(k)) is int and 1 <= cut[k] <= 512

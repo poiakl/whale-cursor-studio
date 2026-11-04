@@ -30,10 +30,19 @@ from PySide6.QtWidgets import (
     QComboBox,
     QMessageBox,
     QStyleOptionViewItem,
+    QScrollArea,
 )
 from .project import SLOTS, EVENTS, EFFECTS
 from .codec import MAX_FRAMES
 from .conditions import describe
+from .prompt_hierarchy import (
+    default_instruction,
+    group_defaults,
+    keywords_dict,
+    STYLE as CHARACTER_STYLE,
+    SHARED,
+    without_inherited,
+)
 
 
 class FrameDelegate(QStyledItemDelegate):
@@ -152,7 +161,7 @@ TRIGGER_PROMPTS = {
 }
 
 
-def default_instruction(key, role=None, title=""):
+def legacy_default_instruction(key, role=None, title=""):
     reference = "匹配参考图中的角色、服装、配色、材质与画风；不改角色设计。"
     if key.startswith("effects."):
         action = {
@@ -181,8 +190,17 @@ def make_brief(
     item_instructions=None,
     group_instructions=None,
     character_name=None,
+    keyword_fields=None,
 ):
     items = []
+    groups = {}
+    common = [
+        style.strip() or CHARACTER_STYLE,
+        SHARED,
+        extra.strip(),
+        *keywords_dict(keyword_fields).values(),
+    ]
+    inherited = dict(group_defaults(), **(group_instructions or {}))
     for key, path, title, frames, role in entries(project):
         if key not in selected:
             continue
@@ -213,21 +231,16 @@ def make_brief(
             dict(
                 id=key,
                 purpose=" / ".join((*path, title)),
-                extra_prompt="\n".join(
-                    filter(
-                        None,
-                        [
-                            *(
-                                (group_instructions or {})
-                                .get("/".join(path[:depth]), "")
-                                .strip()
-                                for depth in range(1, len(path) + 1)
-                            ),
-                            (item_instructions or {})
-                            .get(key, default_instruction(key, role, title))
-                            .strip(),
-                        ],
-                    )
+                parent_id="/".join(path),
+                extra_prompt=without_inherited(
+                    (item_instructions or {})
+                    .get(key, default_instruction(key, role, title))
+                    .strip(),
+                    common
+                    + [
+                        inherited.get("/".join(path[:depth]), "")
+                        for depth in range(1, len(path) + 1)
+                    ],
                 ),
                 frame_count=count,
                 cell_px=[size, size],
@@ -260,6 +273,23 @@ def make_brief(
                 timeline=timeline,
             )
         )
+        for depth in range(1, len(path) + 1):
+            group_id = "/".join(path[:depth])
+            groups.setdefault(
+                group_id,
+                dict(
+                    id=group_id,
+                    parent_id="/".join(path[: depth - 1]) if depth > 1 else "character",
+                    extra_prompt=without_inherited(
+                        inherited.get(group_id, "").strip(),
+                        common
+                        + [
+                            inherited.get("/".join(path[:d]), "")
+                            for d in range(1, depth)
+                        ],
+                    ),
+                ),
+            )
         if decorative:
             settings = project.settings
             effect = key.split(".")[-1]
@@ -283,15 +313,19 @@ def make_brief(
     if not items:
         return "请先在左侧勾选需要生成的内容。"
     request = dict(
-        project=character_name or project.name,
-        style=style.strip() or "保持同一角色、配色和画风",
+        character=dict(
+            id=character_name or project.name,
+            style=style.strip() or CHARACTER_STYLE,
+            extra_prompt="\n".join(filter(None, [SHARED, extra.strip()])),
+            **keywords_dict(keyword_fields),
+        ),
         coordinate_origin="每个单帧左上角；x 向右，y 向下；单位像素",
-        user_instructions=extra.strip(),
+        groups=list(groups.values()),
         items=items,
     )
     return (
         "请为 Windows 鼠标指针与桌面互动制作透明 PNG 动画素材。\n"
-        "user_instructions 是共享要求；extra_prompt 仅作用于所属条目，动作与构图以该条目要求优先。不要把指令文字画进图片。\n"
+        "character 是全局角色要求；groups 通过 parent_id 逐层继承父级，items 继承所属分组。父级要求仅写一次，子项只写自身差异；character 的自定义关键字与 id、extra_prompt 并列，对全部动画生效。不要把指令文字画进图片。\n"
         "每个 items 条目单独生成一张序列图，文件名使用 id；不同用途不要混在同一张图。\n"
         "严格按 sheet_grid 的列数、行数排列，从左到右、从上到下；每格大小为 cell_px，"
         "保留完整画布，不裁边、不留格间距，unused_cells 对应末尾透明空格。\n"
@@ -346,6 +380,7 @@ class PromptPage(QWidget):
         self.extra.setPlaceholderText("共享指令与额外条例，适用于全部勾选项…")
         self.character_name = QLineEdit()
         self.reference_paths = []
+        self.keyword_rows = []
         self.groups = {}
         self.group_instructions = {}
         split = QSplitter()
@@ -415,14 +450,29 @@ class PromptPage(QWidget):
             selected = config.get("selected", {"slots.Arrow": 1})
             counts = config.get("counts", {})
             self.item_instructions = dict(config.get("item_instructions", {}))
-            self.group_instructions = dict(config.get("group_instructions", {}))
+            self.group_instructions = dict(
+                group_defaults(), **config.get("group_instructions", {})
+            )
+            if config.get("prompt_schema", 1) < 2:
+                for key, path, title, frames, role in entries(project):
+                    if self.item_instructions.get(key) == legacy_default_instruction(
+                        key, role, title
+                    ):
+                        self.item_instructions[key] = default_instruction(
+                            key, role, title
+                        )
+            fields = list(config.get("keyword_fields", []))
+            legacy_extra = config.get("extra", "")
+            if legacy_extra:
+                fields.append(dict(key="additional_requirements", value=legacy_extra))
+            self.restore_keyword_rows(fields)
             self.character_name.setText(config.get("character_name", project.name))
             self.reference_paths = list(config.get("references", []))
             self.restore_character_references()
             self.size.setValue(config.get("size", 256))
             self.columns.setValue(config.get("columns", 4))
             self.style.setText(config.get("style", ""))
-            self.extra.setPlainText(config.get("extra", ""))
+            self.extra.setPlainText("")
             self.tree.clear()
             self.leaves.clear()
             groups = {}
@@ -514,6 +564,18 @@ class PromptPage(QWidget):
         self.timer.stop()
         self.refresh_group_counts()
         self.sync_row_backgrounds()
+        try:
+            fields = self.keyword_fields()
+            keywords_dict(fields)
+        except ValueError as error:
+            self.keyword_error.setText(str(error))
+            self.copy.setToolTip(str(error))
+            self.character_button.setToolTip("请检查角色配置：" + str(error))
+            self.copy.setEnabled(False)
+            return False
+        self.keyword_error.clear()
+        self.copy.setToolTip("")
+        self.character_button.setToolTip("")
         selected = {
             key: int(item.text(1))
             for key, item in self.leaves.items()
@@ -530,6 +592,7 @@ class PromptPage(QWidget):
                 self.item_instructions,
                 self.group_instructions,
                 self.character_name.text().strip(),
+                self.keyword_fields(),
             )
         )
         self.copy.setEnabled(bool(selected))
@@ -545,12 +608,16 @@ class PromptPage(QWidget):
                 group_instructions=dict(self.group_instructions),
                 character_name=self.character_name.text().strip(),
                 references=list(self.reference_paths),
+                keyword_fields=fields,
+                prompt_schema=2,
             )
             self.changed()
+        return True
 
     def copy_text(self):
         self.timer.stop()
-        self.regenerate()
+        if not self.regenerate():
+            return
         QApplication.clipboard().setText(self.output.toPlainText())
 
     def extra_changed(self):
@@ -603,7 +670,8 @@ class PromptPage(QWidget):
 
     def generation_tasks(self):
         self.timer.stop()
-        self.regenerate()
+        if not self.regenerate():
+            raise ValueError(self.keyword_error.text())
         tasks = []
         for key, item in self.leaves.items():
             if item.checkState(0) != Qt.CheckState.Checked:
@@ -618,6 +686,7 @@ class PromptPage(QWidget):
                 self.item_instructions,
                 self.group_instructions,
                 self.character_name.text().strip(),
+                self.keyword_fields(),
             )
             spec = json.loads(prompt[prompt.index("{") :])["items"][0]
             tasks.append(
@@ -647,8 +716,24 @@ class PromptPage(QWidget):
         body = QHBoxLayout()
         fields = QVBoxLayout()
         fields.addWidget(self.style)
-        self.extra.setFixedHeight(80)
-        fields.addWidget(self.extra)
+        self.extra.hide()
+        self.keyword_scroll = QScrollArea()
+        self.keyword_scroll.setWidgetResizable(True)
+        self.keyword_scroll.setFixedHeight(92)
+        self.keyword_body = QWidget()
+        self.keyword_layout = QVBoxLayout(self.keyword_body)
+        self.keyword_layout.setContentsMargins(0, 0, 0, 0)
+        self.keyword_layout.setSpacing(4)
+        self.keyword_scroll.setWidget(self.keyword_body)
+        fields.addWidget(self.keyword_scroll)
+        row = QHBoxLayout()
+        add_keyword = QPushButton("添加关键字")
+        add_keyword.clicked.connect(lambda: self.add_keyword())
+        row.addWidget(add_keyword)
+        self.keyword_error = QLabel()
+        self.keyword_error.setWordWrap(True)
+        row.addWidget(self.keyword_error, 1)
+        fields.addLayout(row)
         body.addLayout(fields, 3)
         if self.ai is not None:
             self.ai.sections.setTabText(0, "接口")
@@ -709,7 +794,8 @@ class PromptPage(QWidget):
         from .characters import save_profile
 
         try:
-            self.regenerate()
+            if not self.regenerate():
+                return
             path = save_profile(
                 self.character_name.text(), self.project_getter().settings["ai_prompt"]
             )
@@ -803,3 +889,51 @@ class PromptPage(QWidget):
                         item.setBackground(column, brush)
         finally:
             self.loading = was_loading
+
+    def keyword_fields(self):
+        return [
+            dict(key=key.text(), value=value.text())
+            for widget, key, value in self.keyword_rows
+        ]
+
+    def add_keyword(self, key="", value=""):
+        widget = QWidget()
+        row = QHBoxLayout(widget)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(5)
+        name = QLineEdit(key)
+        name.setPlaceholderText("关键字")
+        name.setFixedWidth(125)
+        content = QLineEdit(value)
+        content.setPlaceholderText("关键字描述")
+        remove = QPushButton("×")
+        remove.setFixedSize(28, 32)
+        remove.setStyleSheet("padding:2px;")
+        remove.setToolTip("删除关键字")
+        row.addWidget(name)
+        row.addWidget(content, 1)
+        row.addWidget(remove)
+        record = (widget, name, content)
+        self.keyword_rows.append(record)
+        self.keyword_layout.addWidget(widget)
+
+        def delete():
+            self.keyword_rows.remove(record)
+            widget.deleteLater()
+            self.edited()
+
+        remove.clicked.connect(delete)
+        name.textChanged.connect(self.edited)
+        content.textChanged.connect(self.edited)
+        if not self.loading:
+            name.setFocus()
+            self.edited()
+        return name, content
+
+    def restore_keyword_rows(self, fields):
+        for widget, key, value in self.keyword_rows:
+            widget.setParent(None)
+            widget.deleteLater()
+        self.keyword_rows.clear()
+        for field in fields:
+            self.add_keyword(str(field.get("key", "")), str(field.get("value", "")))

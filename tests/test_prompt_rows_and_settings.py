@@ -22,7 +22,7 @@ def test_each_prompt_row_has_isolated_instructions_and_persists(app, tmp_path):
         page.extra.setPlainText("全部保持同一个角色")
         page.copy_text()
         copied = data(QApplication.clipboard().text())
-        assert copied["user_instructions"] == "全部保持同一个角色"
+        assert copied["character"]["extra_prompt"].endswith("全部保持同一个角色")
         items = {item["id"]: item for item in copied["items"]}
         assert items["slots.Arrow"]["extra_prompt"] == "眨眼两次\n不要箭头"
         assert items["effects.click"]["extra_prompt"] == "向右弹跳三次"

@@ -6,7 +6,7 @@ import io
 from pathlib import Path
 from PIL import Image
 from .project import Project, user_dir
-from .ai_api import reference_image
+from .references import reference_image
 
 
 def cache_reference(raw):

@@ -575,7 +575,7 @@ class Window(QMainWindow):
         )
         self.tabs.addTab(self.prompt_page, "AI 生图")
         self.tabs.currentChanged.connect(
-            lambda index: self.prompt_page.reload() if index == 4 else None
+            lambda index: self.refresh_prompt_page() if index == 4 else None
         )
         self.tabs.currentChanged.connect(
             lambda index: self.refresh_interaction_views() if index == 1 else None
@@ -637,11 +637,11 @@ class Window(QMainWindow):
         self.last_io_button = self.button("", self.repeat_io)
         bar.addWidget(self.last_io_button)
         self.sync_last_io_button()
-        imports = self.button("导入", lambda: None, True)
-        imports.setMenu(self.import_menu())
+        imports = self.button("导入", lambda: None)
+        self.bind_popup_menu(imports, self.import_menu())
         bar.addWidget(imports)
         exports = self.button("导出", lambda: None)
-        exports.setMenu(self.export_menu())
+        self.bind_popup_menu(exports, self.export_menu())
         bar.addWidget(exports)
         bar.addWidget(self.button("还原", self.reset_slot))
         bar.addWidget(self.button("仅安装", lambda: self.install(True)))
@@ -700,9 +700,12 @@ class Window(QMainWindow):
         pv.addWidget(self.preview)
         pv.addStretch()
         rail = QVBoxLayout()
+        self.editor_tool_buttons = []
         for index, text in enumerate(("◧\n图像", "⌖\n热点", "◎\n试用")):
             button = self.button(text, lambda i=index: self.open_editor_tool(i))
             button.setFixedWidth(52)
+            button.setCheckable(True)
+            self.editor_tool_buttons.append(button)
             button.setToolTip(
                 ("实时图像调整与输出尺寸", "点击热点与全帧对齐", "实际尺寸与指针试用")[
                     index
@@ -711,6 +714,7 @@ class Window(QMainWindow):
             rail.addWidget(button)
         rail.addStretch()
         work.addLayout(rail)
+        self.editor_drawer.active_changed.connect(self.sync_editor_tools)
         self.editor_drawer.hidden_callback = self.finish_image_adjustment
         self.tabs.currentChanged.connect(lambda _: self.editor_drawer.hide())
         frame_card, fc = card()
@@ -886,6 +890,22 @@ class Window(QMainWindow):
         self.rebuild_slots()
         self.refresh_interaction_views()
         self.touch()
+
+    def bind_popup_menu(self, button, menu):
+        button.setMenu(menu)
+        button.setCheckable(True)
+        menu.aboutToShow.connect(lambda: button.setChecked(True))
+        menu.aboutToHide.connect(lambda: button.setChecked(False))
+
+    def sync_editor_tools(self, index):
+        for number, button in enumerate(self.editor_tool_buttons):
+            button.blockSignals(True)
+            button.setChecked(number == index)
+            button.setToolTip(
+                ("图像", "热点", "试用")[number]
+                + (" · 已展开" if number == index else " · 已收起")
+            )
+            button.blockSignals(False)
 
     def open_editor_tool(self, index):
         if self.inspector_tabs.currentIndex() == 0 and index != 0:
@@ -2428,6 +2448,7 @@ class Window(QMainWindow):
         appearance_layout.addWidget(
             label("自启动绑定当前程序路径；移动便携版后需重新设置。", "muted")
         )
+        self.build_mcp_settings(b)
         pane, p = card()
         b.addWidget(pane)
         p.addWidget(label("编辑与输出", "title"))
@@ -2514,7 +2535,7 @@ class Window(QMainWindow):
         a.addWidget(label("关于", "title"))
         a.addWidget(
             label(
-                "鲸鱼娘指针工坊 3.2\n原生 CUR / ANI 安装无需常驻；桌面互动在托盘运行，可随时停止。\n方案与素材保存在当前用户目录；仅点击 AI 发送时上传参考图和提示词，不上传鼠标操作。\n支持 Windows 10 / 11。游戏、远程桌面和部分自绘指针应用可能使用自己的指针。"
+                "鲸鱼娘指针工坊 3.3\n原生 CUR / ANI 安装无需常驻；桌面互动在托盘运行，可随时停止。\n方案与素材保存在当前用户目录；仅点击 AI 发送时上传参考图和提示词，不上传鼠标操作。\n支持 Windows 10 / 11。游戏、远程桌面和部分自绘指针应用可能使用自己的指针。"
             )
         )
         a.addWidget(
@@ -2524,6 +2545,111 @@ class Window(QMainWindow):
             )
         )
         b.addStretch()
+
+    def refresh_prompt_page(self):
+        page = self.prompt_page
+        if page.timer.isActive():
+            page.timer.stop()
+            if not page.regenerate():
+                return
+        page.reload()
+
+    def build_mcp_settings(self, parent_layout):
+        from .mcp_config import workspace
+
+        pane, layout = card()
+        parent_layout.addWidget(pane)
+        layout.addWidget(label("AI 连接 · MCP", "title"))
+        layout.addWidget(
+            label(
+                "连接支持本地 stdio MCP 的 AI 客户端，直接编辑方案、导入素材、调整热点并导出结果。",
+                "muted",
+            )
+        )
+        row = QHBoxLayout()
+        self.mcp_workspace_field = QLineEdit(str(workspace(self.preferences)))
+        self.mcp_workspace_field.setReadOnly(True)
+        row.addWidget(self.mcp_workspace_field, 1)
+        row.addWidget(self.button("选择工作目录", self.choose_mcp_workspace))
+        layout.addLayout(row)
+        row = QHBoxLayout()
+        row.addWidget(self.button("复制连接配置", self.copy_mcp_config, True))
+        row.addWidget(self.button("交给 AI 当前方案", self.prepare_mcp_project))
+        row.addWidget(
+            self.button(
+                "打开工作目录",
+                lambda: QDesktopServices.openUrl(
+                    QUrl.fromLocalFile(str(workspace(self.preferences)))
+                ),
+            )
+        )
+        self.mcp_config_toggle = self.button("查看配置", lambda: None)
+        self.mcp_config_toggle.setCheckable(True)
+        row.addWidget(self.mcp_config_toggle)
+        layout.addLayout(row)
+        self.mcp_config_view = QPlainTextEdit()
+        self.mcp_config_view.setReadOnly(True)
+        self.mcp_config_view.setMaximumHeight(150)
+        self.mcp_config_view.hide()
+        layout.addWidget(self.mcp_config_view)
+        self.mcp_config_toggle.toggled.connect(self.mcp_config_view.setVisible)
+        self.mcp_config_toggle.toggled.connect(
+            lambda checked: self.mcp_config_toggle.setText(
+                "收起配置" if checked else "查看配置"
+            )
+        )
+        self.mcp_status = label(
+            "AI 在工作目录内处理方案副本；在编辑器中打开结果后，可由你预览和安装。",
+            "muted",
+        )
+        layout.addWidget(self.mcp_status)
+        self.refresh_mcp_config()
+
+    def refresh_mcp_config(self):
+        from .mcp_config import workspace, config_text
+
+        self.mcp_workspace_field.setText(str(workspace(self.preferences)))
+        self.mcp_config_view.setPlainText(config_text(self.preferences))
+
+    def choose_mcp_workspace(self):
+        from .mcp_config import workspace
+
+        path = QFileDialog.getExistingDirectory(
+            self, "选择 AI 工作目录", str(workspace(self.preferences))
+        )
+        if path:
+            from . import preferences
+
+            self.preferences["mcp_workspace"] = str(Path(path).resolve())
+            preferences.save(self.preferences)
+            self.refresh_mcp_config()
+
+    def copy_mcp_config(self):
+        self.refresh_mcp_config()
+        QApplication.clipboard().setText(self.mcp_config_view.toPlainText())
+        self.mcp_status.setText(
+            "已复制连接配置；在支持本地 stdio MCP 的 AI 客户端中添加此服务。"
+        )
+
+    def prepare_mcp_project(self):
+        from .mcp_config import workspace
+        import uuid
+
+        self.flush_save()
+        filename = (
+            "当前方案-"
+            + time.strftime("%Y%m%d-%H%M%S")
+            + "-"
+            + uuid.uuid4().hex[:5]
+            + ".whalepack"
+        )
+        destination = workspace(self.preferences) / filename
+        self.project.save(destination)
+        QApplication.clipboard().setText(filename)
+        self.mcp_status.setText(
+            "已准备 " + filename + "；文件名已复制，可让 AI 读取并编辑这份副本。"
+        )
+        return destination
 
     def change_theme(self, name):
         from . import preferences

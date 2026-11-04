@@ -58,6 +58,8 @@ def load():
             "inspect",
         ):
             result["last_io_action"] = data["last_io_action"]
+        if isinstance(data.get("mcp_workspace"), str) and data["mcp_workspace"].strip():
+            result["mcp_workspace"] = data["mcp_workspace"]
         cut = data.get("sheet_cut")
         if isinstance(cut, dict) and all(
             type(cut.get(k)) is int and 1 <= cut[k] <= 512

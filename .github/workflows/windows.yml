@@ -44,6 +44,11 @@ jobs:
           retention-days: 30
       - name: Package portable Windows app
         run: python -m PyInstaller --noconfirm --clean --windowed --onedir --name WhaleCursorStudio --add-data "assets;assets" --collect-all PySide6.QtMultimedia main.py
+      - name: Package local MCP companion
+        run: python -m PyInstaller --noconfirm --clean --console --onefile --name WhaleCursorMCP --add-data "assets;assets" --copy-metadata mcp --collect-submodules mcp.server.fastmcp mcp_entry.py
+      - name: Include MCP companion
+        shell: pwsh
+        run: Copy-Item dist/WhaleCursorMCP.exe dist/WhaleCursorStudio/WhaleCursorMCP.exe
       - name: Launch packaged app and check all pages
         shell: pwsh
         env:
@@ -60,10 +65,17 @@ jobs:
             Get-Content "$env:LOCALAPPDATA/WhaleCursorStudio2/error.log" -ErrorAction SilentlyContinue
             throw "Packaged app launch failed: $($process.ExitCode)"
           }
+      - name: Check packaged MCP protocol
+        shell: pwsh
+        run: |
+          $portableRoot = Join-Path $env:RUNNER_TEMP "便携程序 测试"
+          python tests/mcp_protocol_probe.py --server "$portableRoot/WhaleCursorMCP.exe" --workspace "$env:RUNNER_TEMP/AI 工作目录"
+          if ($LASTEXITCODE -ne 0) { throw "Packaged MCP protocol check failed" }
       - name: Archive portable app
         shell: pwsh
         run: |
           Copy-Item README.md dist/WhaleCursorStudio/使用说明.md
+          Copy-Item docs/mcp.md dist/WhaleCursorStudio/AI接入说明.md
           python -c "from whale_cursor.project import Project; Project.defaults().save('dist/WhaleCursorStudio/Schemes/Whale-Maid.whalepack')"
           if ($LASTEXITCODE -ne 0) { throw "Could not include bundled cursor scheme" }
           Compress-Archive -Path dist/WhaleCursorStudio -DestinationPath WhaleCursorStudio-Windows.zip
@@ -84,5 +96,5 @@ jobs:
           }
           gh api --method PATCH "repos/$env:GITHUB_REPOSITORY/git/refs/tags/desktop-latest" -f "sha=$env:GITHUB_SHA" -F force=true
           if ($LASTEXITCODE -ne 0) { throw "Could not update rolling release source tag" }
-          gh release edit desktop-latest --title "Windows 便携版 · 3.2" --notes "AI 提示词改为角色、分组、子项的继承层级，角色配置支持自定义关键字；导入导出完整命名、复用上次操作、单动画配置包。帧栏使用可逆开关，往返只补一次返回段。完整解压后运行 WhaleCursorStudio.exe。"
+          gh release edit desktop-latest --title "Windows 便携版 · 3.3" --notes "自定义分类以多行输入框整理全局提示词，互动子项承接父级动作，工具面板与菜单有明显选中状态。设置新增本地 stdio MCP 接口，可供支持的 AI 客户端编辑方案、导入素材、调整热点和导出。完整解压后运行 WhaleCursorStudio.exe；MCP 配置从设置中复制。"
           gh release upload desktop-latest WhaleCursorStudio-Windows.zip --clobber

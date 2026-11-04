@@ -3,6 +3,8 @@
 import argparse
 import json
 import os
+import sys
+from contextlib import ExitStack
 from mcp.server.fastmcp import FastMCP, Image
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel
@@ -135,6 +137,24 @@ def create_server(workspace, editor=None, editor_env=None):
     return server
 
 
+def run_stdio(server):
+    # The SDK's UTF-8 wrappers own their underlying buffers. Give them duplicate
+    # descriptors so their cleanup cannot close the interpreter's standard I/O.
+    original = sys.stdin, sys.stdout
+    with ExitStack() as stack:
+        incoming = stack.enter_context(
+            os.fdopen(os.dup(sys.stdin.fileno()), "r", encoding="utf-8")
+        )
+        outgoing = stack.enter_context(
+            os.fdopen(os.dup(sys.stdout.fileno()), "w", encoding="utf-8")
+        )
+        try:
+            sys.stdin, sys.stdout = incoming, outgoing
+            server.run(transport="stdio")
+        finally:
+            sys.stdin, sys.stdout = original
+
+
 def main():
     parser = argparse.ArgumentParser(description="Whale Cursor Studio local stdio MCP")
     parser.add_argument("--workspace", required=True)
@@ -146,4 +166,4 @@ def main():
     # Embedded image/audio extraction also stays inside the chosen workspace.
     editor_env = os.environ.copy()
     os.environ["LOCALAPPDATA"] = str(cache)
-    create_server(work.root, args.editor, editor_env).run(transport="stdio")
+    run_stdio(create_server(work.root, args.editor, editor_env))

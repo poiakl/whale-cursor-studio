@@ -173,3 +173,28 @@ def test_tab_reload_preserves_pending_prompt_category(app):
         w.close()
         w.deleteLater()
         app.processEvents()
+
+
+def test_popup_state_survives_real_button_mouse_release(app):
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    w = Window(Project.defaults())
+    try:
+        w.show()
+        app.processEvents()
+        buttons = [
+            b for b in w.tabs.widget(0).findChildren(type(w.last_io_button)) if b.menu()
+        ]
+        assert len(buttons) == 2
+        for button in buttons:
+            QTest.mouseClick(button, Qt.MouseButton.LeftButton)
+            QTest.qWait(20)
+            assert button.menu().isVisible()
+            assert button.property("menuOpen") is True
+            button.menu().hide()
+            assert button.property("menuOpen") is False
+    finally:
+        w.close()
+        w.deleteLater()
+        app.processEvents()

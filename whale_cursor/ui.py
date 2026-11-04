@@ -79,7 +79,7 @@ QFrame#card,QGroupBox {background:white;border:1px solid #E1E8E2;border-radius:1
 QGroupBox {margin-top:15px;padding:18px;}QGroupBox::title {subcontrol-origin:margin;left:14px;padding:0 5px;}
 QPushButton {background:#FFF;border:1px solid #DCE5DE;border-radius:7px;padding:8px 13px;min-height:18px;}
 QPushButton:hover {background:#EAF4EE;border-color:#A2CDBB;}
-QPushButton:pressed {background:#D5EADD;}QPushButton:disabled {color:#A7B2AB;background:#F5F6F5;}
+QPushButton:pressed {background:#D5EADD;} QPushButton:checked {background:#347D68;color:white;border:2px solid #225A47;}QPushButton:disabled {color:#A7B2AB;background:#F5F6F5;}
 QPushButton#primary {background:#347D68;color:white;border:1px solid #347D68;}QPushButton#primary:hover {background:#276C58;}
 QTabWidget::pane {border:0;}QTabBar::tab {padding:11px 23px;border-bottom:2px solid transparent;color:#7B8C83;}
 QTabBar::tab:selected {color:#286C55;border-bottom:2px solid #347D68;font-weight:600;}
@@ -520,6 +520,10 @@ class Window(QMainWindow):
         self.statusBar().showMessage("自动保存失败：" + message)
 
     def flush_save(self):
+        self.finish_image_adjustment()
+        if hasattr(self, "prompt_page") and self.prompt_page.timer.isActive():
+            self.prompt_page.regenerate()
+        self.stop_play()
         self.save_timer.stop()
         if self.save_worker is not None:
             self.save_worker.wait()
@@ -630,10 +634,13 @@ class Window(QMainWindow):
         self.edit_title = label("正常选择", "title")
         bar.addWidget(self.edit_title)
         bar.addStretch()
-        imports = self.button("导入 ▾", lambda: None, True)
+        self.last_io_button = self.button("", self.repeat_io)
+        bar.addWidget(self.last_io_button)
+        self.sync_last_io_button()
+        imports = self.button("导入", lambda: None, True)
         imports.setMenu(self.import_menu())
         bar.addWidget(imports)
-        exports = self.button("导出 ▾", lambda: None)
+        exports = self.button("导出", lambda: None)
         exports.setMenu(self.export_menu())
         bar.addWidget(exports)
         bar.addWidget(self.button("还原", self.reset_slot))
@@ -740,14 +747,21 @@ class Window(QMainWindow):
         )
         self.frame_info = label("", "muted")
         frame_top.addWidget(self.frame_info, 1)
-        for symbol, tip, fn in [
-            ("⇄", "反转帧顺序", self.reverse_frames),
-            ("↔", "生成往返循环", self.pingpong),
-            ("◷", "统一帧时长", self.uniform_duration),
-            ("×½", "整体调速", self.speed_dialog),
-            ("⌫", "清空当前帧序列", self.clear_slot),
+        self.sequence_buttons = {}
+        for key, symbol, tip, fn in [
+            ("reverse", "⇄", "反转帧顺序", self.reverse_frames),
+            ("pingpong", "↔", "往返播放（只追加一次）", self.pingpong),
+            ("uniform_ms", "◷", "统一帧时长", self.uniform_duration),
+            ("speed", "×½", "整体调速", self.speed_dialog),
         ]:
-            frame_top.addWidget(self.transport_button(symbol, tip, fn))
+            button = self.transport_button(symbol, tip, fn)
+            button.setCheckable(True)
+            button.setProperty("baseTip", tip)
+            self.sequence_buttons[key] = button
+            frame_top.addWidget(button)
+        frame_top.addWidget(
+            self.transport_button("⌫", "清空当前帧序列", self.clear_slot)
+        )
         fc.addLayout(frame_top)
         self.frame_list = FrameList()
         self.frame_list.setSelectionMode(
@@ -775,29 +789,103 @@ class Window(QMainWindow):
         button.setStyleSheet("padding:2px;")
         return button
 
-    def import_menu(self):
+    def io_actions(self):
+        return {
+            "images": ("导入图片及动画", lambda: self.import_files(False)),
+            "append": ("追加动画帧", lambda: self.import_files(True)),
+            "match": ("导入并批量匹配", self.batch_import),
+            "sheet": ("导入精灵图并切帧", self.import_sheet),
+            "hotspots": ("导入热点", self.import_hotspots),
+            "animation_in": ("导入动画及配置", self.import_animation),
+            "cursor_out": ("导出当前指针 CUR / ANI", lambda: self.export(True)),
+            "cursors_out": ("导出整套指针 CUR / ANI", lambda: self.export(False)),
+            "animation_out": ("导出当前动画", self.export_animation),
+            "inspect": ("检查方案", self.check_project),
+        }
+
+    def io_menu(self, keys):
         menu = QMenu(self)
-        for text, fn in [
-            ("图片 / 动画…", lambda: self.import_files(False)),
-            ("追加帧…", lambda: self.import_files(True)),
-            ("批量匹配…", self.batch_import),
-            ("精灵图切帧…", self.import_sheet),
-            ("热点 JSON…", self.import_hotspots),
-            ("完整方案…", self.import_scheme),
-        ]:
-            menu.addAction(text, lambda checked=False, f=fn: self.guard(f))
+        for key in keys:
+            title = self.io_actions()[key][0]
+            menu.addAction(
+                title, lambda checked=False, action=key: self.run_io_action(action)
+            )
         return menu
 
+    def import_menu(self):
+        return self.io_menu(
+            ("images", "append", "match", "sheet", "hotspots", "animation_in")
+        )
+
     def export_menu(self):
-        menu = QMenu(self)
-        for text, fn in [
-            ("当前 CUR / ANI…", lambda: self.export(True)),
-            ("整套 CUR / ANI…", lambda: self.export(False)),
-            ("完整方案…", self.export_scheme),
-            ("检查方案", self.check_project),
-        ]:
-            menu.addAction(text, lambda checked=False, f=fn: self.guard(f))
-        return menu
+        return self.io_menu(("cursor_out", "cursors_out", "animation_out", "inspect"))
+
+    def sync_last_io_button(self):
+        key = self.preferences.get("last_io_action", "images")
+        title = self.io_actions().get(key, self.io_actions()["images"])[0]
+        self.last_io_button.setText(title)
+        self.last_io_button.setToolTip("重复上一次功能：" + title)
+
+    def repeat_io(self):
+        self.run_io_action(self.preferences.get("last_io_action", "images"))
+
+    def run_io_action(self, key):
+        from . import preferences
+
+        if key not in self.io_actions():
+            key = "images"
+        self.preferences["last_io_action"] = key
+        preferences.save(self.preferences)
+        self.sync_last_io_button()
+        self.guard(self.io_actions()[key][1])
+
+    def export_animation(self):
+        from .animation_package import extract
+
+        self.finish_image_adjustment()
+        target = self.group + "." + self.storage_key
+        clip = extract(self.project, target)
+        filename, _ = QFileDialog.getSaveFileName(
+            self,
+            "导出当前动画",
+            target.replace(".", "_") + ".whaleanim",
+            "单动画及配置 (*.whaleanim)",
+        )
+        if filename:
+            if not Path(filename).suffix:
+                filename += ".whaleanim"
+            clip.save(filename)
+            self.statusBar().showMessage("已导出当前动画：" + filename)
+
+    def import_animation(self):
+        from .animation_package import merge
+
+        filename, _ = QFileDialog.getOpenFileName(
+            self, "导入动画及配置", "", "单动画及配置 (*.whaleanim)"
+        )
+        if not filename:
+            return
+        self.finish_image_adjustment()
+        target = self.group + "." + self.storage_key
+        if self.storage_key == "__empty":
+            raise ValueError("请先添加条件动画")
+        clip = Project.load(filename)
+        # Validate the complete merge on a snapshot before changing the editor.
+        staged = snapshot(self.project)
+        merge(staged, clip, target)
+        self.stop_play()
+        if self.engine.active:
+            self.toggle_engine()
+        self.remember("导入当前动画")
+        self.project = staged
+        self.syncing = True
+        self.size_combo.setCurrentText(str(staged.size))
+        self.pixel.setChecked(staged.pixel)
+        self.syncing = False
+        self.frame_index = 0
+        self.rebuild_slots()
+        self.refresh_interaction_views()
+        self.touch()
 
     def open_editor_tool(self, index):
         if self.inspector_tabs.currentIndex() == 0 and index != 0:
@@ -928,6 +1016,7 @@ class Window(QMainWindow):
         if self._image_source is None:
             self.stop_play()
             self.remember("实时图像调整")
+            self.commit_frame_controls()
             self._image_source = source
         getattr(self.project, self.group)[self.storage_key] = staged
         self.image_error.clear()
@@ -946,6 +1035,7 @@ class Window(QMainWindow):
         staged = {i: transform(self.frames[i], operation) for i in targets}
         self.stop_play()
         self.remember("图像变换")
+        self.commit_frame_controls()
         for index, frame in staged.items():
             self.frames[index] = frame
         self.rebuild_frames()
@@ -1032,12 +1122,14 @@ class Window(QMainWindow):
             return
         self.stop_play()
         self.remember("插入排序")
+        self.commit_frame_controls()
         self.frames.insert(target, self.frames.pop(source))
         self.frame_index = target
         self.touch()
         QTimer.singleShot(0, self.rebuild_frames)
 
     def refresh(self):
+        self.sync_sequence_buttons()
         self.syncing = True
         f = self.frame
         self.canvas.frame = f
@@ -1101,6 +1193,7 @@ class Window(QMainWindow):
                 "热点位置",
                 token=("hot", self.group, self.storage_key, self.frame_index),
             )
+            self.commit_frame_controls()
         self.frame.x = x
         self.frame.y = y
         self.refresh()
@@ -1115,6 +1208,7 @@ class Window(QMainWindow):
         if not self.frame:
             return
         self.remember()
+        self.commit_frame_controls()
         x, y = self.frame.x, self.frame.y
         for f in self.frames:
             f.x = x
@@ -1128,6 +1222,7 @@ class Window(QMainWindow):
                 "帧时长",
                 token=("duration", self.group, self.storage_key, self.frame_index),
             )
+            self.commit_frame_controls()
             self.frame.duration = value
             self.touch()
             item = self.frame_list.item(self.frame_index)
@@ -1171,6 +1266,7 @@ class Window(QMainWindow):
             return
         self.stop_play()
         self.remember()
+        self.commit_frame_controls()
         getattr(self.project, self.group)[self.storage_key] = (
             self.frames + result if append else result
         )
@@ -1257,6 +1353,7 @@ class Window(QMainWindow):
             self.finish_image_adjustment()
             self.stop_play()
             self.remember()
+            self.commit_frame_controls()
             getattr(self.project, self.group)[self.storage_key] = frames
             self.capture_import()
             settings = preferences.load()
@@ -1278,6 +1375,7 @@ class Window(QMainWindow):
 
     def capture_import(self, group=None, key=None):
         group, key = group or self.group, key or self.storage_key
+        self.commit_frame_controls(group, key)
         self.project.originals[group + "." + key] = [
             f.clone() for f in getattr(self.project, group).get(key, [])
         ]
@@ -1286,6 +1384,7 @@ class Window(QMainWindow):
         self.finish_image_adjustment()
         self.stop_play()
         self.remember("还原导入状态")
+        self.commit_frame_controls()
         original = self.project.originals.get(self.group + "." + self.storage_key)
         if original is None:
             original = (
@@ -1305,6 +1404,7 @@ class Window(QMainWindow):
         if len(self.frames) >= 512:
             raise ValueError("最多 512 帧")
         self.remember()
+        self.commit_frame_controls()
         self.frames.insert(self.frame_index + 1, self.frame.clone())
         self.frame_index += 1
         self.rebuild_frames()
@@ -1317,6 +1417,7 @@ class Window(QMainWindow):
             return
         self.stop_play()
         self.remember("删除帧")
+        self.commit_frame_controls()
         for index in reversed(indices):
             self.frames.pop(index)
         self.frame_index = min(indices)
@@ -1329,6 +1430,7 @@ class Window(QMainWindow):
         if not 0 <= j < len(self.frames):
             return
         self.remember()
+        self.commit_frame_controls()
         self.frames[self.frame_index], self.frames[j] = (
             self.frames[j],
             self.frames[self.frame_index],
@@ -1337,49 +1439,111 @@ class Window(QMainWindow):
         self.rebuild_frames()
         self.touch()
 
-    def reverse_frames(self):
+    def change_sequence_control(self, key, value):
+        from .sequence_controls import set_option, state, render
+
         self.finish_image_adjustment()
-        self.remember()
-        self.frames.reverse()
-        self.rebuild_frames()
+        self.stop_play()
+        target = self.group + "." + self.storage_key
+        options = state(self.project, target)
+        options[key] = value
+        source = self.project.sequence_sources.get(target, self.frames)
+        if not source:
+            self.sync_sequence_buttons()
+            return
+        try:
+            prepared = render(source, options)
+        except ValueError:
+            self.sync_sequence_buttons()
+            raise
+        self.remember("帧控制开关")
+        set_option(self.project, target, key, value, prepared=prepared)
+        self.frame_index = min(self.frame_index, len(self.frames) - 1)
+        self.rebuild_slots()
         self.touch()
+
+    def sync_sequence_buttons(self):
+        from .sequence_controls import state
+
+        options = state(self.project, self.group + "." + self.storage_key)
+        for key, button in self.sequence_buttons.items():
+            value = options[key]
+            active = value is not None and value is not False
+            button.blockSignals(True)
+            button.setChecked(active)
+            button.setEnabled(bool(self.frames))
+            button.setToolTip(
+                button.property("baseTip")
+                + (" · 已开启" if active else " · 已关闭")
+                + (
+                    f" · {value} ms"
+                    if active and key == "uniform_ms"
+                    else f" · {value} 倍"
+                    if active and key == "speed"
+                    else ""
+                )
+            )
+            button.setAccessibleName(button.toolTip())
+            button.blockSignals(False)
+
+    def commit_frame_controls(self, group=None, key=None):
+        from .sequence_controls import commit
+
+        commit(self.project, (group or self.group) + "." + (key or self.storage_key))
+        if hasattr(self, "sequence_buttons"):
+            self.sync_sequence_buttons()
+
+    def reverse_frames(self):
+        from .sequence_controls import state
+
+        self.change_sequence_control(
+            "reverse",
+            not state(self.project, self.group + "." + self.storage_key)["reverse"],
+        )
 
     def pingpong(self):
-        self.finish_image_adjustment()
-        if len(self.frames) < 3:
-            return
-        if 2 * len(self.frames) - 2 > 512:
-            raise ValueError("往返后超过 512 帧")
-        self.remember()
-        self.frames.extend(f.clone() for f in self.frames[-2:0:-1])
-        self.rebuild_frames()
-        self.touch()
+        from .sequence_controls import state
+
+        self.change_sequence_control(
+            "pingpong",
+            not state(self.project, self.group + "." + self.storage_key)["pingpong"],
+        )
 
     def uniform_duration(self):
-        self.finish_image_adjustment()
+        from .sequence_controls import state
+
+        if (
+            state(self.project, self.group + "." + self.storage_key)["uniform_ms"]
+            is not None
+        ):
+            self.change_sequence_control("uniform_ms", None)
+            return
         if not self.frame:
             return
         value, ok = QInputDialog.getInt(
             self, "统一帧时长", "每帧停留（毫秒）", self.frame.duration, 17, 60000
         )
         if ok:
-            self.remember()
-            for f in self.frames:
-                f.duration = value
-            self.rebuild_frames()
-            self.touch()
+            self.change_sequence_control("uniform_ms", value)
+        else:
+            self.sync_sequence_buttons()
 
     def speed_dialog(self):
-        self.finish_image_adjustment()
-        rate, ok = QInputDialog.getDouble(
-            self, "整体调速", "速度倍数（2 表示两倍速）", 1, 0.1, 10, 2
-        )
+        from .sequence_controls import state
+
+        if (
+            state(self.project, self.group + "." + self.storage_key)["speed"]
+            is not None
+        ):
+            self.change_sequence_control("speed", None)
+            return
+        if not self.frames:
+            return
+        rate, ok = QInputDialog.getDouble(self, "整体调速", "速度倍数", 1, 0.1, 10, 2)
         if ok:
-            self.remember()
-            for f in self.frames:
-                f.duration = max(17, min(60000, round(f.duration / rate)))
-            self.rebuild_frames()
-            self.touch()
+            self.change_sequence_control("speed", rate)
+        else:
+            self.sync_sequence_buttons()
 
     def toggle_play(self):
         self.finish_image_adjustment()
@@ -2350,7 +2514,7 @@ class Window(QMainWindow):
         a.addWidget(label("关于", "title"))
         a.addWidget(
             label(
-                "鲸鱼娘指针工坊 3.1\n原生 CUR / ANI 安装无需常驻；桌面互动在托盘运行，可随时停止。\n方案与素材保存在当前用户目录；仅点击 AI 发送时上传参考图和提示词，不上传鼠标操作。\n支持 Windows 10 / 11。游戏、远程桌面和部分自绘指针应用可能使用自己的指针。"
+                "鲸鱼娘指针工坊 3.2\n原生 CUR / ANI 安装无需常驻；桌面互动在托盘运行，可随时停止。\n方案与素材保存在当前用户目录；仅点击 AI 发送时上传参考图和提示词，不上传鼠标操作。\n支持 Windows 10 / 11。游戏、远程桌面和部分自绘指针应用可能使用自己的指针。"
             )
         )
         a.addWidget(
@@ -2603,6 +2767,7 @@ class Window(QMainWindow):
         if not mapping:
             return
         self.remember("批量匹配")
+        self.commit_frame_controls()
         for role, frames in mapping.items():
             target = role if self.group == "slots" else event_key(role, self.trigger)
             getattr(self.project, self.group)[target] = [f.clone() for f in frames]
@@ -2632,6 +2797,7 @@ class Window(QMainWindow):
             return
         self.stop_play()
         self.remember("删除素材")
+        self.commit_frame_controls()
         getattr(self.project, self.group)[self.storage_key] = []
         self.frame_index = 0
         self.rebuild_slots()
@@ -2680,6 +2846,7 @@ class Window(QMainWindow):
             raise ValueError("粘贴后超过 512 帧")
         self.stop_play()
         self.remember("粘贴帧")
+        self.commit_frame_controls()
         index = self.frame_index + 1 if self.frames else 0
         target = getattr(self.project, self.group).setdefault(self.storage_key, [])
         target[index:index] = frames
@@ -2749,7 +2916,9 @@ class Window(QMainWindow):
             return
         self.stop_play()
         self.remember("清空列表")
+        self.commit_frame_controls()
         for k in keys:
+            self.commit_frame_controls(self.group, k)
             group[k] = []
         self.frame_index = 0
         self.rebuild_slots()
@@ -3097,7 +3266,10 @@ class Window(QMainWindow):
         if self.engine.active:
             self.toggle_engine()
         self.remember("清空非系统动画")
+        self.commit_frame_controls()
         for group in groups:
+            for key in tuple(getattr(self.project, group)):
+                self.commit_frame_controls(group, key)
             getattr(self.project, group).clear()
         self.frame_index = 0
         self.rebuild_slots()
@@ -3197,6 +3369,7 @@ class Window(QMainWindow):
         if self.engine.active:
             self.toggle_engine()
         self.remember("应用 AI 生图")
+        self.commit_frame_controls()
         getattr(self.project, group)[key] = frames
         self.capture_import(group, key)
         self.frame_index = 0
@@ -3262,7 +3435,9 @@ class Window(QMainWindow):
         if self.engine.active:
             self.toggle_engine()
         self.remember("导入热点 JSON")
+        self.commit_frame_controls()
         for change in changes:
+            self.commit_frame_controls(change.group, change.key)
             frame = getattr(self.project, change.group)[change.key][change.frame]
             frame.x, frame.y = change.x, change.y
             if timing and change.duration is not None:

@@ -84,5 +84,5 @@ jobs:
           }
           gh api --method PATCH "repos/$env:GITHUB_REPOSITORY/git/refs/tags/desktop-latest" -f "sha=$env:GITHUB_SHA" -F force=true
           if ($LASTEXITCODE -ne 0) { throw "Could not update rolling release source tag" }
-          gh release edit desktop-latest --title "Windows 便携版 · 3.1" --notes "重排制作页导入导出与时间轴，新增图像、热点、试用侧面板和实时图像调整；记忆精灵图裁切，保存导入原始状态。AI 支持角色配置、嵌入参考图、默认逐项提示词及父项帧数与前缀。完整解压后运行 WhaleCursorStudio.exe。"
+          gh release edit desktop-latest --title "Windows 便携版 · 3.2" --notes "AI 提示词改为角色、分组、子项的继承层级，角色配置支持自定义关键字；导入导出完整命名、复用上次操作、单动画配置包。帧栏使用可逆开关，往返只补一次返回段。完整解压后运行 WhaleCursorStudio.exe。"
           gh release upload desktop-latest WhaleCursorStudio-Windows.zip --clobber

@@ -28,7 +28,7 @@ def test_mixed_brief_counts_hotspots_and_sheet_geometry():
         "像素鲸鱼",
     )
     data = payload(brief)
-    assert data["style"] == "像素鲸鱼"
+    assert data["character"]["style"] == "像素鲸鱼"
     a, idle, click = data["items"]
     assert a["frame_count"] == 1
     assert idle["frame_count"] == 7 and idle["sheet_px"] == [2048, 1024]
@@ -109,15 +109,18 @@ def test_extra_user_instructions_are_copied_sent_and_saved(app, tmp_path):
         page.extra.setPlainText(text)
         page.copy_text()
         copied = payload(QApplication.clipboard().text())
-        assert copied["user_instructions"] == text
+        assert copied["character"]["extra_prompt"].endswith(text)
         tasks = page.generation_tasks()
-        assert all(payload(t["prompt"])["user_instructions"] == text for t in tasks)
+        assert all(
+            payload(t["prompt"])["character"]["extra_prompt"].endswith(text)
+            for t in tasks
+        )
         saved = tmp_path / "instructions.whalepack"
         w.project.save(saved)
         restored = Project.load(saved)
         assert restored.settings["ai_prompt"]["extra"] == text
         page.reload()
-        assert page.extra.toPlainText() == text
+        assert any(field["value"] == text for field in page.keyword_fields())
     finally:
         w.save_timer.stop()
         w.close()

@@ -46,37 +46,36 @@ def test_prompt_layers_are_referenced_once_and_leaf_is_specific():
     assert all("匹配参考图" not in item["extra_prompt"] for item in data["items"])
 
 
-def test_keywords_are_sibling_fields_saved_and_checked_before_api(app, tmp_path):
+def test_prompt_categories_are_global_prose_saved_and_validated(app, tmp_path):
     w = Window(Project.defaults())
     try:
         page = w.prompt_page
         key, value = page.add_keyword()
-        assert (
-            key.placeholderText() == "关键字"
-            and value.placeholderText() == "关键字描述"
-        )
-        key.setText("hair_color")
-        value.setText("深蓝色")
+        assert "分类名称" in key.placeholderText()
+        key.setText("衣服")
+        value.setPlainText("深蓝色长裙")
         page.copy_text()
         data = payload(page.output.toPlainText())
-        assert data["character"]["hair_color"] == "深蓝色"
-        assert "id" in data["character"] and "extra_prompt" in data["character"]
-        assert all("hair_color" not in item for item in data["items"])
+        assert "衣服" not in data["character"]
+        assert "【衣服】深蓝色长裙" in data["character"]["extra_prompt"]
+        assert all("衣服" not in item for item in data["items"])
         filename = tmp_path / "keywords.whalepack"
         w.project.save(filename)
         w.set_project(Project.load(filename))
         page.reload()
-        assert page.keyword_fields() == [{"key": "hair_color", "value": "深蓝色"}]
-        other, _ = page.add_keyword("hair_color", "重复")
-        assert page.regenerate() is False and not page.copy.isEnabled()
-        try:
-            page.generation_tasks()
-        except ValueError as error:
-            assert "重复" in str(error)
-        else:
-            raise AssertionError("Invalid keywords must not produce API tasks")
+        assert page.keyword_fields() == [{"key": "衣服", "value": "深蓝色长裙"}]
+        other, _ = page.add_keyword("衣服", "不同面料")
+        assert page.regenerate()
         other.setText("id")
-        assert page.regenerate() is False and "重名" in page.keyword_error.text()
+        assert page.regenerate()
+        data = payload(page.output.toPlainText())
+        assert data["character"]["id"] == w.project.name
+        assert "【id】不同面料" in data["character"]["extra_prompt"]
+        other.setText("")
+        assert not page.regenerate() and not page.copy.isEnabled()
+        assert "分类名称" in page.keyword_error.text()
+        other.setText("动作")
+        assert page.regenerate()
     finally:
         w.close()
         w.deleteLater()

@@ -5,7 +5,34 @@ from PySide6.QtCore import QTimer
 from whale_cursor.ui import Window, STYLE, wait_for_saves
 
 
+def open_argument(arguments):
+    if "--open" not in arguments:
+        return None
+    index = arguments.index("--open")
+    if index + 1 >= len(arguments):
+        raise ValueError("--open 缺少方案路径")
+    from pathlib import Path
+
+    path = Path(arguments[index + 1]).resolve()
+    if path.suffix.lower() not in (".whalepack", ".whaleanim") or not path.is_file():
+        raise ValueError("请选择已有的指针方案或单动画文件")
+    return path
+
+
+def apply_open_message(window, message):
+    import json
+    from whale_cursor.project import Project
+
+    request = json.loads(message)
+    if not isinstance(request, dict) or not isinstance(request.get("open"), str):
+        raise ValueError("无效的打开方案请求")
+    path = open_argument(["--open", request["open"]])
+    window.set_project(Project.load(path))
+    window.show_window()
+
+
 def main():
+    requested = open_argument(sys.argv)
     app = QApplication(sys.argv)
     app.setApplicationName("WhaleCursorStudio")
     app.setStyle("Fusion")
@@ -46,7 +73,7 @@ def main():
         tasks = window.prompt_page.generation_tasks()
         payload = tasks[0]["prompt"]
         brief = json.loads(payload[payload.index("{") :])
-        if brief["character"].get("portable_probe") != "reference-only":
+        if "reference-only" not in brief["character"]["extra_prompt"]:
             raise RuntimeError("自定义关键字未写入生图提示词")
         app.processEvents()
         window.close()
@@ -76,14 +103,21 @@ def main():
     probe = QLocalSocket()
     probe.connectToServer(name)
     if probe.waitForConnected(300):
-        probe.write(b"startup" if "--startup" in sys.argv else b"show")
+        if requested:
+            import json
+
+            probe.write((json.dumps({"open": str(requested)}) + "\n").encode("utf-8"))
+        else:
+            probe.write(b"startup" if "--startup" in sys.argv else b"show")
         probe.waitForBytesWritten(300)
         return 0
     server = QLocalServer()
     QLocalServer.removeServer(name)
     if not server.listen(name):
         raise RuntimeError("无法创建单实例通信通道")
-    window = Window()
+    from whale_cursor.project import Project
+
+    window = Window(Project.load(requested) if requested else None)
 
     def incoming():
         socket = server.nextPendingConnection()
@@ -93,7 +127,9 @@ def main():
             message = bytes(socket.readAll())
             socket.disconnectFromServer()
             socket.deleteLater()
-            if message != b"startup":
+            if message.startswith(b"{"):
+                window.guard(lambda: apply_open_message(window, message))
+            elif message != b"startup":
                 window.show_window()
 
     server.newConnection.connect(incoming)

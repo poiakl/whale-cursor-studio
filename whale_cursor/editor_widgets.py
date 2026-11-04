@@ -1,6 +1,6 @@
 """Small editor tools that stay beside the canvas without consuming its width."""
 
-from PySide6.QtCore import Qt, QEvent, QPoint
+from PySide6.QtCore import Qt, QEvent, QPoint, Signal
 from PySide6.QtWidgets import (
     QFrame,
     QVBoxLayout,
@@ -12,6 +12,8 @@ from PySide6.QtWidgets import (
 
 
 class EditorDrawer(QFrame):
+    active_changed = Signal(int)
+
     def __init__(self, owner, anchor):
         super().__init__(owner, Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint)
         self.owner = owner
@@ -29,6 +31,7 @@ class EditorDrawer(QFrame):
         header.addWidget(close)
         layout.addLayout(header)
         self.pages = QStackedWidget()
+        self.pages.currentChanged.connect(self.page_changed)
         layout.addWidget(self.pages, 1)
         owner.installEventFilter(self)
 
@@ -41,6 +44,15 @@ class EditorDrawer(QFrame):
         self.place()
         self.show()
         self.raise_()
+
+    def page_changed(self, index):
+        self.title.setText(("图像", "热点", "试用")[index])
+        if self.isVisible():
+            self.active_changed.emit(index)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.active_changed.emit(self.pages.currentIndex())
 
     def place(self):
         area = self.owner.screen().availableGeometry()
@@ -79,6 +91,7 @@ class EditorDrawer(QFrame):
         return super().eventFilter(obj, event)
 
     def hideEvent(self, event):
+        self.active_changed.emit(-1)
         callback = getattr(self, "hidden_callback", None)
         if callback:
             callback()

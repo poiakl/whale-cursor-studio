@@ -65,26 +65,67 @@ def default_instruction(key, role=None, title=""):
         }[key.split(".")[-1]]
     if key.startswith("animations."):
         return "具体条件：「" + title + "」；突出该条件下的动作与姿态。"
+    if key.startswith("events."):
+        trigger = key.rsplit(".", 1)[-1]
+        subject = ROLE_SUBJECTS.get(role, "当前用途的标志性部位")
+        return f"让{subject}跟随父级「{EVENTS[trigger]}」动作；{TRIGGER_DETAILS[trigger]}，保持该用途的功能可辨识。"
     return ROLE_FEATURES.get(role or key.split(".")[-1], "突出当前用途的辨识特征。")
 
 
-def keywords_dict(fields):
-    result = {}
-    reserved = {"id", "style", "extra_prompt"}
+ROLE_SUBJECTS = {
+    "Arrow": "指向手势的尖端",
+    "Help": "询问姿态和帮助标记",
+    "AppStarting": "选择姿态与后台等待标记",
+    "Wait": "忙碌等待标记",
+    "Crosshair": "准星的中心和四向结构",
+    "IBeam": "文本定位的细长竖向结构",
+    "NWPen": "笔尖和握笔手势",
+    "No": "停止手势和禁止标记",
+    "SizeNS": "上下方向的伸展结构",
+    "SizeWE": "左右方向的伸展结构",
+    "SizeNWSE": "左上至右下的对角结构",
+    "SizeNESW": "右上至左下的对角结构",
+    "SizeAll": "四向搬动的抓取姿态",
+    "UpArrow": "朝上的指向部位",
+    "Hand": "伸出的食指和指节",
+    "Pin": "定位标记的尖端",
+    "Person": "人物识别的招呼姿态",
+}
+TRIGGER_DETAILS = {
+    "idle": "对应部位随父动作微动和舒展，避免只展示一张静态系统指针",
+    "move": "对应部位跟随父动作前进或轻倾，产生连续的运动反馈",
+    "left": "对应部位沿父动作的左向运动轻倾或拖动",
+    "right": "对应部位沿父动作的右向运动轻倾或拖动",
+    "up": "对应部位随父动作上抬并舒展",
+    "down": "对应部位随父动作下倾并收拢",
+    "click": "对应部位随父级按压节拍压缩和回弹",
+    "left_click": "对应部位与父级左键按压同步下压和恢复",
+    "right_click": "对应部位与父级右键反馈同步侧转或轻敲",
+    "middle_click": "对应部位与父级中键反馈同步居中收缩和回弹",
+    "double_click": "对应部位跟随父级两段节拍产生两次清晰反馈",
+    "drag": "对应部位随父级牵引方向绷紧、抓握或后拖",
+    "release": "对应部位随父级松开动作舒展，并缓冲回到该用途姿态",
+    "hold": "对应部位跟随父级长按保持受压或蓄力感，不自行提前松开",
+    "move_start": "对应部位随父级起步动作从静止过渡到前倾",
+    "move_stop": "对应部位随父级制动动作缓冲并回正",
+    "role_change": "对应部位跟随父级过渡动作切换成当前用途的标志性姿态",
+}
+
+
+def prompt_sections(fields):
+    """Category names organize prose; they are not JSON property names."""
+    result = []
     for field in fields or []:
-        key, value = (
+        name, value = (
             str(field.get("key", "")).strip(),
             str(field.get("value", "")).strip(),
         )
-        if not key and not value:
+        if not name and not value:
             continue
-        if not key:
-            raise ValueError("请填写关键字")
-        if key in reserved:
-            raise ValueError("关键字与固定字段重名：" + key)
-        if key in result:
-            raise ValueError("关键字重复：" + key)
-        result[key] = value
+        if not name:
+            raise ValueError("请填写提示词分类名称")
+        if value:
+            result.append(f"【{name}】{value}")
     return result
 
 

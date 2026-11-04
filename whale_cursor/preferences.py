@@ -45,6 +45,13 @@ def load():
             result["background"] = QColor(background).name()
         if isinstance(data.get("startup_interaction"), bool):
             result["startup_interaction"] = data["startup_interaction"]
+        cut = data.get("sheet_cut")
+        if isinstance(cut, dict) and all(
+            type(cut.get(k)) is int and 1 <= cut[k] <= 512
+            for k in ("columns", "rows", "count")
+        ):
+            if cut["count"] <= cut["columns"] * cut["rows"]:
+                result["sheet_cut"] = {k: cut[k] for k in ("columns", "rows", "count")}
         return result
     except (OSError, ValueError):
         return {}

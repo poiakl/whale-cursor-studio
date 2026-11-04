@@ -84,5 +84,5 @@ jobs:
           }
           gh api --method PATCH "repos/$env:GITHUB_REPOSITORY/git/refs/tags/desktop-latest" -f "sha=$env:GITHUB_SHA" -F force=true
           if ($LASTEXITCODE -ne 0) { throw "Could not update rolling release source tag" }
-          gh release edit desktop-latest --title "Windows 便携版 · 3.0" --notes "首次运行读取本机当前指针；自带鲸鱼娘图片独立保存到我的方案。修复空方案混入自带图片，增加全新用户、中文及空格路径、异工作目录便携启动验证。完整解压后运行 WhaleCursorStudio.exe，无需安装 Python。"
+          gh release edit desktop-latest --title "Windows 便携版 · 3.1" --notes "重排制作页导入导出与时间轴，新增图像、热点、试用侧面板和实时图像调整；记忆精灵图裁切，保存导入原始状态。AI 支持角色配置、嵌入参考图、默认逐项提示词及父项帧数与前缀。完整解压后运行 WhaleCursorStudio.exe。"
           gh release upload desktop-latest WhaleCursorStudio-Windows.zip --clobber

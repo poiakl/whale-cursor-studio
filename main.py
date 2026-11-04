@@ -2,7 +2,7 @@ import sys
 from PySide6.QtWidgets import QApplication
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtCore import QTimer
-from whale_cursor.ui import Window, STYLE
+from whale_cursor.ui import Window, STYLE, wait_for_saves
 
 
 def main():
@@ -10,14 +10,25 @@ def main():
     app.setApplicationName("WhaleCursorStudio")
     app.setStyle("Fusion")
     app.setStyleSheet(STYLE)
+    app.aboutToQuit.connect(wait_for_saves)
     if "--smoke-test" in sys.argv:
-        from whale_cursor.project import Project, user_dir
+        from whale_cursor.project import Project, user_dir, assets_dir
+        from PySide6.QtGui import QPixmap
         from whale_cursor import native
 
         before = native.snapshot() if native.WINDOWS else None
         window = Window()
         window.show()
         app.processEvents()
+        for index in range(3):
+            window.open_editor_tool(index)
+            app.processEvents()
+            if not window.editor_drawer.isVisible():
+                raise RuntimeError("制作工具面板无法展开")
+        window.editor_drawer.hide()
+        for name in ("spin-up.svg", "spin-down.svg"):
+            if QPixmap(str(assets_dir() / name)).isNull():
+                raise RuntimeError("数值控件箭头资源无法读取")
         for index in range(window.tabs.count()):
             window.tabs.setCurrentIndex(index)
             app.processEvents()
@@ -28,6 +39,8 @@ def main():
             raise RuntimeError("打包程序自带方案检查失败")
         if window.project.name != "本机原有指针":
             raise RuntimeError("首次打开未读取本机指针")
+        window.prompt_page.character_button.setChecked(True)
+        app.processEvents()
         window.close()
         app.processEvents()
         resumed = Window()

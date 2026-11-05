@@ -177,3 +177,29 @@ def test_continuous_audio_repeats_at_interval_and_drops_pending_on_stop(
         assert len(log) == 2
     finally:
         engine.stop()
+
+
+def test_clear_legacy_click_audio_updates_live_pool_and_can_undo(
+    app, tmp_path, monkeypatch
+):
+    w = Window(Project.defaults())
+    try:
+        source = wav(tmp_path / "legacy.wav")
+        w.project.settings["sound"] = source
+        engine = w.engine
+        engine.base_project = w.project.clone()
+        engine.project = engine.base_project
+        engine.prepare_sounds(engine.project)
+        engine.active = True
+        monkeypatch.setattr(engine, "sync_feedback", lambda project: False)
+        w.clear_sounds()
+        assert engine.project.settings["sound"] == ""
+        assert not engine.sounds["click"]
+        engine.active = False
+        w.undo()
+        assert w.project.settings["sound"] == source
+    finally:
+        w.engine.active = False
+        w.close()
+        w.deleteLater()
+        app.processEvents()

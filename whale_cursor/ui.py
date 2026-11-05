@@ -2107,9 +2107,11 @@ class Window(QMainWindow):
                 if i not in indices
             ]
         )
-        self.setting("sounds", sounds)
+        self.remember("移除音效")
+        self.project.settings["sounds"] = sounds
         if trigger == "click":
             self.project.settings["sound"] = ""
+        self.touch()
         self.refresh_sound_list()
 
     def scope_changed(self, index):

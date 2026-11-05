@@ -71,6 +71,11 @@ def extract(project, target):
         clip.settings["sound_modes"] = {
             trigger: project.settings.get("sound_modes", {}).get(trigger, "random")
         }
+        clip.settings["sound_playback"] = {
+            trigger: copy.deepcopy(
+                project.settings.get("sound_playback", {}).get(trigger, {})
+            )
+        }
         clip.settings["volume"] = project.settings.get("volume", 0.5)
     ai = copy.deepcopy(project.settings.get("ai_prompt", {}))
     if ai:
@@ -152,6 +157,9 @@ def merge(project, clip, target):
         project.settings.setdefault("sound_modes", {})[trigger] = clip.settings.get(
             "sound_modes", {}
         ).get(source_trigger, "random")
+        project.settings.setdefault("sound_playback", {})[trigger] = copy.deepcopy(
+            clip.settings.get("sound_playback", {}).get(source_trigger, {})
+        )
         project.settings["volume"] = clip.settings.get("volume", 0.5)
     if clip.settings.get("ai_prompt"):
         project.settings.setdefault("animation_ai_metadata", {})[target] = (

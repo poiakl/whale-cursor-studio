@@ -45,7 +45,7 @@ jobs:
       - name: Package portable Windows app
         run: python -m PyInstaller --noconfirm --clean --windowed --onedir --name WhaleCursorStudio --add-data "assets;assets" --collect-all PySide6.QtMultimedia main.py
       - name: Package local MCP companion
-        run: python -m PyInstaller --noconfirm --clean --console --onefile --name WhaleCursorMCP --add-data "assets;assets" --copy-metadata mcp --collect-submodules mcp.server.fastmcp mcp_entry.py
+        run: python -m PyInstaller --noconfirm --clean --console --onefile --name WhaleCursorMCP --copy-metadata mcp --collect-submodules mcp.server.fastmcp mcp_entry.py
       - name: Include MCP companion
         shell: pwsh
         run: Copy-Item dist/WhaleCursorMCP.exe dist/WhaleCursorStudio/WhaleCursorMCP.exe
@@ -69,7 +69,7 @@ jobs:
         shell: pwsh
         run: |
           $portableRoot = Join-Path $env:RUNNER_TEMP "便携程序 测试"
-          python tests/mcp_protocol_probe.py --server "$portableRoot/WhaleCursorMCP.exe" --workspace "$env:RUNNER_TEMP/AI 工作目录"
+          python tests/mcp_protocol_probe.py --server "$portableRoot/WhaleCursorMCP.exe" --editor "$portableRoot/WhaleCursorStudio.exe" --workspace "$env:RUNNER_TEMP/AI 工作目录"
           if ($LASTEXITCODE -ne 0) { throw "Packaged MCP protocol check failed" }
       - name: Archive portable app
         shell: pwsh
@@ -96,5 +96,5 @@ jobs:
           }
           gh api --method PATCH "repos/$env:GITHUB_REPOSITORY/git/refs/tags/desktop-latest" -f "sha=$env:GITHUB_SHA" -F force=true
           if ($LASTEXITCODE -ne 0) { throw "Could not update rolling release source tag" }
-          gh release edit desktop-latest --title "Windows 便携版 · 3.3" --notes "自定义分类以多行输入框整理全局提示词，互动子项承接父级动作，工具面板与菜单有明显选中状态。设置新增本地 stdio MCP 接口，可供支持的 AI 客户端编辑方案、导入素材、调整热点和导出。完整解压后运行 WhaleCursorStudio.exe；MCP 配置从设置中复制。"
+          gh release edit desktop-latest --title "Windows 便携版 · 3.4" --notes "MCP 直接连接工坊当前界面：读取提示词与参考图、回填生成结果、编写及预览点击关键帧、配置互动音效。音效新增播完再播和触发间隔，实时生效并随方案保存。完整解压后运行 WhaleCursorStudio.exe；设置中复制新版 MCP 配置。"
           gh release upload desktop-latest WhaleCursorStudio-Windows.zip --clobber

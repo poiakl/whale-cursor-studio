@@ -149,6 +149,7 @@ class Project:
             "interaction_scope": "common",
             "sounds": {},
             "sound_modes": {},
+            "sound_playback": {},
             "animation_rules": [],
             "history_limit": 30,
             "effect_size": 64,
@@ -283,6 +284,9 @@ class Project:
                 ):
                     if key not in previous:
                         p.settings[key] = p.settings[shared]
+            from .audio import validate_audio_settings
+
+            validate_audio_settings(p.settings)
             from .fx import parse_keyframes
 
             if "effect_keyframes" in p.settings:

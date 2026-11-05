@@ -1,30 +1,26 @@
-"""Official MCP SDK stdio server over the same headless project operations as the UI."""
+"""Stdio MCP tools operating the running cursor studio's native features."""
 
 import argparse
 import json
 import os
 import sys
 from contextlib import ExitStack
-from mcp.server.fastmcp import FastMCP, Image
-from mcp.types import ToolAnnotations
-from pydantic import BaseModel
-from .mcp_core import Workspace
+from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations, TextContent, ImageContent
+from .mcp_connection import LiveClient
 
 
-class PromptSection(BaseModel):
-    name: str
-    prompt: str
-
-
-def create_server(workspace, editor=None, editor_env=None):
-    work = Workspace(workspace, editor, editor_env)
+def create_server(editor=None, endpoint=None, client=None):
+    app = client or LiveClient(editor, endpoint)
     server = FastMCP(
         "Whale Cursor Studio",
         instructions=(
-            "先调用 capabilities 和 list_files。路径均相对于用户选择的工作目录。"
-            "使用交给 AI 的方案副本或创建新方案；导入素材、设置热点、导出结果后可 open_in_editor。"
-            "所有操作是本地文件编辑，不安装系统指针、不执行任意代码、不调用收费生图接口。"
-            "提示词分类只是整理用，最终合并为全局提示词；互动子项要承接父级触发动作。"
+            "这些工具直接操作正在运行的指针工坊，软件未打开时会尝试打开。"
+            "生图流程：get_generation_request 读取当前勾选项的完整提示词、尺寸、帧数、热点与参考图片；"
+            "你使用自己的生图能力生成图片，再调用 apply_generated_image 直接回填对应动画。"
+            "点击特效用 set_click_effect 编写 JSON 关键帧，preview_click_effect 返回工坊真实渲染预览；"
+            "音效用 configure_interaction_audio 配置。更改实时显示在软件中且可以撤销。"
+            "工具不调用软件的付费生图 API，也不负责通用文件查询、文件管理或系统指针安装。"
         ),
     )
     read = ToolAnnotations(
@@ -35,111 +31,108 @@ def create_server(workspace, editor=None, editor_env=None):
     )
 
     @server.tool(annotations=read)
-    def capabilities() -> dict:
-        """查看支持的用途、触发、动画目标命名和工作流。"""
-        return work.capabilities()
-
-    @server.tool(annotations=read)
-    def list_files() -> list[str]:
-        """列出工作目录内的素材、方案和导出文件。"""
-        return work.list_files()
+    def get_generation_request(
+        targets: list[str] | None = None, include_references: bool = True
+    ):
+        """取得工坊 AI 页已勾选任务的提示词和真实参考图片，供你直接生图；可按目标 id 分批读取。返回 request_id 用于回填，生成时保留单格布局与热点。"""
+        result = app.call(
+            "get_generation_request",
+            targets=targets,
+            include_references=include_references,
+        )
+        references = result.pop("references", [])
+        return [
+            TextContent(type="text", text=json.dumps(result, ensure_ascii=False)),
+            *[
+                ImageContent(type="image", data=raw, mimeType="image/png")
+                for raw in references
+            ],
+        ]
 
     @server.tool(annotations=write)
-    def create_project(
-        project: str, name: str = "未命名", template: str = "empty"
+    def apply_generated_image(
+        request_id: str,
+        target: str,
+        image_path: str | None = None,
+        image_base64: str | None = None,
+        hotspots: dict | None = None,
     ) -> dict:
-        """创建新 .whalepack；template 为 empty、built_in 或 Windows 的 system。已有文件不会覆盖。"""
-        return work.create_project(project, name, template)
-
-    @server.tool(annotations=read)
-    def inspect_project(project: str, target: str | None = None) -> dict:
-        """读取方案；指定 target 时返回从 0 开始的逐帧热点和时长。"""
-        return work.inspect_project(project, target)
-
-    @server.tool(annotations=write)
-    def import_images(
-        project: str, target: str, images: list[str], append: bool = False
-    ) -> dict:
-        """将工作目录中的 PNG/GIF/WebP/CUR/ANI 或连续帧导入指定动画。"""
-        return work.import_images(project, target, images, append)
-
-    @server.tool(annotations=write)
-    def split_sprite_sheet(
-        project: str, target: str, image: str, columns: int, rows: int, count: int
-    ) -> dict:
-        """按列、行、帧数切分精灵图并导入；每格须为正方形。"""
-        return work.split_sprite_sheet(project, target, image, columns, rows, count)
-
-    @server.tool(annotations=write)
-    def set_hotspots(
-        project: str, target: str, data: dict, include_timing: bool = False
-    ) -> dict:
-        """设置热点，例如 data={"hotspot":[30,40]}；支持逐帧 JSON，默认 256×256 编辑坐标。"""
-        return work.set_hotspots(project, target, data, include_timing)
-
-    @server.tool(annotations=write)
-    def set_frame_timing(project: str, target: str, durations_ms: list[int]) -> dict:
-        """统一时长传一个数，逐帧时长传与帧数相同的数组，范围 17～60000 ms。"""
-        return work.set_frame_timing(project, target, durations_ms)
-
-    @server.tool(annotations=write)
-    def configure_sequence(project: str, target: str, controls: dict) -> dict:
-        """设置 reverse、pingpong 布尔开关或 uniform_ms、speed；时长和速度传 null 关闭。往返不会重复追加。"""
-        return work.configure_sequence(project, target, controls)
-
-    @server.tool(annotations=write)
-    def set_prompt_sections(
-        project: str, style: str, sections: list[PromptSection]
-    ) -> dict:
-        """按衣服、动作等分类整理全局提示词。每项传 name 和 prompt，最终合并为整体提示词。"""
-        return work.set_prompt_sections(
-            project,
-            style,
-            [dict(key=item.name, value=item.prompt) for item in sections],
+        """把你已生成的本地图片或 PNG base64 直接放回工坊对应动画，自动切帧并应用该请求的热点和时长。hotspots 可传生图返回的热点 JSON；方案切换或用户修改目标后会拒绝覆盖。"""
+        return app.call(
+            "apply_generated_image",
+            request_id=request_id,
+            target=target,
+            image_path=image_path,
+            image_base64=image_base64,
+            hotspots=hotspots,
         )
 
     @server.tool(annotations=read)
-    def build_generation_brief(
-        project: str, selected: dict[str, int], size: int = 256, columns: int = 4
-    ) -> str:
-        """生成可复制给生图 AI 的分层文本；selected 将动画 id 映射到所需帧数，不发付费请求。"""
-        return work.build_generation_brief(project, selected, size, columns)
+    def get_interaction_settings() -> dict:
+        """读取工坊当前点击特效、素材、各触发音效及关键帧语法，作为编写动画和配音依据。"""
+        return app.call("get_interaction_settings")
 
     @server.tool(annotations=write)
-    def export_animation(project: str, target: str, output: str) -> str:
-        """只导出指定动画及配置到工作目录内的 .whaleanim。"""
-        return work.export_animation(project, target, output)
-
-    @server.tool(annotations=write)
-    def export_cursors(project: str, folder: str, role: str | None = None) -> dict:
-        """在工作目录内生成 CUR/ANI；role 可选单个系统用途，不会安装。"""
-        return work.export_cursors(project, folder, role)
+    def set_click_effect(
+        keyframes: list[dict] | None = None,
+        effect: str | None = None,
+        motion: str | None = None,
+        duration_ms: int | None = None,
+        size: int | None = None,
+        opacity: float | None = None,
+    ) -> dict:
+        """直接编写并应用点击效果。keyframes 为2～64帧JSON，t从0到1，可写x/y/scale/rotation/opacity，不执行任意代码。effect=custom使用点击装饰素材；其余可选ripple/petals/none。"""
+        return app.call(
+            "set_click_effect",
+            keyframes=keyframes,
+            effect=effect,
+            motion=motion,
+            duration_ms=duration_ms,
+            size=size,
+            opacity=opacity,
+        )
 
     @server.tool(annotations=read)
-    def preview_frame(project: str, target: str, index: int = 0) -> Image:
-        """以 MCP 图片内容预览一帧；index 从 0 开始。"""
-        return Image(data=work.preview_frame(project, target, index), format="png")
+    def preview_click_effect(progress: list[float] | None = None):
+        """返回工坊当前点击特效在指定进度的真实渲染图与姿态，检查你编写的动画；默认6帧，最多12帧。"""
+        frames = app.call("preview_click_effect", progress=progress)
+        output = []
+        for frame in frames:
+            raw = frame.pop("image")
+            output.extend(
+                [
+                    TextContent(
+                        type="text", text=json.dumps(frame, ensure_ascii=False)
+                    ),
+                    ImageContent(type="image", data=raw, mimeType="image/png"),
+                ]
+            )
+        return output
 
     @server.tool(annotations=write)
-    def add_condition_rule(project: str, rule: dict) -> dict:
-        """添加条件动画规则：id、trigger、button、motion、role、lock、enabled。先添加再导入 animations.id。"""
-        return work.add_condition_rule(project, rule)
-
-    @server.tool(annotations=write)
-    def open_in_editor(project: str) -> dict:
-        """在指针工坊中打开工作目录内的结果方案供用户查看，不应用系统指针。"""
-        return work.open_in_editor(project)
-
-    @server.resource("whale://capabilities")
-    def capability_resource() -> str:
-        return json.dumps(work.capabilities(), ensure_ascii=False)
+    def configure_interaction_audio(
+        trigger: str,
+        files: list[str] | None = None,
+        mode: str | None = None,
+        wait_finish: bool | None = None,
+        interval_ms: int | None = None,
+        volume: float | None = None,
+    ) -> dict:
+        """直接配置工坊的触发音效：files为PCM WAV本地路径（空数组清空），mode=random/sequence，wait_finish播完再播，interval_ms为同一触发最短开始间隔，volume=0～1。未传的参数保留。"""
+        return app.call(
+            "configure_interaction_audio",
+            trigger=trigger,
+            files=files,
+            mode=mode,
+            wait_finish=wait_finish,
+            interval_ms=interval_ms,
+            volume=volume,
+        )
 
     return server
 
 
 def run_stdio(server):
-    # The SDK's UTF-8 wrappers own their underlying buffers. Give them duplicate
-    # descriptors so their cleanup cannot close the interpreter's standard I/O.
     original = sys.stdin, sys.stdout
     with ExitStack() as stack:
         incoming = stack.enter_context(
@@ -156,14 +149,11 @@ def run_stdio(server):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Whale Cursor Studio local stdio MCP")
-    parser.add_argument("--workspace", required=True)
+    parser = argparse.ArgumentParser(description="Whale Cursor Studio native app MCP")
     parser.add_argument("--editor")
+    parser.add_argument("--endpoint")
+    parser.add_argument(
+        "--workspace", help=argparse.SUPPRESS
+    )  # Accept older launch configs without file tools.
     args = parser.parse_args()
-    work = Workspace(args.workspace, args.editor)
-    cache = work.path(".cache")
-    cache.mkdir(exist_ok=True)
-    # Embedded image/audio extraction also stays inside the chosen workspace.
-    editor_env = os.environ.copy()
-    os.environ["LOCALAPPDATA"] = str(cache)
-    run_stdio(create_server(work.root, args.editor, editor_env))
+    run_stdio(create_server(args.editor, args.endpoint))

@@ -502,6 +502,7 @@ class Window(QMainWindow):
         self.save_timer.start()
         if self.engine.active:
             self.engine.sync_feedback(self.project)
+            self.engine.sync_audio(self.project)
         if self.tabs.currentIndex() == 1:
             self.refresh_events()
             self.refresh_conditions()
@@ -1873,6 +1874,25 @@ class Window(QMainWindow):
         self.sound_mode.addItems(["随机播放", "顺序播放"])
         self.sound_mode.currentIndexChanged.connect(self.sound_mode_changed)
         audio_layout.addWidget(self.sound_mode)
+        timing = QHBoxLayout()
+        self.sound_wait = QCheckBox("播完再播")
+        self.sound_wait.setToolTip(
+            "等待当前音频结束再播放；连续触发只保留最新一次待播，避免积压。"
+        )
+        self.sound_wait.toggled.connect(self.sound_playback_changed)
+        timing.addWidget(self.sound_wait)
+        timing.addStretch()
+        timing.addWidget(QLabel("触发间隔"))
+        self.sound_interval = NumberBox()
+        self.sound_interval.setRange(0, 600000)
+        self.sound_interval.setSuffix(" ms")
+        self.sound_interval.setFixedWidth(130)
+        self.sound_interval.setToolTip(
+            "同一触发两次开始播放的最短间隔；0 不限制。连续动作设置间隔后可重复播放，动作结束即停止等待。"
+        )
+        self.sound_interval.valueChanged.connect(self.sound_playback_changed)
+        timing.addWidget(self.sound_interval)
+        audio_layout.addLayout(timing)
         self.sound_list = QListWidget()
         self.sound_list.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
         self.sound_list.model().rowsMoved.connect(self.sound_order_changed)
@@ -2009,6 +2029,7 @@ class Window(QMainWindow):
             self.statusBar().showMessage(
                 "效果设置已即时应用"
                 if key in FEEDBACK_KEYS
+                or key in ("sounds", "sound_modes", "sound_playback", "volume")
                 else "运行中；设置已修改，停止并重新开启后生效"
             )
 
@@ -2049,6 +2070,18 @@ class Window(QMainWindow):
             else 0
         )
         self.sound_mode.blockSignals(False)
+        from .audio import playback_options
+
+        options = playback_options(self.project.settings, trigger)
+        for field, value in (
+            (self.sound_wait, options["wait_finish"]),
+            (self.sound_interval, options["interval_ms"]),
+        ):
+            field.blockSignals(True)
+            field.setChecked(value) if field is self.sound_wait else field.setValue(
+                value
+            )
+            field.blockSignals(False)
         self.sound_list.clear()
         for file in self.audio_files(list(EVENTS)[self.sound_trigger.currentIndex()]):
             item = QListWidgetItem(Path(file).name)
@@ -2074,9 +2107,11 @@ class Window(QMainWindow):
                 if i not in indices
             ]
         )
-        self.setting("sounds", sounds)
+        self.remember("移除音效")
+        self.project.settings["sounds"] = sounds
         if trigger == "click":
             self.project.settings["sound"] = ""
+        self.touch()
         self.refresh_sound_list()
 
     def scope_changed(self, index):
@@ -2544,7 +2579,7 @@ class Window(QMainWindow):
         a.addWidget(label("关于", "title"))
         a.addWidget(
             label(
-                "鲸鱼娘指针工坊 3.3\n原生 CUR / ANI 安装无需常驻；桌面互动在托盘运行，可随时停止。\n方案与素材保存在当前用户目录；仅点击 AI 发送时上传参考图和提示词，不上传鼠标操作。\n支持 Windows 10 / 11。游戏、远程桌面和部分自绘指针应用可能使用自己的指针。"
+                "鲸鱼娘指针工坊 3.4\n原生 CUR / ANI 安装无需常驻；桌面互动在托盘运行，可随时停止。\n方案与素材保存在当前用户目录；仅点击 AI 发送时上传参考图和提示词，不上传鼠标操作。\n支持 Windows 10 / 11。游戏、远程桌面和部分自绘指针应用可能使用自己的指针。"
             )
         )
         a.addWidget(
@@ -2564,34 +2599,18 @@ class Window(QMainWindow):
         page.reload()
 
     def build_mcp_settings(self, parent_layout):
-        from .mcp_config import workspace
-
         pane, layout = card()
         parent_layout.addWidget(pane)
         layout.addWidget(label("AI 连接 · MCP", "title"))
         layout.addWidget(
             label(
-                "连接支持本地 stdio MCP 的 AI 客户端，直接编辑方案、导入素材、调整热点并导出结果。",
+                "让 AI 直接读取生图提示词和参考图、回填生成图、编写点击效果、配置互动音效。",
                 "muted",
             )
         )
         row = QHBoxLayout()
-        self.mcp_workspace_field = QLineEdit(str(workspace(self.preferences)))
-        self.mcp_workspace_field.setReadOnly(True)
-        row.addWidget(self.mcp_workspace_field, 1)
-        row.addWidget(self.button("选择工作目录", self.choose_mcp_workspace))
-        layout.addLayout(row)
-        row = QHBoxLayout()
         row.addWidget(self.button("复制连接配置", self.copy_mcp_config, True))
-        row.addWidget(self.button("交给 AI 当前方案", self.prepare_mcp_project))
-        row.addWidget(
-            self.button(
-                "打开工作目录",
-                lambda: QDesktopServices.openUrl(
-                    QUrl.fromLocalFile(str(workspace(self.preferences)))
-                ),
-            )
-        )
+        row.addWidget(self.button("选择生图内容", lambda: self.tabs.setCurrentIndex(4)))
         self.mcp_config_toggle = self.button("查看配置", lambda: None)
         self.mcp_config_toggle.setCheckable(True)
         row.addWidget(self.mcp_config_toggle)
@@ -2608,57 +2627,23 @@ class Window(QMainWindow):
             )
         )
         self.mcp_status = label(
-            "AI 在工作目录内处理方案副本；在编辑器中打开结果后，可由你预览和安装。",
+            "连接后直接操作当前方案，修改可以撤销。生图使用调用方 AI 自己的能力。",
             "muted",
         )
         layout.addWidget(self.mcp_status)
         self.refresh_mcp_config()
 
     def refresh_mcp_config(self):
-        from .mcp_config import workspace, config_text
+        from .mcp_config import config_text
 
-        self.mcp_workspace_field.setText(str(workspace(self.preferences)))
         self.mcp_config_view.setPlainText(config_text(self.preferences))
-
-    def choose_mcp_workspace(self):
-        from .mcp_config import workspace
-
-        path = QFileDialog.getExistingDirectory(
-            self, "选择 AI 工作目录", str(workspace(self.preferences))
-        )
-        if path:
-            from . import preferences
-
-            self.preferences["mcp_workspace"] = str(Path(path).resolve())
-            preferences.save(self.preferences)
-            self.refresh_mcp_config()
 
     def copy_mcp_config(self):
         self.refresh_mcp_config()
         QApplication.clipboard().setText(self.mcp_config_view.toPlainText())
         self.mcp_status.setText(
-            "已复制连接配置；在支持本地 stdio MCP 的 AI 客户端中添加此服务。"
+            "已复制；在支持本地 stdio MCP 的 AI 客户端中添加，调用时会连接当前工坊。"
         )
-
-    def prepare_mcp_project(self):
-        from .mcp_config import workspace
-        import uuid
-
-        self.flush_save()
-        filename = (
-            "当前方案-"
-            + time.strftime("%Y%m%d-%H%M%S")
-            + "-"
-            + uuid.uuid4().hex[:5]
-            + ".whalepack"
-        )
-        destination = workspace(self.preferences) / filename
-        self.project.save(destination)
-        QApplication.clipboard().setText(filename)
-        self.mcp_status.setText(
-            "已准备 " + filename + "；文件名已复制，可让 AI 读取并编辑这份副本。"
-        )
-        return destination
 
     def change_theme(self, name):
         from . import preferences
@@ -3361,6 +3346,15 @@ class Window(QMainWindow):
             self.rebuild_slots()
         self.refresh_conditions(rule["id"])
 
+    def sound_playback_changed(self, *args):
+        options = dict(self.project.settings.get("sound_playback", {}))
+        trigger = list(EVENTS)[self.sound_trigger.currentIndex()]
+        options[trigger] = dict(
+            wait_finish=self.sound_wait.isChecked(),
+            interval_ms=self.sound_interval.value(),
+        )
+        self.setting("sound_playback", options)
+
     def sound_mode_changed(self, index):
         modes = dict(self.project.settings.get("sound_modes", {}))
         modes[list(EVENTS)[self.sound_trigger.currentIndex()]] = (
@@ -3377,7 +3371,7 @@ class Window(QMainWindow):
         ]
         self.remember("音效排序")
         self.project.settings["sounds"] = sounds
-        self.save_timer.start()
+        self.touch()
 
     def refresh_interaction_views(self):
         self.refresh_events()

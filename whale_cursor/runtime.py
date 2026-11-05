@@ -22,6 +22,7 @@ from .project import Project, user_dir
 from . import native
 from .conditions import Inputs, Resolver, ORDER, owners
 from .fx import pose, parse_keyframes, EXAMPLE
+from .audio import playback_options
 
 
 FEEDBACK_KEYS = {
@@ -570,6 +571,8 @@ class Engine:
         self.sound = QSoundEffect()
         self.sounds = {}
         self.sound_indices = {}
+        self.sound_last_started = {}
+        self.pending_sound = None
         self.temp = None
         self.initial = None
         self.frame_cache = {}
@@ -689,6 +692,8 @@ class Engine:
                 sound.stop()
                 sound.deleteLater()
         self.sounds = {}
+        self.pending_sound = None
+        self.sound_last_started = {}
         self.active = False
         # Keep recovery information and files if Windows refuses restoration.
         if self.initial:
@@ -810,6 +815,20 @@ class Engine:
         pool = self.sounds.get(trigger, [])
         if not pool:
             return
+        now = time.monotonic()
+        options = playback_options(self.project.settings, trigger)
+        if (
+            now - self.sound_last_started.get(trigger, -float("inf"))
+            < options["interval_ms"] / 1000
+        ):
+            return
+        if options["wait_finish"] and any(
+            getattr(sound, "isPlaying", lambda: False)()
+            for sounds in self.sounds.values()
+            for sound in sounds
+        ):
+            self.pending_sound = trigger
+            return
         mode = self.project.settings.get("sound_modes", {}).get(trigger, "random")
         if mode == "sequence":
             index = self.sound_indices.get(trigger, 0) % len(pool)
@@ -824,7 +843,14 @@ class Engine:
             if not ready:
                 return
             sound = random.choice(ready)
+        self.pending_sound = None
+        self.sound_last_started[trigger] = now
         sound.play()
+
+    def flush_pending_sound(self):
+        pending, self.pending_sound = self.pending_sound, None
+        if pending:
+            self.play_sound(pending)
 
     def _tick(self):
         now = time.monotonic()
@@ -893,7 +919,12 @@ class Engine:
                 "double_click",
             ):
                 self.play_sound(trigger)
-        for trigger in continuous_audio - self.active_audio:
+        repeat = {
+            trigger
+            for trigger in continuous_audio
+            if playback_options(self.project.settings, trigger)["interval_ms"] > 0
+        }
+        for trigger in sorted((continuous_audio - self.active_audio) | repeat):
             if trigger == "move" and any(
                 self.sounds.get(k)
                 for k in ("left", "right", "up", "down")
@@ -901,6 +932,13 @@ class Engine:
             ):
                 continue
             self.play_sound(trigger)
+        if (
+            self.pending_sound
+            in {"hold", "drag", "idle", "move", "left", "right", "up", "down"}
+            - continuous_audio
+        ):
+            self.pending_sound = None
+        self.flush_pending_sound()
         self.active_audio = continuous_audio
         rule = (
             self.resolver.select(
@@ -980,6 +1018,8 @@ class Engine:
                 sound.stop()
                 sound.deleteLater()
         self.sound_indices = {}
+        self.sound_last_started = {}
+        self.pending_sound = None
         files = dict(project.settings.get("sounds", {}))
         if project.settings.get("sound") and not files.get("click"):
             files["click"] = [project.settings["sound"]]
@@ -1064,6 +1104,24 @@ class Engine:
             if not settings.get("companion"):
                 self.overlay.sprite = None
             self.present_layers(time.monotonic())
+
+    def sync_audio(self, project):
+        if not self.active:
+            return
+        keys = ("sounds", "sound", "sound_modes", "sound_playback", "volume")
+        before = {key: self.base_project.settings.get(key) for key in keys}
+        after = {key: project.settings.get(key) for key in keys}
+        if before == after:
+            return
+        files_changed = any(before[key] != after[key] for key in ("sounds", "sound"))
+        self.base_project.settings.update(copy.deepcopy(after))
+        if self.project is self.base_project:
+            if files_changed:
+                self.prepare_sounds(self.project)
+            else:
+                for pool in self.sounds.values():
+                    for sound in pool:
+                        sound.setVolume(float(project.settings.get("volume", 0.5)))
 
     def sync_feedback(self, project):
         if not self.active:

@@ -120,6 +120,13 @@ def main():
     from whale_cursor.project import Project
 
     window = Window(Project.load(requested) if requested else None)
+    from whale_cursor.mcp_bridge import LiveBridge
+
+    endpoint = None
+    if "--mcp-endpoint" in sys.argv:
+        endpoint = sys.argv[sys.argv.index("--mcp-endpoint") + 1]
+    window.live_bridge = LiveBridge(window, endpoint)
+    app.aboutToQuit.connect(window.live_bridge.close)
 
     def incoming():
         socket = server.nextPendingConnection()

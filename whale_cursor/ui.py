@@ -60,7 +60,7 @@ from PySide6.QtWidgets import (
     QTableWidgetItem,
     QColorDialog,
 )
-from .codec import import_images, split_sheet, transform, SIZES
+from .codec import import_images, transform, SIZES
 from .project import Project, SLOTS, EVENTS, EFFECTS, user_dir, event_key, assets_dir
 from .runtime import Engine, Overlay, pixmap
 from .fx import MOTIONS as FX_MOTIONS, EXAMPLE, parse_keyframes
@@ -802,15 +802,11 @@ class Window(QMainWindow):
 
     def io_actions(self):
         return {
-            "images": ("导入图片及动画", lambda: self.import_files(False)),
-            "append": ("追加动画帧", lambda: self.import_files(True)),
-            "match": ("导入并批量匹配", self.batch_import),
-            "sheet": ("导入精灵图并切帧", self.import_sheet),
-            "hotspots": ("导入热点", self.import_hotspots),
-            "animation_in": ("导入动画及配置", self.import_animation),
+            "images": ("导入当前动画", self.import_current_animation),
+            "match": ("批量匹配动画", self.batch_import),
             "cursor_out": ("导出当前指针 CUR / ANI", lambda: self.export(True)),
             "cursors_out": ("导出整套指针 CUR / ANI", lambda: self.export(False)),
-            "animation_out": ("导出当前动画", self.export_animation),
+            "png_out": ("导出为 PNG", self.export_png),
             "inspect": ("检查方案", self.check_project),
         }
 
@@ -824,12 +820,10 @@ class Window(QMainWindow):
         return menu
 
     def import_menu(self):
-        return self.io_menu(
-            ("images", "append", "match", "sheet", "hotspots", "animation_in")
-        )
+        return self.io_menu(("images", "match"))
 
     def export_menu(self):
-        return self.io_menu(("cursor_out", "cursors_out", "animation_out", "inspect"))
+        return self.io_menu(("cursor_out", "cursors_out", "png_out", "inspect"))
 
     def sync_last_io_button(self):
         key = self.preferences.get("last_io_action", "images")
@@ -850,30 +844,37 @@ class Window(QMainWindow):
         self.sync_last_io_button()
         self.guard(self.io_actions()[key][1])
 
-    def export_animation(self):
-        from .animation_package import extract
-
+    def export_png(self):
         self.finish_image_adjustment()
-        target = self.group + "." + self.storage_key
-        clip = extract(self.project, target)
+        if not self.frames:
+            raise ValueError("当前动画没有素材")
+        columns = min(8, len(self.frames))
+        rows = (len(self.frames) + columns - 1) // columns
         filename, _ = QFileDialog.getSaveFileName(
             self,
-            "导出当前动画",
-            target.replace(".", "_") + ".whaleanim",
-            "单动画及配置 (*.whaleanim)",
+            "导出为 PNG",
+            self.group + "." + self.storage_key + ".png",
+            "PNG (*.png)",
         )
         if filename:
-            if not Path(filename).suffix:
-                filename += ".whaleanim"
-            clip.save(filename)
-            self.statusBar().showMessage("已导出当前动画：" + filename)
+            path = Path(filename)
+            if path.suffix.lower() != ".png":
+                path = path.with_suffix(".png")
+            sheet = Image.new("RGBA", (columns * 256, rows * 256))
+            for index, frame in enumerate(self.frames):
+                sheet.paste(
+                    frame.image, (index % columns * 256, index // columns * 256)
+                )
+            sheet.save(path, "PNG")
+            self.statusBar().showMessage("已导出 PNG：" + str(path))
 
-    def import_animation(self):
+    def import_animation(self, filename=None):
         from .animation_package import merge
 
-        filename, _ = QFileDialog.getOpenFileName(
-            self, "导入动画及配置", "", "单动画及配置 (*.whaleanim)"
-        )
+        if filename is None:
+            filename, _ = QFileDialog.getOpenFileName(
+                self, "导入动画及配置", "", "单动画及配置 (*.whaleanim)"
+            )
         if not filename:
             return
         self.finish_image_adjustment()
@@ -1288,12 +1289,33 @@ class Window(QMainWindow):
             self.touch()
             self.refresh()
 
+    def import_current_animation(self):
+        self.import_files(False)
+
     def import_files(self, append):
-        files, _ = QFileDialog.getOpenFileNames(
-            self, "选择图片、GIF、连续帧或已有指针", "", FILTER
-        )
-        if files:
-            self.load_files(files, append)
+        from .import_panel import ImportPanel
+
+        if self.storage_key == "__empty":
+            raise ValueError("请先在互动页添加动画规则")
+        target = self.group + "." + self.storage_key
+        dialog = ImportPanel(target, self.edit_title.text(), self.project.pixel, self)
+        dialog.append.setChecked(append)
+        if dialog.exec():
+            if dialog.metadata_only:
+                self.import_hotspots(dialog.metadata_only)
+            elif dialog.package:
+                self.import_animation(dialog.package)
+            else:
+                self.apply_import_frames(dialog.frames, dialog.append.isChecked())
+                if dialog.split.isChecked():
+                    from . import preferences
+
+                    self.preferences["sheet_cut"] = dict(
+                        columns=dialog.columns.value(),
+                        rows=dialog.rows.value(),
+                        count=len(dialog.frames),
+                    )
+                    preferences.save(self.preferences)
 
     def load_files(self, files, append=False):
         self.finish_image_adjustment()
@@ -1302,6 +1324,10 @@ class Window(QMainWindow):
         result = []
         for path in sorted(files):
             result.extend(import_images(Path(path), self.project.pixel))
+        self.apply_import_frames(result, append)
+
+    def apply_import_frames(self, result, append=False):
+        self.finish_image_adjustment()
         if len(result) + (len(self.frames) if append else 0) > 512:
             raise ValueError("每个动作最多 512 帧")
         if not result:
@@ -1318,14 +1344,6 @@ class Window(QMainWindow):
         self.touch()
 
     def batch_import(self):
-        if self.group in ("effects", "animations"):
-            self.import_files(False)
-            return
-        if (
-            self.group == "events"
-            and self.project.settings.get("interaction_scope") == "common"
-        ):
-            self.scope_box.setCurrentIndex(1)
         files, _ = QFileDialog.getOpenFileNames(
             self, "选择多张图片或动画，下一步调整匹配", "", FILTER
         )
@@ -1346,67 +1364,7 @@ class Window(QMainWindow):
             return
         dialog = MatchDialog(assets, self)
         if dialog.exec():
-            self.apply_matching(dialog.result_mapping())
-
-    def import_sheet(self):
-        file, _ = QFileDialog.getOpenFileName(
-            self, "选择精灵图", "", "图片 (*.png *.webp *.bmp)"
-        )
-        if not file:
-            return
-        dlg = QDialog(self)
-        dlg.setWindowTitle("精灵图切帧")
-        form = QFormLayout(dlg)
-        cols = NumberBox()
-        rows = NumberBox()
-        count = NumberBox()
-        for b in (cols, rows):
-            b.setRange(1, 512)
-        count.setRange(1, 512)
-        from . import preferences
-
-        last = preferences.load().get(
-            "sheet_cut", {"columns": 8, "rows": 1, "count": 8}
-        )
-        cols.setValue(last["columns"])
-        rows.setValue(last["rows"])
-        count.setMaximum(min(512, cols.value() * rows.value()))
-        count.setValue(last["count"])
-
-        def capacity_changed():
-            count.setMaximum(min(512, cols.value() * rows.value()))
-
-        cols.valueChanged.connect(capacity_changed)
-        rows.valueChanged.connect(capacity_changed)
-        form.addRow("列数", cols)
-        form.addRow("行数", rows)
-        form.addRow("读取帧数", count)
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
-        )
-        buttons.accepted.connect(dlg.accept)
-        buttons.rejected.connect(dlg.reject)
-        form.addRow(buttons)
-        if dlg.exec():
-            with Image.open(file) as image:
-                frames = split_sheet(
-                    image, cols.value(), rows.value(), count.value(), self.project.pixel
-                )
-            self.finish_image_adjustment()
-            self.stop_play()
-            self.remember()
-            self.commit_frame_controls()
-            getattr(self.project, self.group)[self.storage_key] = frames
-            self.capture_import()
-            settings = preferences.load()
-            settings["sheet_cut"] = dict(
-                columns=cols.value(), rows=rows.value(), count=count.value()
-            )
-            preferences.save(settings)
-            self.preferences.update(settings)
-            self.frame_index = 0
-            self.rebuild_slots()
-            self.touch()
+            self.apply_matching(dialog.result)
 
     def ensure_import_origins(self):
         for group in ("slots", "events", "effects", "animations"):
@@ -1762,8 +1720,7 @@ class Window(QMainWindow):
         ef = QVBoxLayout(effect_page)
         audio_layout = QVBoxLayout(audio_page)
         self.interaction_presets = {}
-        self.build_interaction_presets(ef, "effects", "效果")
-        self.build_interaction_presets(audio_layout, "audio", "音效")
+        self.effect_save_buttons = {}
         feature_tabs = QTabWidget()
         ef.addWidget(feature_tabs)
         feature_layouts = {}
@@ -1780,33 +1737,17 @@ class Window(QMainWindow):
         response_layout = feature_layouts["response"]
         form = QFormLayout()
         self.click_effect = ChoiceBox()
-        self.click_effect.addItems(["水波", "花瓣", "关闭", "自定义"])
-        self.click_effect.setCurrentIndex(
-            {"ripple": 0, "petals": 1, "none": 2, "custom": 3}.get(
-                self.project.settings.get("click_effect"), 0
-            )
+        form.addRow(
+            "点击特效", self.effect_preset_row("click", self.click_effect, "点击特效")
         )
-        self.click_effect.currentIndexChanged.connect(
-            lambda i: self.setting(
-                "click_effect", ["ripple", "petals", "none", "custom"][i]
-            )
-        )
-        form.addRow("点击特效", self.click_effect)
         self.effect_motion = ChoiceBox()
-        for key, title in FX_MOTIONS.items():
-            self.effect_motion.addItem(title, key)
-        self.effect_motion.setCurrentIndex(
-            max(
-                0,
-                self.effect_motion.findData(
-                    self.project.settings.get("effect_motion", "fade")
-                ),
+        form.addRow(
+            "运动方式", self.effect_preset_row("motion", self.effect_motion, "运动方式")
+        )
+        for kind, title in (("trail", "拖尾"), ("companion", "角色")):
+            feature_layouts[kind].addLayout(
+                self.effect_preset_row(kind, ChoiceBox(), title)
             )
-        )
-        self.effect_motion.currentIndexChanged.connect(
-            lambda _: self.setting("effect_motion", self.effect_motion.currentData())
-        )
-        form.addRow("运动方式", self.effect_motion)
         self.idle = NumberBox()
         self.idle.setRange(1, 3600)
         self.idle.setSuffix(" 秒")
@@ -1930,7 +1871,7 @@ class Window(QMainWindow):
         vf = QFormLayout()
         vf.addRow("音量", self.volume)
         audio_layout.addLayout(vf)
-        self.refresh_sound_list()
+        self.sync_interaction_controls()
         rules, rl = card()
         layout.addWidget(rules)
         r = QHBoxLayout()
@@ -2030,60 +1971,107 @@ class Window(QMainWindow):
         self.rebuild_slots()
         self.tabs.setCurrentIndex(0)
 
-    def build_interaction_presets(self, layout, kind, title):
+    def effect_preset_row(self, kind, combo, title):
         row = QHBoxLayout()
-        combo = ChoiceBox()
         self.interaction_presets[kind] = combo
-        combo.activated.connect(
-            lambda index: self.guard(lambda: self.load_interaction_preset(kind, index))
+        combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
         )
+        combo.setMinimumContentsLength(9)
         row.addWidget(combo, 1)
-        row.addWidget(
-            self.button(
-                "保存" + title + "预设",
-                lambda: self.save_interaction_preset(kind, title),
-            )
-        )
-        layout.addLayout(row)
+        save = self.button("保存…", lambda: self.save_interaction_preset(kind, title))
+        self.effect_save_buttons[kind] = save
+        row.addWidget(save)
         self.refresh_interaction_presets(kind)
+        combo.currentIndexChanged.connect(
+            lambda _: self.guard(lambda: self.select_effect_option(kind))
+        )
+        return row
 
     def refresh_interaction_presets(self, kind, selected=None):
         from .interaction_presets import list_presets
 
         combo = self.interaction_presets[kind]
+        combo.blockSignals(True)
         combo.clear()
-        combo.addItem("切换已存预设…", None)
+        if kind == "click":
+            for key, title in (
+                ("ripple", "水波"),
+                ("petals", "花瓣"),
+                ("none", "关闭"),
+                ("custom", "自定义"),
+            ):
+                combo.addItem(title, key)
+            setting = self.project.settings.get("click_effect", "ripple")
+        elif kind == "motion":
+            for key, title in FX_MOTIONS.items():
+                combo.addItem(title, key)
+            setting = self.project.settings.get("effect_motion", "fade")
+        else:
+            combo.addItem("当前设置", None)
+            setting = None
         for name, path in list_presets(kind):
-            combo.addItem(name, path)
-        if selected:
-            combo.setCurrentIndex(max(0, combo.findData(str(selected))))
+            combo.addItem(name, {"preset": path})
+        combo.setCurrentIndex(
+            max(0, combo.findData({"preset": str(selected)} if selected else setting))
+        )
+        combo.blockSignals(False)
+        self.update_effect_save_button(kind)
+
+    def update_effect_save_button(self, kind):
+        setting = self.project.settings
+        show = (
+            setting.get("click_effect") == "custom"
+            if kind == "click"
+            else setting.get("effect_motion") == "keyframes"
+            if kind == "motion"
+            else True
+        )
+        self.effect_save_buttons[kind].setVisible(show)
+
+    def select_effect_option(self, kind):
+        option = self.interaction_presets[kind].currentData()
+        if isinstance(option, dict):
+            try:
+                self.load_interaction_preset(kind, option["preset"])
+            except Exception:
+                self.refresh_interaction_presets(kind)
+                raise
+        elif kind in ("click", "motion") and option:
+            key = "click_effect" if kind == "click" else "effect_motion"
+            self.setting(key, option)
+        self.update_effect_save_button(kind)
 
     def save_interaction_preset(self, kind, title):
         from .interaction_presets import save_preset
 
         self.finish_image_adjustment()
-        name, ok = QInputDialog.getText(self, "保存" + title + "预设", "预设名称")
+        name, ok = QInputDialog.getText(self, "保存" + title, "名称")
         if ok and name.strip():
             path = save_preset(self.project, kind, name)
             self.refresh_interaction_presets(kind, path)
-            self.statusBar().showMessage("已保存预设：" + name.strip())
+            self.statusBar().showMessage("已保存：" + name.strip())
 
-    def load_interaction_preset(self, kind, index):
+    def load_interaction_preset(self, kind, path):
         from .interaction_presets import apply_preset
 
-        path = self.interaction_presets[kind].itemData(index)
-        if not path:
-            return
         preset = Project.load(path)
         self.finish_image_adjustment()
-        self.remember("切换互动预设")
+        self.remember("切换效果资料")
+        selected = {
+            key: combo.currentData() for key, combo in self.interaction_presets.items()
+        }
         apply_preset(self.project, preset, kind)
         self.sync_interaction_controls()
-        if kind == "effects" and self.group == "effects":
+        for key, option in selected.items():
+            if key != kind and isinstance(option, dict):
+                self.refresh_interaction_presets(key, option["preset"])
+        self.refresh_interaction_presets(kind, path)
+        if kind != "motion" and self.group == "effects":
             self.stop_play()
             self.rebuild_slots()
         self.touch()
-        self.statusBar().showMessage("已应用预设：" + preset.name)
+        self.statusBar().showMessage("已应用：" + preset.name)
 
     def setting(self, key, value):
         if self.project.settings.get(key) == value:
@@ -2475,8 +2463,6 @@ class Window(QMainWindow):
         )
         self.scope_box.blockSignals(False)
         self.sync_interaction_controls()
-        for combo in self.interaction_presets.values():
-            combo.setCurrentIndex(0)
         if hasattr(self, "prompt_page"):
             self.prompt_page.reload()
         self.sync_shortcuts()
@@ -2488,23 +2474,8 @@ class Window(QMainWindow):
 
     def sync_interaction_controls(self):
         project = self.project
-        self.click_effect.blockSignals(True)
-        self.click_effect.setCurrentIndex(
-            {"ripple": 0, "petals": 1, "none": 2, "custom": 3}.get(
-                project.settings.get("click_effect"), 0
-            )
-        )
-        self.click_effect.blockSignals(False)
-        self.effect_motion.blockSignals(True)
-        self.effect_motion.setCurrentIndex(
-            max(
-                0,
-                self.effect_motion.findData(
-                    project.settings.get("effect_motion", "fade")
-                ),
-            )
-        )
-        self.effect_motion.blockSignals(False)
+        for kind in self.interaction_presets:
+            self.refresh_interaction_presets(kind)
         self.idle.blockSignals(True)
         self.idle.setValue(int(project.settings.get("idle_seconds", 5)))
         self.idle.blockSignals(False)
@@ -2666,7 +2637,7 @@ class Window(QMainWindow):
         a.addWidget(label("关于", "title"))
         a.addWidget(
             label(
-                "鲸鱼娘指针工坊 3.5\n原生 CUR / ANI 安装无需常驻；桌面互动在托盘运行，可随时停止。\n方案与素材保存在当前用户目录；仅点击 AI 发送时上传参考图和提示词，不上传鼠标操作。\n支持 Windows 10 / 11。游戏、远程桌面和部分自绘指针应用可能使用自己的指针。"
+                "鲸鱼娘指针工坊 3.6\n原生 CUR / ANI 安装无需常驻；桌面互动在托盘运行，可随时停止。\n方案与素材保存在当前用户目录；仅点击 AI 发送时上传参考图和提示词，不上传鼠标操作。\n支持 Windows 10 / 11。游戏、远程桌面和部分自绘指针应用可能使用自己的指针。"
             )
         )
         a.addWidget(
@@ -2973,12 +2944,17 @@ class Window(QMainWindow):
         self.finish_image_adjustment()
         if not mapping:
             return
+        self.stop_play()
+        if self.engine.active:
+            self.toggle_engine()
         self.remember("批量匹配")
-        self.commit_frame_controls()
-        for role, frames in mapping.items():
-            target = role if self.group == "slots" else event_key(role, self.trigger)
-            getattr(self.project, self.group)[target] = [f.clone() for f in frames]
-            self.capture_import(self.group, target)
+        for target, frames in mapping.items():
+            group, separator, key = target.partition(".")
+            if not separator:
+                group = self.group
+                key = target if group == "slots" else event_key(target, self.trigger)
+            getattr(self.project, group)[key] = [f.clone() for f in frames]
+            self.capture_import(group, key)
         self.frame_index = 0
         self.rebuild_slots()
         self.touch()
@@ -3593,23 +3569,10 @@ class Window(QMainWindow):
         self.refresh_interaction_views()
         self.touch()
 
-    def import_hotspots(self):
-        import json
+    def import_hotspots(self, data):
         from .hotspots import parse_hotspots
 
-        path, _ = QFileDialog.getOpenFileName(
-            self, "导入热点 JSON", "", "JSON (*.json)"
-        )
-        if not path:
-            return
-        source = Path(path)
-        if source.stat().st_size > 2 * 1024 * 1024:
-            raise ValueError("热点 JSON 不能超过 2 MB。")
-        changes = parse_hotspots(
-            json.loads(source.read_text("utf-8-sig")),
-            self.project,
-            (self.group, self.storage_key),
-        )
+        changes = parse_hotspots(data, self.project, (self.group, self.storage_key))
         dialog = QDialog(self)
         dialog.setWindowTitle("预览导入热点")
         dialog.resize(680, 480)

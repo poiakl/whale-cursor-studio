@@ -1,40 +1,53 @@
-from pathlib import Path
-
+from whale_cursor.fx import EXAMPLE
+from whale_cursor.interaction_presets import save_preset
 from whale_cursor.project import Project
 from whale_cursor.ui import Window
-from whale_cursor.interaction_presets import save_preset
-from test_audio_playback import wav
 
 
-def test_preset_switch_restores_assets_and_can_undo(app, tmp_path):
+def test_effect_presets_switch_independently(app):
     project = Project.defaults()
     frame = project.slots["Arrow"][0].clone()
     project.effects["click"] = [frame]
-    project.settings.update(click_effect="custom", click_size=92)
-    effect_path = save_preset(project, "effects", "大特效")
-    path = wav(tmp_path / "点击.wav")
-    project.settings["sounds"] = {"click": [path]}
-    project.settings["sound_playback"] = {
-        "click": {"wait_finish": True, "interval_ms": 500}
+    project.effects["trail"] = [frame]
+    project.settings.update(
+        click_effect="custom",
+        click_size=92,
+        effect_motion="keyframes",
+        effect_keyframes=EXAMPLE,
+        trail=True,
+        trail_size=37,
+    )
+    paths = {
+        kind: save_preset(project, kind, kind) for kind in ("click", "motion", "trail")
     }
-    audio_path = save_preset(project, "audio", "慢一点")
-    Path(path).unlink()
-
     window = Window(Project.defaults())
     try:
-        for kind, preset in (("effects", effect_path), ("audio", audio_path)):
+
+        def select(kind):
             combo = window.interaction_presets[kind]
-            combo.activated.emit(combo.findData(str(preset)))
+            index = combo.findData({"preset": str(paths[kind])})
+            assert index >= 0
+            combo.setCurrentIndex(index)
+
+        assert window.effect_save_buttons["click"].isHidden()
+        assert window.effect_save_buttons["motion"].isHidden()
+        select("motion")
+        assert window.project.settings["effect_motion"] == "keyframes"
+        assert not window.effect_save_buttons["motion"].isHidden()
+        select("click")
         assert window.effect_fields["click_size"].value() == 92
         assert (
             window.project.effects["click"][0].image.tobytes() == frame.image.tobytes()
         )
-        assert window.sound_interval.value() == 500
-        assert Path(window.audio_files("click")[0]).exists()
+        assert window.project.settings["effect_motion"] == "keyframes"
+        assert not window.effect_save_buttons["click"].isHidden()
+        select("trail")
+        assert window.project.settings["trail_size"] == 37
+        assert window.project.effects["trail"]
         window.undo()
-        assert not window.audio_files("click") and window.project.effects["click"]
-        window.undo()
-        assert not window.project.effects.get("click") and window.project.slots["Arrow"]
+        assert (
+            not window.project.effects.get("trail") and window.project.effects["click"]
+        )
     finally:
         window.close()
         window.deleteLater()

@@ -3,10 +3,10 @@ from pathlib import Path
 
 from PIL import Image
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QDialog, QFileDialog, QPushButton
+from PySide6.QtWidgets import QDialog, QPushButton
 from PySide6.QtTest import QTest
 
-from whale_cursor.ui import Window, NumberBox
+from whale_cursor.ui import Window
 from whale_cursor.codec import Frame, transform
 from whale_cursor.project import Project, user_dir
 from whale_cursor.hotspots import parse_hotspots
@@ -30,7 +30,8 @@ def test_editor_menus_transport_and_drawer_placement(app):
         assert "帧操作" not in labels and "撤销" not in labels and "重做" not in labels
         imports = [a.text() for a in w.import_menu().actions()]
         exports = [a.text() for a in w.export_menu().actions()]
-        assert any("精灵图" in x for x in imports) and any("热点" in x for x in imports)
+        assert imports == ["导入当前动画", "批量匹配动画"]
+        assert "导出为 PNG" in exports and "导出当前动画" not in exports
         assert "检查方案" in exports and not any("撤销" in x for x in exports)
         assert w.play.toolTip() and not w.play.icon().isNull()
         width = w.canvas.width()
@@ -132,32 +133,36 @@ def test_imported_originals_and_hotspots_survive_save_load(app, tmp_path):
 
 
 def test_sheet_settings_remember_only_successful_import(app, monkeypatch, tmp_path):
+    from whale_cursor.import_panel import ImportPanel
+
     file = tmp_path / "sheet.png"
     Image.new("RGBA", (768, 512), "red").save(file)
-    monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *a, **k: (str(file), ""))
-    previous_exec = QDialog.exec
     seen = []
 
     def fill(dialog):
-        boxes = dialog.findChildren(NumberBox)
-        seen.append([box.value() for box in boxes])
-        for box, value in zip(boxes, [3, 2, 6]):
-            box.setValue(value)
-        return QDialog.DialogCode.Accepted
+        seen.append([dialog.columns.value(), dialog.rows.value()])
+        dialog.paths = [str(file)]
+        dialog.split.setChecked(True)
+        dialog.columns.setValue(3)
+        dialog.rows.setValue(2)
+        dialog.count.setValue(6)
+        dialog.read_selection()
+        return dialog.result()
 
-    monkeypatch.setattr(QDialog, "exec", fill)
+    monkeypatch.setattr(ImportPanel, "exec", fill)
     w = Window(Project.defaults())
     try:
-        w.import_sheet()
+        w.import_current_animation()
         assert len(w.frames) == 6
         assert preferences.load()["sheet_cut"] == dict(columns=3, rows=2, count=6)
-        w.import_sheet()
-        assert seen[1] == [3, 2, 6]
-        monkeypatch.setattr(QDialog, "exec", lambda self: QDialog.DialogCode.Rejected)
-        w.import_sheet()
+        w.import_current_animation()
+        assert seen[1] == [3, 2]
+        monkeypatch.setattr(
+            ImportPanel, "exec", lambda self: QDialog.DialogCode.Rejected
+        )
+        w.import_current_animation()
         assert preferences.load()["sheet_cut"]["count"] == 6
     finally:
-        monkeypatch.setattr(QDialog, "exec", previous_exec)
         w.close()
         w.deleteLater()
         app.processEvents()

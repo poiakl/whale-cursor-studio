@@ -17,9 +17,15 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QDialogButtonBox,
     QAbstractItemView,
+    QComboBox,
+    QFileDialog,
+    QMessageBox,
+    QTabBar,
 )
 from .runtime import pixmap
-from .project import SLOTS
+from .project import SLOTS, EVENTS, EFFECTS
+from .conditions import describe
+from .asset_import import configured_target, read_frames, read_manifest
 
 
 class AnimatedThumb(QLabel):
@@ -189,46 +195,75 @@ class MatchTable(QTableWidget):
 
 
 class MatchDialog(QDialog):
+    GROUPS = ("slots", "events", "effects", "animations")
+
     def __init__(self, assets, parent=None):
         super().__init__(parent)
         self.assets = assets
-        self.assignments = [None] * 17
-        self.setWindowTitle("批量匹配 · 自动分配后可拖动调整")
-        self.resize(940, 740)
+        self.pixel = parent.project.pixel
+        self.fallback_trigger = parent.trigger if parent.group == "events" else None
+        self.manifest = {}
+        self.options = {}
+        self.mapping = {}
+        self.manual = set()
+        self.result = {}
+        self.targets = {
+            "slots": {f"slots.{key}": name for key, name in SLOTS.items()},
+            "events": {
+                f"events.{role}.{event}": name
+                for event in EVENTS
+                for role, name in SLOTS.items()
+            },
+            "effects": {f"effects.{key}": name for key, name in EFFECTS.items()},
+            "animations": {
+                f"animations.{rule['id']}": describe(rule)
+                for rule in parent.project.settings.get("animation_rules", [])
+            },
+        }
+        self.target_ids = {key for group in self.targets.values() for key in group}
+        self.setWindowTitle("批量匹配动画")
+        self.resize(1060, 700)
         layout = QVBoxLayout(self)
-        layout.addWidget(
-            QLabel(
-                "左侧用途固定；把文件拖到对应行。行与行之间拖动可交换文件，拖回右侧可取消匹配。"
-            )
-        )
         row = QHBoxLayout()
         layout.addLayout(row, 1)
-        self.table = MatchTable(17, 3)
+        left = QVBoxLayout()
+        row.addLayout(left, 4)
+        self.tabs = QTabBar()
+        for title in ("系统指针", "互动指针", "装饰效果", "条件动画"):
+            self.tabs.addTab(title)
+        self.tabs.setCurrentIndex(self.GROUPS.index(parent.group))
+        left.addWidget(self.tabs)
+        self.trigger = QComboBox()
+        for key, title in EVENTS.items():
+            self.trigger.addItem(title, key)
+        self.trigger.setCurrentIndex(self.trigger.findData(parent.trigger))
+        left.addWidget(self.trigger)
+        self.table = MatchTable(0, 5)
         self.table.setHorizontalHeaderLabels(
-            ["匹配用途", "匹配文件（拖动调整）", "动画预览"]
+            ["匹配用途", "匹配文件（可拖动）", "列×行", "帧数", "预览"]
         )
         self.table.verticalHeader().hide()
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setDragDropMode(QAbstractItemView.DragDropMode.DragDrop)
         self.table.setDragEnabled(True)
         self.table.setAcceptDrops(True)
         self.table.setDropIndicatorShown(True)
         self.table.assigned.connect(self.assign)
+        self.table.itemChanged.connect(self.update_options)
         self.table.horizontalHeader().setSectionResizeMode(
             1, QHeaderView.ResizeMode.Stretch
         )
-        self.table.setColumnWidth(0, 150)
-        self.table.setColumnWidth(2, 80)
-        row.addWidget(self.table, 3)
+        for column, width in ((0, 160), (2, 72), (3, 60), (4, 60)):
+            self.table.setColumnWidth(column, width)
+        left.addWidget(self.table)
         right = QVBoxLayout()
-        right.addWidget(QLabel("未分配文件（可拖入左侧）"))
+        right.addWidget(QLabel("未分配文件（拖到左侧）"))
         self.pool = AssetPool()
         self.pool.returned.connect(self.unassign)
         right.addWidget(self.pool, 1)
-        self.selected_preview = AnimatedThumb(size=112)
-        right.addWidget(self.selected_preview)
-        self.pool.currentRowChanged.connect(self.preview_pool)
+        self.config_button = QPushButton("导入配置文件…")
+        self.config_button.clicked.connect(self.choose_config)
+        right.addWidget(self.config_button)
         row.addLayout(right, 1)
         footer = QHBoxLayout()
         auto = QPushButton("重新自动匹配")
@@ -244,101 +279,183 @@ class MatchDialog(QDialog):
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
-        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("确认匹配并读取")
-        buttons.accepted.connect(self.accept)
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("导入所有已匹配动画")
+        buttons.accepted.connect(self.accept_import)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+        self.tabs.currentChanged.connect(self.render)
+        self.trigger.currentIndexChanged.connect(self.render)
         self.auto_assign()
 
-    def auto_assign(self):
-        self.assignments = [None] * 17
-        remaining = []
-        keys = list(SLOTS)
-        for i, asset in enumerate(self.assets):
-            key = guess_role(asset["path"])
-            if key is not None and self.assignments[keys.index(key)] is None:
-                self.assignments[keys.index(key)] = i
-            else:
-                remaining.append(i)
-        # Unrecognised names get an initial position too, always visible for manual correction.
-        for row, index in zip(
-            [r for r, v in enumerate(self.assignments) if v is None], remaining
-        ):
-            self.assignments[row] = index
+    def choose_config(self):
+        filename, _ = QFileDialog.getOpenFileName(
+            self, "导入配置文件", "", "JSON (*.json)"
+        )
+        if not filename:
+            return
+        try:
+            self.manifest = read_manifest(filename)
+        except (OSError, ValueError) as error:
+            QMessageBox.warning(self, "配置文件有误", str(error))
+            return
+        self.config_button.setToolTip(Path(filename).name)
+        for target in self.manifest:
+            self.options.pop(target, None)
+        self.auto_assign(preserve=True)
+
+    def auto_assign(self, checked=False, *, preserve=False):
+        if preserve:
+            self.mapping = {
+                key: value for key, value in self.mapping.items() if key in self.manual
+            }
+        else:
+            self.mapping.clear()
+            self.manual.clear()
+        used = set(self.mapping.values())
+        for index, asset in enumerate(self.assets):
+            if index in used:
+                continue
+            target = configured_target(asset["path"], self.target_ids, self.manifest)
+            if target and target not in self.mapping and target not in self.manual:
+                self.mapping[target] = index
+                used.add(index)
+        for index, asset in enumerate(self.assets):
+            if index in used or "." in Path(asset["path"]).stem:
+                continue
+            role = guess_role(asset["path"])
+            if role:
+                target = (
+                    f"events.{role}.{self.fallback_trigger}"
+                    if self.fallback_trigger
+                    else f"slots.{role}"
+                )
+                if target not in self.mapping and target not in self.manual:
+                    self.mapping[target] = index
         self.render()
 
     def assign(self, row, index):
-        if not 0 <= row < 17 or not 0 <= index < len(self.assets):
+        if not 0 <= row < len(self.visible_targets) or not 0 <= index < len(
+            self.assets
+        ):
             return
-        source = next((r for r, v in enumerate(self.assignments) if v == index), None)
-        old = self.assignments[row]
-        if source == row:
+        target = self.visible_targets[row]
+        source = next(
+            (key for key, value in self.mapping.items() if value == index), None
+        )
+        if source == target:
             return
+        old = self.mapping.get(target)
         if source is not None:
-            self.assignments[source] = old
-        self.assignments[row] = index
+            self.manual.add(source)
+            self.mapping.pop(source)
+            if old is not None:
+                self.mapping[source] = old
+        self.mapping[target] = index
+        self.manual.add(target)
         self.render()
 
     def unassign(self, index):
-        for row, value in enumerate(self.assignments):
-            if value == index:
-                self.assignments[row] = None
+        self.manual.update(key for key, value in self.mapping.items() if value == index)
+        self.mapping = {
+            key: value for key, value in self.mapping.items() if value != index
+        }
         self.render()
 
     def clear_row(self, row):
-        if row >= 0:
-            self.assignments[row] = None
+        if 0 <= row < len(self.visible_targets):
+            target = self.visible_targets[row]
+            self.manual.add(target)
+            self.mapping.pop(target, None)
             self.render()
 
-    def render(self):
-        for row, (key, name) in enumerate(SLOTS.items()):
-            self.table.setRowHeight(row, 58)
-            self.table.setItem(row, 0, QTableWidgetItem(name + "\n" + key))
-            index = self.assignments[row]
-            item = QTableWidgetItem(
-                "未分配（保留当前素材）"
-                if index is None
-                else Path(self.assets[index]["path"]).name
-                + "\n"
-                + str(len(self.assets[index]["frames"]))
-                + " 帧"
-            )
+    def update_options(self, item):
+        if item.column() not in (2, 3):
+            return
+        target = self.visible_targets[item.row()]
+        self.options[target] = (
+            self.table.item(item.row(), 2).text(),
+            self.table.item(item.row(), 3).text(),
+        )
+
+    def render(self, *_):
+        group = self.GROUPS[self.tabs.currentIndex()]
+        self.trigger.setVisible(group == "events")
+        self.visible_targets = [
+            target
+            for target in self.targets[group]
+            if group != "events" or target.endswith("." + self.trigger.currentData())
+        ]
+        self.table.blockSignals(True)
+        self.table.setRowCount(len(self.visible_targets))
+        for row, target in enumerate(self.visible_targets):
+            self.table.setRowHeight(row, 50)
+            name = QTableWidgetItem(self.targets[group][target] + "\n" + target)
+            name.setFlags(name.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.table.setItem(row, 0, name)
+            index = self.mapping.get(target)
+            asset = self.assets[index] if index is not None else None
+            item = QTableWidgetItem(Path(asset["path"]).name if asset else "未分配")
             item.setData(Qt.ItemDataRole.UserRole, index)
+            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             self.table.setItem(row, 1, item)
-            old = self.table.cellWidget(row, 2)
-            if old:
-                old.deleteLater()
+            spec = self.manifest.get(target, {})
+            columns, rows = spec.get("sheet_grid", [1, 1])
+            count = spec.get("frame_count", len(asset["frames"]) if asset else 1)
+            grid, count = self.options.get(target, (f"{columns}×{rows}", str(count)))
+            self.table.setItem(row, 2, QTableWidgetItem(grid))
+            self.table.setItem(row, 3, QTableWidgetItem(count))
             self.table.setCellWidget(
-                row,
-                2,
-                AnimatedThumb([] if index is None else self.assets[index]["frames"]),
+                row, 4, AnimatedThumb(asset["frames"] if asset else [])
             )
+        self.table.blockSignals(False)
         self.pool.clear()
-        used = set(self.assignments)
+        used = set(self.mapping.values())
         for index, asset in enumerate(self.assets):
             if index not in used:
                 item = QListWidgetItem(
-                    QIcon(pixmap(asset["frames"][0].image)),
-                    Path(asset["path"]).name + "\n" + str(len(asset["frames"])) + " 帧",
+                    QIcon(pixmap(asset["frames"][0].image)), Path(asset["path"]).name
                 )
                 item.setData(Qt.ItemDataRole.UserRole, index)
                 self.pool.addItem(item)
         self.count_label.setText(
-            f"已匹配 {sum(v is not None for v in self.assignments)} / 17 项"
-        )
-
-    def preview_pool(self, row):
-        item = self.pool.item(row)
-        self.selected_preview.set_frames(
-            self.assets[item.data(Qt.ItemDataRole.UserRole)]["frames"] if item else []
+            f"全部分类已匹配 {len(self.mapping)} 项 · 配置 {len(self.manifest)} 项"
         )
 
     def result_mapping(self):
-        return {
-            role: self.assets[index]["frames"]
-            for role, index in zip(SLOTS, self.assignments)
-            if index is not None
-        }
+        result = {}
+        for target, index in self.mapping.items():
+            asset = self.assets[index]
+            spec = self.manifest.get(target)
+            columns, rows = spec["sheet_grid"] if spec else (1, 1)
+            default_count = spec["frame_count"] if spec else len(asset["frames"])
+            try:
+                grid_text, count_text = self.options.get(
+                    target, (f"{columns}×{rows}", str(default_count))
+                )
+                match = re.fullmatch(r"\s*(\d{1,3})\s*[×xX*]\s*(\d{1,3})\s*", grid_text)
+                if not match or not all(
+                    1 <= int(value) <= 512 for value in match.groups()
+                ):
+                    raise ValueError("网格请填写列×行，例如 4×4")
+                grid = tuple(int(value) for value in match.groups())
+                count = int(count_text)
+                result[target] = read_frames(
+                    [asset["path"]], self.pixel, grid, count, spec, asset["frames"]
+                )
+            except (OSError, ValueError) as error:
+                raise ValueError(
+                    f"{target} · {Path(asset['path']).name}：{error}"
+                ) from error
+        return result
+
+    def accept_import(self):
+        try:
+            self.result = self.result_mapping()
+        except ValueError as error:
+            QMessageBox.warning(self, "批量导入失败", str(error))
+            return
+        if self.result:
+            self.accept()
 
 
 class InspectionDialog(QDialog):

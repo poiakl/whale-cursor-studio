@@ -256,7 +256,7 @@ def make_brief(
     return (
         "请为 Windows 鼠标指针与桌面互动制作透明 PNG 动画素材。\n"
         "character 为全局要求，groups 和 items 通过 parent_id 继承上级。每个条目只补充自身要求。\n"
-        "每个 items 条目单独生成一张序列图，文件名使用 id；不同用途不要混在同一张图。\n"
+        "每个 items 条目单独生成一张序列图，文件名使用 id.png；不同用途不要混在同一张图。\n"
         "严格按 sheet_grid 的列数、行数排列，从左到右、从上到下；每格大小为 cell_px，"
         "保留完整画布，不裁边、不留格间距，unused_cells 对应末尾透明空格。\n"
         "不要文字、编号、水印、网格线、棋盘底或阴影背景；透明区域必须是真正的 alpha。\n"
@@ -264,6 +264,8 @@ def make_brief(
         "点击装饰从出现到消散。\n"
         "hotspot_px 是默认锚点，请让相应部位对齐，不要画热点标记。"
         "duration_ms 是工坊回填用的默认帧时长。frame_overrides 仅列不同帧的值，帧号从 1 开始。\n"
+        "同时返回独立的 UTF-8 import-settings.json。根对象只含 items 数组，每个生成成功的条目复制下方对应 id、frame_count、cell_px、sheet_grid、hotspot_px、duration_ms，有差异时保留 frame_overrides。"
+        "文件名不同于 id.png 时，加 filename 写实际 PNG 文件名。网格顺序为 [列数, 行数]。配置文件只写合法 JSON，不加代码围栏、注释或说明文字。\n"
         "生成器若无法精确满足大图尺寸，请分条目或分批生成，保持单格尺寸与帧序。"
         "导入时选择对应格尺寸切分；保持每格为正方形，尺寸限制不允许时按比例等比缩放整张序列图。\n\n"
         + json.dumps(request, ensure_ascii=False, indent=2)

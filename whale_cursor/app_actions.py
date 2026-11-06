@@ -184,29 +184,7 @@ class AppActions:
         window = self.window
         window.remember("AI 配置点击特效")
         window.project.settings.update(values)
-        for field, value in (
-            (
-                window.click_effect,
-                {"ripple": 0, "petals": 1, "none": 2, "custom": 3}.get(
-                    window.project.settings.get("click_effect"), 0
-                ),
-            ),
-            (
-                window.effect_motion,
-                window.effect_motion.findData(
-                    window.project.settings.get("effect_motion", "fade")
-                ),
-            ),
-        ):
-            field.blockSignals(True)
-            field.setCurrentIndex(value)
-            field.blockSignals(False)
-        for key in ("click_size", "effect_lifetime", "click_opacity"):
-            field = window.effect_fields[key]
-            field.blockSignals(True)
-            value = window.project.settings.get(key, window.effect_defaults[key])
-            field.setValue(round(value * 100) if key.endswith("opacity") else value)
-            field.blockSignals(False)
+        window.sync_interaction_controls()
         window.touch()
         return self.get_interaction_settings()["click_effect"]
 

@@ -190,20 +190,20 @@ def test_io_labels_and_last_operation_button_are_persistent(app, monkeypatch):
     w = Window(Project.defaults())
     invoked = []
     try:
-        monkeypatch.setattr(w, "import_hotspots", lambda: invoked.append("hotspots"))
+        monkeypatch.setattr(w, "batch_import", lambda: invoked.append("match"))
         menu = w.import_menu()
         names = [action.text() for action in menu.actions()]
-        assert "导入热点" in names and not any("…" in name for name in names)
+        assert "批量匹配动画" in names and not any("…" in name for name in names)
         assert not any(
             "完整方案" in action.text() for action in w.export_menu().actions()
         )
         next(
-            action for action in menu.actions() if action.text() == "导入热点"
+            action for action in menu.actions() if action.text() == "批量匹配动画"
         ).trigger()
         w.last_io_button.click()
-        assert invoked == ["hotspots", "hotspots"]
-        assert w.last_io_button.text() == "导入热点"
-        assert preferences.load()["last_io_action"] == "hotspots"
+        assert invoked == ["match", "match"]
+        assert w.last_io_button.text() == "批量匹配动画"
+        assert preferences.load()["last_io_action"] == "match"
         assert [
             b.text()
             for b in w.tabs.widget(0).findChildren(type(w.last_io_button))
@@ -233,16 +233,17 @@ def test_rejected_pingpong_does_not_leave_a_false_enabled_indicator(app):
         app.processEvents()
 
 
-def test_current_animation_export_import_through_ui(app, monkeypatch, tmp_path):
+def test_existing_single_animation_package_import_through_ui(
+    app, monkeypatch, tmp_path
+):
     w = Window(source_project())
     filename = tmp_path / "single.whaleanim"
     try:
         w.pingpong()
         assert "6 帧" in w.slot_list.currentItem().text()
-        monkeypatch.setattr(
-            QFileDialog, "getSaveFileName", lambda *a, **k: (str(filename), "")
-        )
-        w.export_animation()
+        from whale_cursor.animation_package import extract
+
+        extract(w.project, "slots.Arrow").save(filename)
         saved = Project.load(filename)
         assert set(saved.slots) == {"Arrow"} and len(saved.slots["Arrow"]) == 6
         w.key = "Hand"

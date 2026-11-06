@@ -280,6 +280,7 @@ class MatchDialog(QDialog):
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
         buttons.button(QDialogButtonBox.StandardButton.Ok).setText("导入所有已匹配动画")
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
         buttons.accepted.connect(self.accept_import)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
@@ -404,9 +405,13 @@ class MatchDialog(QDialog):
             grid, count = self.options.get(target, (f"{columns}×{rows}", str(count)))
             self.table.setItem(row, 2, QTableWidgetItem(grid))
             self.table.setItem(row, 3, QTableWidgetItem(count))
-            self.table.setCellWidget(
-                row, 4, AnimatedThumb(asset["frames"] if asset else [])
-            )
+            preview = self.table.cellWidget(row, 4)
+            if preview is not None:
+                preview.set_frames(asset["frames"] if asset else [])
+            else:
+                self.table.setCellWidget(
+                    row, 4, AnimatedThumb(asset["frames"] if asset else [])
+                )
         self.table.blockSignals(False)
         self.pool.clear()
         used = set(self.mapping.values())

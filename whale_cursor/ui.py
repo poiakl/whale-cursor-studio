@@ -1721,6 +1721,7 @@ class Window(QMainWindow):
         audio_layout = QVBoxLayout(audio_page)
         self.interaction_presets = {}
         self.effect_save_buttons = {}
+        audio_layout.addLayout(self.effect_preset_row("audio", ChoiceBox(), "音效预设"))
         feature_tabs = QTabWidget()
         ef.addWidget(feature_tabs)
         feature_layouts = {}
@@ -1979,7 +1980,10 @@ class Window(QMainWindow):
         )
         combo.setMinimumContentsLength(9)
         row.addWidget(combo, 1)
-        save = self.button("保存…", lambda: self.save_interaction_preset(kind, title))
+        save = self.button(
+            "保存音效预设" if kind == "audio" else "保存…",
+            lambda: self.save_interaction_preset(kind, title),
+        )
         self.effect_save_buttons[kind] = save
         row.addWidget(save)
         self.refresh_interaction_presets(kind)
@@ -2008,7 +2012,7 @@ class Window(QMainWindow):
                 combo.addItem(title, key)
             setting = self.project.settings.get("effect_motion", "fade")
         else:
-            combo.addItem("当前设置", None)
+            combo.addItem("切换已存预设…" if kind == "audio" else "当前设置", None)
             setting = None
         for name, path in list_presets(kind):
             combo.addItem(name, {"preset": path})
@@ -2067,7 +2071,7 @@ class Window(QMainWindow):
             if key != kind and isinstance(option, dict):
                 self.refresh_interaction_presets(key, option["preset"])
         self.refresh_interaction_presets(kind, path)
-        if kind != "motion" and self.group == "effects":
+        if kind in EFFECTS and self.group == "effects":
             self.stop_play()
             self.rebuild_slots()
         self.touch()

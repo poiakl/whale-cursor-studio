@@ -1,4 +1,4 @@
-"""User presets keep individual effect assets in the existing project format."""
+"""User presets keep individual effect and audio assets in the existing project format."""
 
 import hashlib
 import json
@@ -8,6 +8,7 @@ from .fx import EXAMPLE
 from .project import Project, user_dir
 
 SETTINGS = {
+    "audio": {"sounds", "sound", "sound_modes", "sound_playback", "volume"},
     "click": {
         "click_effect",
         "click_size",
@@ -38,6 +39,8 @@ def apply_preset(project, preset, kind):
     project.settings.update(
         {key: preset.settings[key] for key in SETTINGS[kind] if key in preset.settings}
     )
+    if kind == "audio":
+        return
     if kind == "motion":
         project.settings["effect_keyframes"] = preset.settings.get(
             "effect_keyframes", EXAMPLE

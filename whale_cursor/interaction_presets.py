@@ -1,4 +1,4 @@
-"""User presets keep effect and audio assets in the existing project format."""
+"""User presets keep individual effect assets in the existing project format."""
 
 import hashlib
 import json
@@ -6,50 +6,56 @@ from zipfile import BadZipFile, ZipFile
 
 from .fx import EXAMPLE
 from .project import Project, user_dir
-from .runtime import FEEDBACK_KEYS, RESPONSE_KEYS
 
 SETTINGS = {
-    "effects": FEEDBACK_KEYS | RESPONSE_KEYS,
-    "audio": {"sounds", "sound", "sound_modes", "sound_playback", "volume"},
+    "click": {
+        "click_effect",
+        "click_size",
+        "click_opacity",
+        "effect_size",
+        "effect_lifetime",
+        "effect_opacity",
+    },
+    "motion": {"effect_motion", "effect_keyframes"},
+    "trail": {
+        "trail",
+        "trail_size",
+        "trail_opacity",
+        "trail_lifetime",
+        "trail_spacing",
+    },
+    "companion": {
+        "companion",
+        "companion_size",
+        "companion_opacity",
+        "companion_x",
+        "companion_y",
+    },
 }
-
-
-def effect_entries(mapping):
-    return {key: value for key, value in mapping.items() if key.startswith("effects.")}
 
 
 def apply_preset(project, preset, kind):
     project.settings.update(
         {key: preset.settings[key] for key in SETTINGS[kind] if key in preset.settings}
     )
-    if kind == "effects":
-        project.effects = preset.effects
+    if kind == "motion":
         project.settings["effect_keyframes"] = preset.settings.get(
             "effect_keyframes", EXAMPLE
         )
-        for attr in ("originals", "sequence_sources"):
-            current = getattr(project, attr)
-            setattr(
-                project,
-                attr,
-                {
-                    **{
-                        key: value
-                        for key, value in current.items()
-                        if not key.startswith("effects.")
-                    },
-                    **effect_entries(getattr(preset, attr)),
-                },
-            )
-        controls = project.settings.get("frame_controls", {})
-        project.settings["frame_controls"] = {
-            **{
-                key: value
-                for key, value in controls.items()
-                if not key.startswith("effects.")
-            },
-            **effect_entries(preset.settings.get("frame_controls", {})),
-        }
+        return
+    project.effects[kind] = preset.effects.get(kind, [])
+    target = "effects." + kind
+    for current, saved in (
+        (project.originals, preset.originals),
+        (project.sequence_sources, preset.sequence_sources),
+        (
+            project.settings.setdefault("frame_controls", {}),
+            preset.settings.get("frame_controls", {}),
+        ),
+    ):
+        current.pop(target, None)
+        if target in saved:
+            current[target] = saved[target]
 
 
 def save_preset(project, kind, name):

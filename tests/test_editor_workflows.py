@@ -93,12 +93,13 @@ def test_batch_matches_named_and_unknown_with_manual_swap(window, app):
     ]
     dialog = MatchDialog(assets, window)
     mapping = dialog.result_mapping()
-    assert len(mapping["Hand"]) == 2
+    assert len(mapping["slots.Hand"]) == 2
     arrow = list(SLOTS).index("Arrow")
+    dialog.assign(arrow, 1)
     dialog.assign(arrow, 0)
     mapping = dialog.result_mapping()
-    assert mapping["Arrow"][0].image.getpixel((0, 0))[:3] == (255, 0, 0)
-    assert mapping["Hand"][0].image.getpixel((0, 0))[:3] == (0, 0, 255)
+    assert mapping["slots.Arrow"][0].image.getpixel((0, 0))[:3] == (255, 0, 0)
+    assert mapping["slots.Hand"][0].image.getpixel((0, 0))[:3] == (0, 0, 255)
     window.apply_matching(mapping)
     assert len(window.project.slots["Arrow"]) == 2
     window.undo()

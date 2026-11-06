@@ -47,14 +47,10 @@ def load():
             result["startup_interaction"] = data["startup_interaction"]
         if data.get("last_io_action") in (
             "images",
-            "append",
             "match",
-            "sheet",
-            "hotspots",
-            "animation_in",
             "cursor_out",
             "cursors_out",
-            "animation_out",
+            "png_out",
             "inspect",
         ):
             result["last_io_action"] = data["last_io_action"]

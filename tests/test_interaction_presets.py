@@ -52,3 +52,30 @@ def test_effect_presets_switch_independently(app):
         window.close()
         window.deleteLater()
         app.processEvents()
+
+
+def test_existing_audio_preset_remains_in_audio_dropdown(app, tmp_path):
+    from pathlib import Path
+    from test_audio_playback import wav
+
+    project = Project.defaults()
+    audio = wav(tmp_path / "click.wav")
+    project.settings["sounds"] = {"click": [audio]}
+    project.settings["sound_playback"] = {
+        "click": {"wait_finish": True, "interval_ms": 500}
+    }
+    path = save_preset(project, "audio", "原音效")
+    Path(audio).unlink()
+    window = Window(Project.defaults())
+    try:
+        combo = window.interaction_presets["audio"]
+        combo.setCurrentIndex(combo.findData({"preset": str(path)}))
+        assert window.sound_interval.value() == 500
+        assert Path(window.audio_files("click")[0]).is_file()
+        assert not window.project.effects
+        window.undo()
+        assert not window.audio_files("click")
+    finally:
+        window.close()
+        window.deleteLater()
+        app.processEvents()

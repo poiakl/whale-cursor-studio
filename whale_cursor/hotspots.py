@@ -202,6 +202,17 @@ def parse_hotspots(data, project, current):
             if not isinstance(sequence, list):
                 raise ValueError("timeline / frames 应为逐帧数组。")
             visit(sequence, dst, size, normalized)
+        elif "frame_overrides" in value or (
+            "frame_count" in value and "hotspot_px" in value
+        ):
+            from .codec import MAX_FRAMES
+            from .generation_brief import frame_metadata
+
+            count = value.get("frame_count")
+            if type(count) is not int or not 1 <= count <= MAX_FRAMES:
+                raise ValueError("帧数须为 1～512。")
+            for record in frame_metadata(value, count):
+                add(record, dst, size, record["frame"] - 1, normalized)
         elif "hotspots" in value:
             visit(value["hotspots"], dst, size, normalized)
         elif any(

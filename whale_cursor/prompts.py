@@ -101,10 +101,12 @@ class PromptPage(QWidget):
         parent=None,
         apply_frames=None,
         frame_getter=lambda: None,
+        scope_changed=None,
     ):
         super().__init__(parent)
         self.project_getter = project_getter
         self.changed = changed
+        self.scope_changed = scope_changed
         self.loading = False
         self.leaves = {}
         self.item_instructions = {}
@@ -152,7 +154,16 @@ class PromptPage(QWidget):
         self.tree.header().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         self.tree.itemDoubleClicked.connect(self.edit_item_instruction)
         self.tree.setItemDelegate(FrameDelegate(self.tree))
-        split.addWidget(self.tree)
+        left = QWidget()
+        left_layout = QVBoxLayout(left)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        self.scope = QComboBox()
+        self.scope.addItems(["互动指针 · 共用动画", "互动指针 · 按状态分别配置"])
+        self.scope.setToolTip("共用模式下，每种触发只需生成一套动画。")
+        self.scope.currentIndexChanged.connect(self.change_scope)
+        left_layout.addWidget(self.scope)
+        left_layout.addWidget(self.tree)
+        split.addWidget(left)
         self.output = QPlainTextEdit()
         self.output.setReadOnly(True)
         self.right_tabs = QTabWidget()
@@ -201,10 +212,13 @@ class PromptPage(QWidget):
         return super().eventFilter(obj, event)
 
     def reload(self):
+        self.timer.stop()
         self.loading = True
         try:
             project = self.project_getter()
             config = project.settings.get("ai_prompt", {})
+            scope = project.settings.get("interaction_scope", "role")
+            self.scope.setCurrentIndex(0 if scope == "common" else 1)
             selected = config.get("selected", {"slots.Arrow": 1})
             counts = config.get("counts", {})
             self.item_instructions = dict(config.get("item_instructions", {}))
@@ -236,7 +250,7 @@ class PromptPage(QWidget):
             self.leaves.clear()
             groups = {}
             self.groups = groups
-            for key, path, title, frames, role in entries(project):
+            for key, path, title, frames, role in entries(project, scope):
                 parent = None
                 for depth in range(1, len(path) + 1):
                     prefix = path[:depth]
@@ -250,6 +264,10 @@ class PromptPage(QWidget):
                             group.setData(
                                 column, Qt.ItemDataRole.UserRole, "@group:" + group_key
                             )
+                        group.setToolTip(
+                            0,
+                            "打钩选中全部子项，取消勾选清空本组。减号表示只选中了部分子项。",
+                        )
                         group.setToolTip(1, "设置本组所有子项的帧数，不改变勾选状态")
                         group.setToolTip(
                             2,
@@ -304,6 +322,27 @@ class PromptPage(QWidget):
             self.loading = False
         self.regenerate(save=False)
 
+    def change_scope(self, index):
+        if self.loading:
+            return
+        if not self.regenerate():
+            self.scope.blockSignals(True)
+            self.scope.setCurrentIndex(
+                0
+                if self.project_getter().settings.get("interaction_scope") == "common"
+                else 1
+            )
+            self.scope.blockSignals(False)
+            return
+        if self.scope_changed:
+            self.scope_changed(index)
+        else:
+            self.project_getter().settings["interaction_scope"] = (
+                "common" if index == 0 else "role"
+            )
+            self.changed()
+            self.reload()
+
     def edited(self, *args):
         if self.loading:
             return
@@ -352,13 +391,25 @@ class PromptPage(QWidget):
                 self.group_instructions,
                 self.character_name.text().strip(),
                 self.keyword_fields(),
+                interaction_scope=self.project_getter().settings.get(
+                    "interaction_scope", "role"
+                ),
             )
         )
         self.copy.setEnabled(bool(selected))
         if save:
+            previous = self.project_getter().settings.get("ai_prompt", {})
+            hidden = lambda field: {
+                key: value
+                for key, value in previous.get(field, {}).items()
+                if key.startswith("events.") and key not in self.leaves
+            }
             self.project_getter().settings["ai_prompt"] = dict(
-                selected=selected,
-                counts={key: int(item.text(1)) for key, item in self.leaves.items()},
+                selected={**hidden("selected"), **selected},
+                counts={
+                    **hidden("counts"),
+                    **{key: int(item.text(1)) for key, item in self.leaves.items()},
+                },
                 size=self.size.value(),
                 columns=self.columns.value(),
                 style=self.style.text(),
@@ -446,6 +497,9 @@ class PromptPage(QWidget):
                 self.group_instructions,
                 self.character_name.text().strip(),
                 self.keyword_fields(),
+                interaction_scope=self.project_getter().settings.get(
+                    "interaction_scope", "role"
+                ),
             )
             spec = json.loads(prompt[prompt.index("{") :])["items"][0]
             tasks.append(

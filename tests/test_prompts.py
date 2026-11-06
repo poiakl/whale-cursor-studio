@@ -5,6 +5,7 @@ from PySide6.QtWidgets import QApplication
 from whale_cursor.codec import Frame
 from whale_cursor.project import Project, SLOTS
 from whale_cursor.prompts import make_brief, PromptPage
+from whale_cursor.generation_brief import frame_metadata
 
 
 def payload(text):
@@ -32,10 +33,14 @@ def test_mixed_brief_counts_hotspots_and_sheet_geometry():
     a, idle, click = data["items"]
     assert a["frame_count"] == 1
     assert idle["frame_count"] == 7 and idle["sheet_px"] == [2048, 1024]
-    assert idle["unused_cells"] == 1 and len(idle["timeline"]) == 7
-    assert idle["timeline"][0]["hotspot_px"] == [128, 256]
-    assert idle["timeline"][1]["duration_ms"] == 200
-    assert click["sheet_grid"] == [4, 3] and not click["loop"]
+    assert idle["unused_cells"] == 1 and "timeline" not in idle
+    frames = list(frame_metadata(idle, 7))
+    assert frames[0]["hotspot_px"] == [128, 256]
+    assert frames[1]["duration_ms"] == 200
+    assert idle["frame_overrides"][0]["frame"] == 2
+    assert click["sheet_grid"] == [4, 3]
+    assert click["duration_ms"] == 80 and "frame_overrides" not in click
+    assert "loop" not in click and "effect_playback" not in click
     assert "透明 PNG" in brief and "不要画热点标记" in brief
     assert p.events["Arrow.idle"][0].x == before
 
@@ -125,4 +130,39 @@ def test_extra_user_instructions_are_copied_sent_and_saved(app, tmp_path):
         w.save_timer.stop()
         w.close()
         w.deleteLater()
+        app.processEvents()
+
+
+def test_interaction_scope_limits_bulk_selection_and_keeps_role_choices(app):
+    project = Project.defaults()
+    project.settings["interaction_scope"] = "role"
+    page = PromptPage(lambda: project, lambda: None)
+    checked = Qt.CheckState.Checked
+    unchecked = Qt.CheckState.Unchecked
+    try:
+        hand = page.leaves["events.Hand.idle"]
+        hand.setCheckState(0, checked)
+        parent = page.groups[("互动指针",)]
+        assert parent.checkState(0) == Qt.CheckState.PartiallyChecked
+        assert page.leaves["events.Arrow.idle"].checkState(0) == unchecked
+        page.scope.setCurrentIndex(0)
+        assert "events.Hand.idle" not in page.leaves
+        parent = page.groups[("互动指针",)]
+        parent.setCheckState(0, checked)
+        tasks = [
+            task
+            for task in page.generation_tasks()
+            if task["spec"]["id"].startswith("events.")
+        ]
+        from whale_cursor.project import EVENTS
+
+        assert len(tasks) == len(EVENTS)
+        assert all("共用动画" in task["spec"]["purpose"] for task in tasks)
+        parent.setCheckState(0, unchecked)
+        page.scope.setCurrentIndex(1)
+        assert page.leaves["events.Hand.idle"].checkState(0) == checked
+        assert page.leaves["events.Arrow.idle"].checkState(0) == unchecked
+    finally:
+        page.timer.stop()
+        page.deleteLater()
         app.processEvents()

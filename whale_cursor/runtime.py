@@ -25,6 +25,9 @@ from .fx import pose, parse_keyframes, EXAMPLE
 from .audio import playback_options
 
 
+RESPONSE_KEYS = {"idle_seconds", "direction", "speed"}
+
+
 FEEDBACK_KEYS = {
     "click_effect",
     "effect_motion",
@@ -796,7 +799,9 @@ class Engine:
                 "right",
                 "up",
                 "down",
-            ) and not self.project.settings.get("direction"):
+            ) and not getattr(self, "base_project", self.project).settings.get(
+                "direction"
+            ):
                 continue
             rules.append(
                 {
@@ -1126,6 +1131,13 @@ class Engine:
     def sync_feedback(self, project):
         if not self.active:
             return False
+        self.base_project.settings.update(
+            {
+                key: project.settings[key]
+                for key in RESPONSE_KEYS
+                if key in project.settings
+            }
+        )
         values = {
             key: copy.deepcopy(value)
             for key, value in project.settings.items()

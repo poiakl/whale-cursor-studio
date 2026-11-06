@@ -96,5 +96,5 @@ jobs:
           }
           gh api --method PATCH "repos/$env:GITHUB_REPOSITORY/git/refs/tags/desktop-latest" -f "sha=$env:GITHUB_SHA" -F force=true
           if ($LASTEXITCODE -ne 0) { throw "Could not update rolling release source tag" }
-          gh release edit desktop-latest --title "Windows 便携版 · 3.4" --notes "MCP 直接连接工坊当前界面：读取提示词与参考图、回填生成结果、编写及预览点击关键帧、配置互动音效。音效新增播完再播和触发间隔，实时生效并随方案保存。完整解压后运行 WhaleCursorStudio.exe；设置中复制新版 MCP 配置。"
+          gh release edit desktop-latest --title "Windows 便携版 · 3.5" --notes "生图提示词合并重复帧参数，互动指针可在列表切换共用与按状态配置。桌面效果、音效支持保存带素材的预设。完整解压后运行 WhaleCursorStudio.exe。"
           gh release upload desktop-latest WhaleCursorStudio-Windows.zip --clobber

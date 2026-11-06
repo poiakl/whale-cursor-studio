@@ -182,7 +182,9 @@ def result_frames(image, spec, pixel):
         )
     frames = split_sheet(image, cols, rows, spec["frame_count"], pixel)
     size = spec["cell_px"][0]
-    for frame, metadata in zip(frames, spec["timeline"]):
+    from .generation_brief import frame_metadata
+
+    for frame, metadata in zip(frames, frame_metadata(spec, len(frames))):
         frame.x, frame.y = (
             max(0, min(255, round(value * 256 / size)))
             for value in metadata["hotspot_px"]

@@ -45,6 +45,26 @@ TRIGGERS = {
 }
 
 
+_CLICK_PROMPT = "点击装饰从出现、扩散到完全消散，播放一次；末帧不重新出现。"
+
+
+def visual_instruction(text):
+    # Also recognize previously saved defaults, while retaining user-written prompts.
+    if text == _CLICK_PROMPT:
+        return "点击装饰从出现、扩散到完全消散。"
+    if text in TRIGGERS.values():
+        return (
+            text.replace("，完整播放一次", "")
+            .replace("，播放一次", "")
+            .replace("，连续循环", "，首尾姿态衔接")
+            .replace("，平稳循环", "，首尾姿态衔接")
+            .replace("动作沿左方向循环", "动作沿左方向延续")
+            .replace("动作沿右方向循环", "动作沿右方向延续")
+            .replace("微小动作循环", "保持微小动作")
+        )
+    return text
+
+
 def group_defaults():
     result = {
         "系统指针": "按各子项的系统用途设计，功能指向清晰；多帧时采用克制的循环动作。",
@@ -52,14 +72,19 @@ def group_defaults():
         "装饰": "作为独立装饰绘制，不承担点击定位，构图以画布中心对齐。",
         "条件动画": "按子项给出的触发条件设计动作。",
     }
-    result.update({"互动指针/" + EVENTS[key]: value for key, value in TRIGGERS.items()})
+    result.update(
+        {
+            "互动指针/" + EVENTS[key]: visual_instruction(value)
+            for key, value in TRIGGERS.items()
+        }
+    )
     return result
 
 
 def default_instruction(key, role=None, title=""):
     if key.startswith("effects."):
         return {
-            "click": "点击装饰从出现、扩散到完全消散，播放一次；末帧不重新出现。",
+            "click": visual_instruction(_CLICK_PROMPT),
             "trail": "绘制柔和粒子或短轨迹，由显现到淡出；不把鼠标位移画进单格。",
             "companion": "保留完整主体，自然呼吸眨眼，首尾连贯循环。",
         }[key.split(".")[-1]]

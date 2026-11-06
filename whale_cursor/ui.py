@@ -573,6 +573,7 @@ class Window(QMainWindow):
             self.touch,
             apply_frames=self.apply_ai_frames,
             frame_getter=lambda: self.frame,
+            scope_changed=self.scope_changed,
         )
         self.tabs.addTab(self.prompt_page, "AI 生图")
         self.tabs.currentChanged.connect(
@@ -620,6 +621,11 @@ class Window(QMainWindow):
         self.trigger_box.currentIndexChanged.connect(self.change_trigger)
         self.trigger_box.hide()
         side.addWidget(self.trigger_box)
+        self.editor_scope = ChoiceBox()
+        self.editor_scope.addItems(["共用动画", "按指针状态分别配置"])
+        self.editor_scope.currentIndexChanged.connect(self.scope_changed)
+        self.editor_scope.hide()
+        side.addWidget(self.editor_scope)
         self.slot_list = QListWidget()
         self.slot_list.setIconSize(QSize(32, 32))
         self.slot_list.currentRowChanged.connect(self.select_slot)
@@ -1083,6 +1089,12 @@ class Window(QMainWindow):
         self.rebuild_slots()
 
     def rebuild_slots(self):
+        self.editor_scope.blockSignals(True)
+        self.editor_scope.setCurrentIndex(
+            0 if self.project.settings.get("interaction_scope") == "common" else 1
+        )
+        self.editor_scope.blockSignals(False)
+        self.editor_scope.setVisible(self.group == "events")
         if self.key not in self.role_names:
             self.key = next(iter(self.role_names))
         self.syncing = True
@@ -1749,6 +1761,9 @@ class Window(QMainWindow):
         effect_tabs.addTab(audio_page, "音效")
         ef = QVBoxLayout(effect_page)
         audio_layout = QVBoxLayout(audio_page)
+        self.interaction_presets = {}
+        self.build_interaction_presets(ef, "effects", "效果")
+        self.build_interaction_presets(audio_layout, "audio", "音效")
         feature_tabs = QTabWidget()
         ef.addWidget(feature_tabs)
         feature_layouts = {}
@@ -2015,6 +2030,61 @@ class Window(QMainWindow):
         self.rebuild_slots()
         self.tabs.setCurrentIndex(0)
 
+    def build_interaction_presets(self, layout, kind, title):
+        row = QHBoxLayout()
+        combo = ChoiceBox()
+        self.interaction_presets[kind] = combo
+        combo.activated.connect(
+            lambda index: self.guard(lambda: self.load_interaction_preset(kind, index))
+        )
+        row.addWidget(combo, 1)
+        row.addWidget(
+            self.button(
+                "保存" + title + "预设",
+                lambda: self.save_interaction_preset(kind, title),
+            )
+        )
+        layout.addLayout(row)
+        self.refresh_interaction_presets(kind)
+
+    def refresh_interaction_presets(self, kind, selected=None):
+        from .interaction_presets import list_presets
+
+        combo = self.interaction_presets[kind]
+        combo.clear()
+        combo.addItem("切换已存预设…", None)
+        for name, path in list_presets(kind):
+            combo.addItem(name, path)
+        if selected:
+            combo.setCurrentIndex(max(0, combo.findData(str(selected))))
+
+    def save_interaction_preset(self, kind, title):
+        from .interaction_presets import save_preset
+
+        self.finish_image_adjustment()
+        name, ok = QInputDialog.getText(self, "保存" + title + "预设", "预设名称")
+        if ok and name.strip():
+            path = save_preset(self.project, kind, name)
+            self.refresh_interaction_presets(kind, path)
+            self.statusBar().showMessage("已保存预设：" + name.strip())
+
+    def load_interaction_preset(self, kind, index):
+        from .interaction_presets import apply_preset
+
+        path = self.interaction_presets[kind].itemData(index)
+        if not path:
+            return
+        preset = Project.load(path)
+        self.finish_image_adjustment()
+        self.remember("切换互动预设")
+        apply_preset(self.project, preset, kind)
+        self.sync_interaction_controls()
+        if kind == "effects" and self.group == "effects":
+            self.stop_play()
+            self.rebuild_slots()
+        self.touch()
+        self.statusBar().showMessage("已应用预设：" + preset.name)
+
     def setting(self, key, value):
         if self.project.settings.get(key) == value:
             return
@@ -2024,11 +2094,12 @@ class Window(QMainWindow):
         if key == "sounds":
             self.refresh_sound_list()
         if self.engine.active:
-            from .runtime import FEEDBACK_KEYS
+            from .runtime import FEEDBACK_KEYS, RESPONSE_KEYS
 
             self.statusBar().showMessage(
                 "效果设置已即时应用"
                 if key in FEEDBACK_KEYS
+                or key in RESPONSE_KEYS
                 or key in ("sounds", "sound_modes", "sound_playback", "volume")
                 else "运行中；设置已修改，停止并重新开启后生效"
             )
@@ -2115,6 +2186,12 @@ class Window(QMainWindow):
         self.refresh_sound_list()
 
     def scope_changed(self, index):
+        page = getattr(self, "prompt_page", None)
+        if page and page.timer.isActive():
+            page.regenerate()
+        self.scope_box.blockSignals(True)
+        self.scope_box.setCurrentIndex(index)
+        self.scope_box.blockSignals(False)
         self.setting("interaction_scope", "common" if index == 0 else "role")
         if self.group == "events":
             self.stop_play()
@@ -2122,6 +2199,8 @@ class Window(QMainWindow):
             self.frame_index = 0
             self.rebuild_slots()
         self.refresh_events()
+        if page:
+            page.reload()
 
     def edit_effect(self, key):
         self.finish_image_adjustment()
@@ -2387,6 +2466,28 @@ class Window(QMainWindow):
         self.size_combo.setCurrentText(str(project.size))
         self.pixel.setChecked(project.pixel)
         self.syncing = False
+        self.multi.blockSignals(True)
+        self.multi.setChecked(project.multi_size)
+        self.multi.blockSignals(False)
+        self.scope_box.blockSignals(True)
+        self.scope_box.setCurrentIndex(
+            0 if project.settings.get("interaction_scope") == "common" else 1
+        )
+        self.scope_box.blockSignals(False)
+        self.sync_interaction_controls()
+        for combo in self.interaction_presets.values():
+            combo.setCurrentIndex(0)
+        if hasattr(self, "prompt_page"):
+            self.prompt_page.reload()
+        self.sync_shortcuts()
+        self.rebuild_slots()
+        self.refresh_rules()
+        self.refresh_events()
+        self.refresh_conditions()
+        self.touch()
+
+    def sync_interaction_controls(self):
+        project = self.project
         self.click_effect.blockSignals(True)
         self.click_effect.setCurrentIndex(
             {"ripple": 0, "petals": 1, "none": 2, "custom": 3}.get(
@@ -2414,14 +2515,6 @@ class Window(QMainWindow):
         self.volume.blockSignals(True)
         self.volume.setValue(float(project.settings.get("volume", 0.5)))
         self.volume.blockSignals(False)
-        self.multi.blockSignals(True)
-        self.multi.setChecked(project.multi_size)
-        self.multi.blockSignals(False)
-        self.scope_box.blockSignals(True)
-        self.scope_box.setCurrentIndex(
-            0 if project.settings.get("interaction_scope") == "common" else 1
-        )
-        self.scope_box.blockSignals(False)
         for key, field in self.effect_fields.items():
             field.blockSignals(True)
             value = project.settings.get(
@@ -2435,12 +2528,6 @@ class Window(QMainWindow):
             )
             field.blockSignals(False)
         self.refresh_sound_list()
-        self.sync_shortcuts()
-        self.rebuild_slots()
-        self.refresh_rules()
-        self.refresh_events()
-        self.refresh_conditions()
-        self.touch()
 
     def build_settings(self):
         page = QWidget()
@@ -2579,7 +2666,7 @@ class Window(QMainWindow):
         a.addWidget(label("关于", "title"))
         a.addWidget(
             label(
-                "鲸鱼娘指针工坊 3.4\n原生 CUR / ANI 安装无需常驻；桌面互动在托盘运行，可随时停止。\n方案与素材保存在当前用户目录；仅点击 AI 发送时上传参考图和提示词，不上传鼠标操作。\n支持 Windows 10 / 11。游戏、远程桌面和部分自绘指针应用可能使用自己的指针。"
+                "鲸鱼娘指针工坊 3.5\n原生 CUR / ANI 安装无需常驻；桌面互动在托盘运行，可随时停止。\n方案与素材保存在当前用户目录；仅点击 AI 发送时上传参考图和提示词，不上传鼠标操作。\n支持 Windows 10 / 11。游戏、远程桌面和部分自绘指针应用可能使用自己的指针。"
             )
         )
         a.addWidget(

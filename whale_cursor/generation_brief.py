@@ -2,6 +2,7 @@
 
 import json
 import math
+from collections import Counter
 from .project import SLOTS, EVENTS, EFFECTS
 from .codec import MAX_FRAMES
 from .conditions import describe
@@ -12,14 +13,16 @@ from .prompt_hierarchy import (
     STYLE as CHARACTER_STYLE,
     SHARED,
     without_inherited,
+    visual_instruction,
 )
 
 
-def entries(project):
+def entries(project, interaction_scope="role"):
     for role, title in SLOTS.items():
         yield ("slots." + role, ("系统指针",), title, project.slots.get(role, []), role)
     for trigger, title in EVENTS.items():
-        for role, role_title in SLOTS.items():
+        roles = {"Arrow": "共用动画"} if interaction_scope == "common" else SLOTS
+        for role, role_title in roles.items():
             yield (
                 "events." + role + "." + trigger,
                 ("互动指针", title),
@@ -99,6 +102,31 @@ def legacy_default_instruction(key, role=None, title=""):
     return action + reference + "主体大小和热点锚点全程一致，完整入格，背景真透明。"
 
 
+def frame_metadata(spec, count):
+    """Expand compact frame defaults or a legacy complete timeline."""
+    if "timeline" in spec:
+        yield from spec["timeline"]
+        return
+    defaults = {key: spec[key] for key in ("hotspot_px", "duration_ms") if key in spec}
+    overrides = spec.get("frame_overrides", [])
+    if not isinstance(overrides, list):
+        raise ValueError("frame_overrides 应为数组。")
+    by_frame = {}
+    for override in overrides:
+        if not isinstance(override, dict) or set(override) - {
+            "frame",
+            "hotspot_px",
+            "duration_ms",
+        }:
+            raise ValueError("逐帧覆盖仅支持 frame、hotspot_px 和 duration_ms。")
+        index = override.get("frame")
+        if type(index) is not int or not 1 <= index <= count or index in by_frame:
+            raise ValueError("逐帧覆盖的帧号超出范围或重复。")
+        by_frame[index] = override
+    for index in range(1, count + 1):
+        yield {**defaults, **by_frame.get(index, {}), "frame": index}
+
+
 def make_brief(
     project,
     selected,
@@ -110,6 +138,7 @@ def make_brief(
     group_instructions=None,
     character_name=None,
     keyword_fields=None,
+    interaction_scope="role",
 ):
     items = []
     groups = {}
@@ -119,8 +148,11 @@ def make_brief(
         extra.strip(),
         *prompt_sections(keyword_fields),
     ]
-    inherited = dict(group_defaults(), **(group_instructions or {}))
-    for key, path, title, frames, role in entries(project):
+    inherited = {
+        key: visual_instruction(value)
+        for key, value in dict(group_defaults(), **(group_instructions or {})).items()
+    }
+    for key, path, title, frames, role in entries(project, interaction_scope):
         if key not in selected:
             continue
         count = max(1, min(MAX_FRAMES, int(selected[key])))
@@ -144,6 +176,25 @@ def make_brief(
                     duration_ms=frame.duration if frame else 100,
                 )
             )
+        defaults = dict(
+            hotspot_px=list(
+                Counter(tuple(row["hotspot_px"]) for row in timeline).most_common(1)[0][
+                    0
+                ]
+            ),
+            duration_ms=Counter(row["duration_ms"] for row in timeline).most_common(1)[
+                0
+            ][0],
+        )
+        overrides = []
+        for row in timeline:
+            different = {
+                field: row[field] for field in defaults if row[field] != defaults[field]
+            }
+            if different:
+                overrides.append(dict(frame=row["frame"], **different))
+        if overrides:
+            defaults["frame_overrides"] = overrides
         cols = min(columns, count)
         rows = math.ceil(count / cols)
         items.append(
@@ -152,9 +203,11 @@ def make_brief(
                 purpose=" / ".join((*path, title)),
                 parent_id="/".join(path),
                 extra_prompt=without_inherited(
-                    (item_instructions or {})
-                    .get(key, default_instruction(key, role, title))
-                    .strip(),
+                    visual_instruction(
+                        (item_instructions or {})
+                        .get(key, default_instruction(key, role, title))
+                        .strip()
+                    ),
                     common
                     + [
                         inherited.get("/".join(path[:depth]), "")
@@ -166,30 +219,7 @@ def make_brief(
                 sheet_grid=[cols, rows],
                 sheet_px=[cols * size, rows * size],
                 unused_cells=cols * rows - count,
-                loop=(
-                    count > 1
-                    and not (
-                        key == "effects.click"
-                        or key.split(".")[-1]
-                        in (
-                            "click",
-                            "left_click",
-                            "right_click",
-                            "middle_click",
-                            "double_click",
-                            "release",
-                            "move_start",
-                            "move_stop",
-                            "role_change",
-                        )
-                    )
-                ),
-                anchor_source="装饰画布中心"
-                if decorative
-                else "现有动画"
-                if frames
-                else ("对应系统指针参考" if reference else "画布中心"),
-                timeline=timeline,
+                **defaults,
             )
         )
         for depth in range(1, len(path) + 1):
@@ -209,26 +239,6 @@ def make_brief(
                     ),
                 ),
             )
-        if decorative:
-            settings = project.settings
-            effect = key.split(".")[-1]
-            items[-1]["effect_playback"] = dict(
-                motion=settings.get("effect_motion", "fade")
-                if effect == "click"
-                else "跟随鼠标",
-                display_size_px=settings.get(
-                    {
-                        "click": "click_size",
-                        "trail": "trail_size",
-                        "companion": "companion_size",
-                    }[effect],
-                    64,
-                ),
-                lifetime_ms=settings.get(
-                    "trail_lifetime" if effect == "trail" else "effect_lifetime", 850
-                ),
-                note="画布中心为构图锚点；点击和拖尾按中心绘制，跟随角色按左上角加偏移绘制；运行时不使用素材点击热点",
-            )
     if not items:
         return "请先在左侧勾选需要生成的内容。"
     request = dict(
@@ -245,15 +255,15 @@ def make_brief(
     )
     return (
         "请为 Windows 鼠标指针与桌面互动制作透明 PNG 动画素材。\n"
-        "character 是全局角色要求；groups 通过 parent_id 逐层继承父级，items 继承所属分组。父级要求仅写一次，子项只写自身差异；character.extra_prompt 中的分类标题仅用于整理思路，所有分类都是对全部动画生效的整体提示词，不是独立字段。不要把指令文字画进图片。\n"
+        "character 为全局要求，groups 和 items 通过 parent_id 继承上级。每个条目只补充自身要求。\n"
         "每个 items 条目单独生成一张序列图，文件名使用 id；不同用途不要混在同一张图。\n"
         "严格按 sheet_grid 的列数、行数排列，从左到右、从上到下；每格大小为 cell_px，"
         "保留完整画布，不裁边、不留格间距，unused_cells 对应末尾透明空格。\n"
         "不要文字、编号、水印、网格线、棋盘底或阴影背景；透明区域必须是真正的 alpha。\n"
-        "同一动画中角色大小、镜头、朝向与锚点连续稳定，避免意外抖动。循环项首尾自然衔接；"
-        "点击装饰从出现到消散。duration_ms 是播放参考，不要画进图片。\n"
-        "hotspot_px 是该格内的目标点击/对齐锚点，请让相应部位对齐；不要画热点标记。"
-        "它来自当前方案参考，生成后仍需在制作页核对热点。\n"
+        "同一动画中保持大小、镜头、朝向和锚点稳定。"
+        "点击装饰从出现到消散。\n"
+        "hotspot_px 是默认锚点，请让相应部位对齐，不要画热点标记。"
+        "duration_ms 是工坊回填用的默认帧时长。frame_overrides 仅列不同帧的值，帧号从 1 开始。\n"
         "生成器若无法精确满足大图尺寸，请分条目或分批生成，保持单格尺寸与帧序。"
         "导入时选择对应格尺寸切分；保持每格为正方形，尺寸限制不允许时按比例等比缩放整张序列图。\n\n"
         + json.dumps(request, ensure_ascii=False, indent=2)
